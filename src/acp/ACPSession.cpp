@@ -557,7 +557,6 @@ QJsonArray ACPSession::buildMcpServers() const
 
     if (!mcpServerPath.isEmpty()) {
         QJsonObject kateMcp;
-        kateMcp[QStringLiteral("type")] = QStringLiteral("stdio");
         kateMcp[QStringLiteral("name")] = QStringLiteral("kate");
         kateMcp[QStringLiteral("command")] = mcpServerPath;
         kateMcp[QStringLiteral("args")] = QJsonArray();
