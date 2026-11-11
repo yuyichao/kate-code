@@ -36,6 +36,7 @@ ChatWebView::ChatWebView(QWidget *parent)
     connect(this, &QWebEngineView::loadFinished, this, &ChatWebView::onLoadFinished);
     connect(m_bridge, &WebBridge::permissionResponse, this, &ChatWebView::permissionResponseReady);
     connect(m_bridge, &WebBridge::jumpToEditRequested, this, &ChatWebView::jumpToEditRequested);
+    connect(m_bridge, &WebBridge::reconnectRequested, this, &ChatWebView::reconnectRequested);
     connect(m_bridge, &WebBridge::questionAnswersSubmitted, this, [this](const QString &requestId, const QString &answersJson) {
         QJsonDocument doc = QJsonDocument::fromJson(answersJson.toUtf8());
         Q_EMIT userQuestionAnswered(requestId, doc.object());
@@ -541,6 +542,17 @@ void ChatWebView::showError(const QString &text)
     runJavaScript(script);
 }
 
+void ChatWebView::showReconnectPrompt(const QString &text)
+{
+    const QString base64Text = QString::fromLatin1(text.toUtf8().toBase64());
+    runJavaScript(QStringLiteral("addReconnectPrompt('%1');").arg(base64Text));
+}
+
+void ChatWebView::disableReconnectPrompts()
+{
+    runJavaScript(QStringLiteral("disableReconnectPrompts();"));
+}
+
 void ChatWebView::updateDiffColors(const QString &removeBackground, const QString &addBackground)
 {
     QString script = QStringLiteral(
@@ -573,4 +585,9 @@ void WebBridge::submitQuestionAnswers(const QString &requestId, const QString &a
 {
     qDebug() << "[WebBridge] submitQuestionAnswers:" << requestId;
     Q_EMIT questionAnswersSubmitted(requestId, answersJson);
+}
+
+void WebBridge::requestReconnect()
+{
+    Q_EMIT reconnectRequested();
 }

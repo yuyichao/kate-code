@@ -43,6 +43,8 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
+#include <utility>
+
 ChatWidget::ChatWidget(QWidget *parent)
     : QWidget(parent)
     , m_session(new ACPSession(this))
@@ -112,13 +114,6 @@ ChatWidget::ChatWidget(QWidget *parent)
     m_clearOutputButton->setAutoRaise(true);
     headerLayout->addWidget(m_clearOutputButton);
 
-    // Connect/Disconnect button (icon only)
-    m_connectButton = new QToolButton(this);
-    m_connectButton->setIcon(QIcon::fromTheme(QStringLiteral("network-connect")));
-    m_connectButton->setToolTip(QStringLiteral("Connect"));
-    m_connectButton->setAutoRaise(true);
-    headerLayout->addWidget(m_connectButton);
-
     // Connection status indicator (colored dot)
     m_statusIndicator = new QLabel(QStringLiteral("●"), this);
     m_statusIndicator->setStyleSheet(QStringLiteral("QLabel { color: #888888; font-size: 14px; }"));
@@ -168,7 +163,6 @@ ChatWidget::ChatWidget(QWidget *parent)
     layout->addWidget(m_splitter, 1);
 
     // Connect signals
-    connect(m_connectButton, &QPushButton::clicked, this, &ChatWidget::onConnectClicked);
     connect(m_resumeSessionButton, &QPushButton::clicked, this, &ChatWidget::onResumeSessionClicked);
     connect(m_newSessionButton, &QPushButton::clicked, this, &ChatWidget::onNewSessionClicked);
     connect(m_saveOutputButton, &QToolButton::clicked, this, [this] {
@@ -477,41 +471,71 @@ void ChatWidget::setSettingsStore(SettingsStore *settings)
     }
 }
 
-void ChatWidget::onConnectClicked()
+void ChatWidget::startSession()
 {
-    if (m_session->isConnected()) {
-        // Summarise BEFORE stopping so the current-agent option can ask the
-        // live session. Resetting m_userSentMessage stops the Disconnected
-        // handler from triggering a second summary for the same session.
-        triggerSummaryGeneration();
-        m_userSentMessage = false;
-        m_session->stop();
+    if (m_session->status() == ConnectionStatus::Disconnected) {
+        startNewSession(false);
+    }
+}
+
+void ChatWidget::stopSessionQuietly()
+{
+    if (m_session->status() == ConnectionStatus::Disconnected) {
         return;
     }
+    m_quietStop = true;
+    m_session->stop();  // emits Disconnected synchronously
+    m_quietStop = false;
+}
 
-    // Reset user message tracking for new session
+void ChatWidget::startNewSession(bool resetView)
+{
+    // Summarise BEFORE stopping so the current-agent option can ask the live
+    // session; this can pump events. Resetting m_userSentMessage stops the
+    // Disconnected handler from summarising the same session again.
+    QPointer<ChatWidget> self(this);
+    triggerSummaryGeneration();
+    if (!self) {
+        return;
+    }
     m_userSentMessage = false;
 
-    // Get current project root
-    QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
-
-    // Clear any pending summary from previous attempt
+    // The stored session list is kept so earlier sessions stay resumable.
     m_pendingSummaryContext.clear();
+    m_injectContextOnConnect = false;
+    m_reconnectSessionId.clear();
 
+    stopSessionQuietly();
+    if (resetView) {
+        // Destroy and recreate the WebView to reclaim Chromium memory.
+        resetWebView();
+    }
+
+    const QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
     m_pendingAction = PendingAction::CreateSession;
 
-    // Clear any stale log from a previous session before starting fresh.
-    m_chatWebView->clearMessages();
-
-    // Add system message
     Message sysMsg;
-    sysMsg.id = QStringLiteral("sys_connect");
+    sysMsg.id = QStringLiteral("sys_newsession");
     sysMsg.role = QStringLiteral("system");
     sysMsg.timestamp = QDateTime::currentDateTime();
     sysMsg.content = QStringLiteral("Starting new session in: %1").arg(projectRoot);
     m_chatWebView->addMessage(sysMsg);
 
     m_session->start(projectRoot);
+}
+
+void ChatWidget::onReconnectRequested()
+{
+    if (m_lastStatus == ConnectionStatus::Connecting || m_lastStatus == ConnectionStatus::Connected) {
+        return;  // a stale button; another attempt already started
+    }
+    // Pick up where the lost session left off; a chat that never connected
+    // just tries again.
+    if (!m_reconnectSessionId.isEmpty()) {
+        resumeSession(m_reconnectSessionId);
+    } else {
+        startNewSession(false);
+    }
 }
 
 void ChatWidget::onResumeSessionClicked()
@@ -535,58 +559,72 @@ void ChatWidget::onResumeSessionClicked()
 
     // Show dialog to let user select a session to resume
     SessionSelectionDialog dialog(projectRoot, m_summaryStore, this);
-    if (dialog.exec() != QDialog::Accepted
-        || dialog.selectedResult() != SessionSelectionDialog::Result::Resume) {
-        // Cancelled or "Start new session" chosen - user can click Connect.
+    if (dialog.exec() != QDialog::Accepted) {
         return;
     }
+    switch (dialog.selectedResult()) {
+    case SessionSelectionDialog::Result::Resume:
+        resumeSession(dialog.selectedSessionId());
+        break;
+    case SessionSelectionDialog::Result::NewSession:
+        startNewSession(true);
+        break;
+    case SessionSelectionDialog::Result::Cancelled:
+        break;
+    }
+}
 
-    const QString selectedId = dialog.selectedSessionId();
+void ChatWidget::resumeSession(const QString &sessionId)
+{
+    const QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
 
     // The same agent session must not be loaded into two chats (they would
     // write one transcript); switch to the chat that has it instead.
-    if (m_openSessionLocator && !hasAgentSession(selectedId) && m_openSessionLocator(selectedId)) {
+    if (m_openSessionLocator && !hasAgentSession(sessionId) && m_openSessionLocator(sessionId)) {
         return;
     }
 
     // Resolve the prior-session context to inject (option A). Prefer an existing
     // AI summary; otherwise optionally summarise the raw transcript on demand;
     // failing that, fall back to the raw transcript text itself. The resolve
-    // can pump events, so re-check that we are still alive afterwards.
+    // (and the summary below) can pump events, so re-check that we are still
+    // alive afterwards.
     QPointer<ChatWidget> self(this);
-    const QString resumeContext = resolveResumeContext(projectRoot, selectedId);
+    const QString resumeContext = resolveResumeContext(projectRoot, sessionId);
     if (!self) {
         return;
     }
-    m_pendingSummaryContext = resumeContext;
 
-    // If already connected, stop current session first (like onNewSessionClicked)
-    if (m_session->isConnected()) {
-        triggerSummaryGeneration();
-        // stop() synchronously emits Disconnected, whose handler calls
-        // triggerSummaryGeneration() again; clearing the flag first stops a
-        // duplicate summary for the same session.
-        m_userSentMessage = false;
-        m_session->stop();
-        resetWebView();
+    const bool wasConnected = m_lastStatus == ConnectionStatus::Connected;
+    triggerSummaryGeneration();
+    if (!self) {
+        return;
     }
-
-    // Reset user message tracking for new session
+    // stop() emits Disconnected, whose handler calls triggerSummaryGeneration()
+    // again; clearing the flag first stops a duplicate summary.
     m_userSentMessage = false;
+    stopSessionQuietly();
 
     // Option B (per-provider): try a real ACP session/load, falling back to
     // context injection if it fails. Otherwise use option A directly.
     const ACPProvider provider = currentProvider();
+    // A true resume replays the history into the view, so start from an
+    // empty one; context injection keeps what is shown (e.g. after the agent
+    // died) unless another session was live.
+    if (provider.trueResume || wasConnected) {
+        resetWebView();
+    }
+    m_pendingSummaryContext = resumeContext;
+    m_reconnectSessionId = sessionId;
     if (provider.trueResume) {
         m_pendingAction = PendingAction::LoadSession;
-        m_pendingSessionId = selectedId;
+        m_pendingSessionId = sessionId;
         m_injectContextOnConnect = false;  // set on load failure (see onSessionLoadFailed)
     } else {
         m_pendingAction = PendingAction::CreateSession;
         m_injectContextOnConnect = true;
     }
 
-    // Add system message
     Message sysMsg;
     sysMsg.id = QStringLiteral("sys_connect");
     sysMsg.role = QStringLiteral("system");
@@ -641,38 +679,7 @@ QString ChatWidget::resolveResumeContext(const QString &projectRoot, const QStri
 
 void ChatWidget::onNewSessionClicked()
 {
-    // Trigger summary generation BEFORE resetting state, since stop() will
-    // emit statusChanged(Disconnected) which calls triggerSummaryGeneration()
-    // and that checks m_userSentMessage
-    triggerSummaryGeneration();
-
-    // Reset user message tracking for new session
-    m_userSentMessage = false;
-
-    // Get current project root
-    QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
-
-    // Clear any pending summary context. The stored session list is kept so
-    // earlier sessions stay available for resuming.
-    m_pendingSummaryContext.clear();
-
-    // Stop current session
-    m_session->stop();
-
-    // Destroy and recreate WebView to reclaim Chromium memory
-    resetWebView();
-
-    m_pendingAction = PendingAction::CreateSession;
-
-    // Add system message for new session
-    Message sysMsg;
-    sysMsg.id = QStringLiteral("sys_newsession");
-    sysMsg.role = QStringLiteral("system");
-    sysMsg.content = QStringLiteral("Starting new session in: %1").arg(projectRoot);
-    sysMsg.timestamp = QDateTime::currentDateTime();
-    m_chatWebView->addMessage(sysMsg);
-
-    m_session->start(projectRoot);
+    startNewSession(true);
 }
 
 void ChatWidget::onStopClicked()
@@ -722,6 +729,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
 {
     // Keep m_lastStatus in sync first so any slot called from within this
     // function sees the updated value.
+    const ConnectionStatus previousStatus = m_lastStatus;
     m_lastStatus = status;
 
     Message sysMsg;
@@ -735,21 +743,21 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         }
         m_recentEdits.clear();
         m_inputWidget->setConfigOptions({});
-        m_connectButton->setIcon(QIcon::fromTheme(QStringLiteral("network-connect")));
-        m_connectButton->setToolTip(QStringLiteral("Connect"));
-        m_connectButton->setEnabled(true);
         m_resumeSessionButton->setEnabled(true);
-        m_newSessionButton->setEnabled(false);
+        m_newSessionButton->setEnabled(true);
         m_providerCombo->setEnabled(true);
         m_inputWidget->setEnabled(false);
-        m_statusIndicator->setStyleSheet(QStringLiteral("QLabel { color: #888888; font-size: 14px; }"));
-        m_statusIndicator->setToolTip(QStringLiteral("Disconnected"));
         m_titleLabel->setText(QStringLiteral("Kate Code - Session"));
-        sysMsg.id = QStringLiteral("sys_disconnected");
-        sysMsg.content = QStringLiteral("Disconnected from %1").arg(
-            m_settingsStore ? currentProvider().description
-                            : QStringLiteral("ACP"));
-        m_chatWebView->addMessage(sysMsg);
+        // A failed agent exiting afterwards keeps the error state and its
+        // Reconnect button; a deliberate restart shows nothing.
+        if (previousStatus != ConnectionStatus::Error) {
+            m_statusIndicator->setStyleSheet(QStringLiteral("QLabel { color: #888888; font-size: 14px; }"));
+            m_statusIndicator->setToolTip(QStringLiteral("Disconnected"));
+            if (!m_quietStop) {
+                m_chatWebView->showReconnectPrompt(QStringLiteral("Disconnected from %1.").arg(
+                    m_settingsStore ? currentProvider().description : QStringLiteral("ACP")));
+            }
+        }
 
         // Close the ACP log file so the next session starts a fresh one.
         m_acpLogger->endSession();
@@ -767,7 +775,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
                                    m_settingsStore->acpLogDirectory(),
                                    m_settingsStore->acpLogSubdirectory());
         }
-        m_connectButton->setEnabled(false);
+        m_chatWebView->disableReconnectPrompts();
         m_resumeSessionButton->setEnabled(false);
         m_newSessionButton->setEnabled(false);
         m_providerCombo->setEnabled(false);
@@ -778,12 +786,10 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         m_chatWebView->addMessage(sysMsg);
         break;
     case ConnectionStatus::Connected:
-        m_connectButton->setIcon(QIcon::fromTheme(QStringLiteral("network-disconnect")));
-        m_connectButton->setToolTip(QStringLiteral("Disconnect"));
-        m_connectButton->setEnabled(true);
         m_resumeSessionButton->setEnabled(true);
         m_newSessionButton->setEnabled(true);
-        m_providerCombo->setEnabled(false);
+        // Switching provider starts a new session with it.
+        m_providerCombo->setEnabled(true);
         m_inputWidget->setEnabled(true);
         m_statusIndicator->setStyleSheet(QStringLiteral("QLabel { color: #5cb85c; font-size: 14px; }"));
         m_statusIndicator->setToolTip(QStringLiteral("Connected"));
@@ -801,6 +807,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
             m_sessionStore->saveSession(projectRoot, m_session->sessionId());
             m_lastSessionId = m_session->sessionId();
             m_lastProjectRoot = projectRoot;
+            m_reconnectSessionId = m_session->sessionId();
         }
 
         // Populate file list for @-completion (never blocks on a disk walk)
@@ -827,21 +834,22 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         }
         m_pendingSummaryContext.clear();
         m_injectContextOnConnect = false;
+        sendQueuedQuickActions();
         break;
     case ConnectionStatus::Error:
         if (m_editorSession) {
             m_editorSession->cancelPendingQuestions(QStringLiteral("the agent session ended"));
         }
         m_inputWidget->setConfigOptions({});
-        m_connectButton->setIcon(QIcon::fromTheme(QStringLiteral("network-connect")));
-        m_connectButton->setToolTip(QStringLiteral("Connect"));
-        m_connectButton->setEnabled(true);
         m_resumeSessionButton->setEnabled(true);
-        m_newSessionButton->setEnabled(false);
+        m_newSessionButton->setEnabled(true);
         m_providerCombo->setEnabled(true);
         m_statusIndicator->setStyleSheet(QStringLiteral("QLabel { color: #d9534f; font-size: 14px; }"));
         m_statusIndicator->setToolTip(QStringLiteral("Error"));
         m_acpLogger->endSession();
+        // The error itself is reported by onError()/describeError().
+        m_chatWebView->showReconnectPrompt(QStringLiteral("Could not start a session with %1.").arg(
+            m_settingsStore ? currentProvider().description : QStringLiteral("the agent")));
         break;
     }
 
@@ -1128,15 +1136,33 @@ void ChatWidget::clearContextChunks()
 
 void ChatWidget::sendPromptWithSelection(const QString &prompt, const QString &filePath, const QString &selection)
 {
-    if (!m_session || !m_session->isConnected()) {
-        qWarning() << "[ChatWidget] Cannot send quick action: not connected to ACP";
+    if (!m_session->isConnected()) {
+        // A new chat is still connecting; send it once connected.
+        m_queuedQuickActions.append({prompt, filePath, selection});
+        if (m_lastStatus != ConnectionStatus::Connecting) {
+            Message sysMsg;
+            sysMsg.id = QStringLiteral("sys_quick_action_queued");
+            sysMsg.role = QStringLiteral("system");
+            sysMsg.timestamp = QDateTime::currentDateTime();
+            sysMsg.content = QStringLiteral("Not connected; the request will be sent after reconnecting.");
+            m_chatWebView->addMessage(sysMsg);
+        }
         return;
     }
+    m_userSentMessage = true;
 
     // Send prompt with selection directly to ACP (no context chunks for quick actions)
     m_session->sendMessage(prompt, filePath, selection, QList<ContextChunk>());
 
     qDebug() << "[ChatWidget] Sent quick action prompt with selection from:" << filePath;
+}
+
+void ChatWidget::sendQueuedQuickActions()
+{
+    const QList<QueuedQuickAction> queued = std::exchange(m_queuedQuickActions, {});
+    for (const QueuedQuickAction &action : queued) {
+        sendPromptWithSelection(action.prompt, action.filePath, action.selection);
+    }
 }
 
 void ChatWidget::onRemoveContextChunk(const QString &id)
@@ -1624,11 +1650,29 @@ void ChatWidget::onProviderComboChanged(int index)
         return;
     }
 
-    m_providerId = m_providerCombo->itemData(index).toString();
+    const QString providerId = m_providerCombo->itemData(index).toString();
+    if (providerId == m_providerId) {
+        return;
+    }
+    if (hasUserWork()) {
+        const auto answer = QMessageBox::question(
+            this, QStringLiteral("Switch Provider"),
+            QStringLiteral("Switching the provider ends this chat's session and starts a new one. "
+                           "The current session can be resumed later."),
+            QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (answer != QMessageBox::Ok) {
+            const QSignalBlocker blocker(m_providerCombo);
+            m_providerCombo->setCurrentIndex(qMax(0, m_providerCombo->findData(m_providerId)));
+            return;
+        }
+    }
+
+    m_providerId = providerId;
     applyACPBackend();
     // Remember the choice as the default for new chats. This notifies every
     // chat (settingsChanged), but each keeps its own m_providerId.
     m_settingsStore->setActiveProviderId(m_providerId);
+    startNewSession(true);
 }
 
 void ChatWidget::resizeEvent(QResizeEvent *event)
@@ -1712,6 +1756,9 @@ void ChatWidget::connectWebViewSignals()
     // Forward jump to edit requests from WebView
     connect(m_chatWebView, &ChatWebView::jumpToEditRequested, this, &ChatWidget::jumpToEditRequested);
 
+    // Reconnect button in a connection failure notice
+    connect(m_chatWebView, &ChatWebView::reconnectRequested, this, &ChatWidget::onReconnectRequested);
+
     // Apply diff colors when WebView is ready (after page load)
     connect(m_chatWebView, &ChatWebView::webViewReady, this, &ChatWidget::applyDiffColors);
 }
@@ -1784,14 +1831,23 @@ void ChatWidget::updateWindowTitle()
     }
 }
 
+bool ChatWidget::hasUserWork() const
+{
+    return m_lastStatus == ConnectionStatus::Connected
+        && (m_userSentMessage || m_session->isPromptRunning());
+}
+
 bool ChatWidget::shouldClose()
 {
-    if (m_lastStatus != ConnectionStatus::Connected && m_lastStatus != ConnectionStatus::Connecting) {
+    // Every chat has an agent running, so only ask when closing would cut
+    // off something the user did in it.
+    if (!hasUserWork()) {
         return true;
     }
     const auto answer = QMessageBox::question(
         this, QStringLiteral("Close Kate Code Session"),
-        QStringLiteral("This chat has a live agent session. Closing it stops the agent."),
+        QStringLiteral("This chat has a live agent session. Closing it stops the agent; "
+                       "the session can be resumed later."),
         QMessageBox::Close | QMessageBox::Cancel, QMessageBox::Cancel);
     return answer == QMessageBox::Close;
 }

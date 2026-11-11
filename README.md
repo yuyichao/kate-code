@@ -163,9 +163,9 @@ The plugin will be installed to:
 
 ### Starting a Session
 
-1. The Kate Code panel appears in Kate's side panel area (left or right sidebar)
-2. Choose a configured ACP provider from the provider dropdown
-3. Click **Connect** to start a session using the current project's directory as its working directory
+1. Click **New Session** in the Kate Code side panel (or use a quick action) to open a chat tab
+2. The chat connects to the default ACP provider right away, using the current project's directory as its working directory
+3. Choosing another provider from the chat's provider dropdown starts a new session with it
 
 ### Sending Messages
 
@@ -251,6 +251,7 @@ The plugin automatically adapts to your KDE color scheme by reading `~/.config/k
 - Restart Kate completely (close all windows)
 
 ### Connection fails
+- The chat shows the agent's error and a **Reconnect** button
 - Verify the selected provider executable is installed and available in `PATH`
 - Look for error messages in terminal when launching Kate from command line: `kate`
 

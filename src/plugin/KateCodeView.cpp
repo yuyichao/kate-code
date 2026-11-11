@@ -264,6 +264,8 @@ ChatWidget *KateCodeView::createChat()
         return nullptr;
     }
     scheduleSessionPanelRefresh();
+    // Connect right away; there is no manual connect step.
+    chat->startSession();
     return chat;
 }
 

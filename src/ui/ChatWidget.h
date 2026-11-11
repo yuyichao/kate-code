@@ -79,6 +79,11 @@ public:
     // Shutdown hook - generates summary and waits for completion
     void prepareForShutdown();
 
+    // Start an agent session if this chat has none. Called once the chat is
+    // set up; there is no manual connect step. A failed or lost connection
+    // shows a Reconnect button in the chat.
+    void startSession();
+
     // Summary of this chat for the session list (KateCodeView side panel).
     // sessionInfoChanged() fires when any of these change.
     QString sessionTitle() const;
@@ -87,7 +92,7 @@ public:
     QString workingDir() const;
 
     // Called by Kate before closing this widget's tab; asks for confirmation
-    // while an agent session is live.
+    // while the session has unsaved work in it (a prompt the user sent).
     Q_INVOKABLE bool shouldClose();
 
 public Q_SLOTS:
@@ -119,7 +124,7 @@ Q_SIGNALS:
     void sessionInfoChanged();
 
 private Q_SLOTS:
-    void onConnectClicked();
+    void onReconnectRequested();
     void onResumeSessionClicked();
     void onNewSessionClicked();
     void onStopClicked();
@@ -156,6 +161,17 @@ private Q_SLOTS:
 
 private:
     void updateWindowTitle();
+    // Stop any session (live, connecting or failed) and start a new one.
+    void startNewSession(bool resetView);
+    // Stop any session and resume the given one (true resume or context
+    // injection, depending on the provider).
+    void resumeSession(const QString &sessionId);
+    // Stop the agent without the "Disconnected" notice (the caller starts
+    // another session right after).
+    void stopSessionQuietly();
+    // Whether ending the session now would interrupt the user's work.
+    bool hasUserWork() const;
+    void sendQueuedQuickActions();
     void triggerSummaryGeneration();
     // Ask the live session's agent for the summary, showing a cancellable
     // progress dialogue while it runs. Only valid while connected.
@@ -200,7 +216,6 @@ private:
     ChatWebView *m_chatWebView;
     ChatInputWidget *m_inputWidget;
     QComboBox *m_providerCombo;
-    QToolButton *m_connectButton;
     QToolButton *m_resumeSessionButton;
     QToolButton *m_newSessionButton;
     QToolButton *m_clearOutputButton;
@@ -258,6 +273,16 @@ private:
     void stopFileScans(bool wait);
     QList<QPointer<QThread>> m_fileScanThreads;
     quint64 m_fileScanGeneration = 0;
+
+    // Set while stopSessionQuietly() runs.
+    bool m_quietStop = false;
+    // Session the Reconnect button resumes: the last one that connected
+    // (empty for a chat whose first connection failed).
+    QString m_reconnectSessionId;
+
+    // Quick actions requested before the session connected; sent once it does.
+    struct QueuedQuickAction { QString prompt, filePath, selection; };
+    QList<QueuedQuickAction> m_queuedQuickActions;
 
     // Session id passed to the in-flight session/load, so a failed load can
     // drop just that entry from the stored session list.

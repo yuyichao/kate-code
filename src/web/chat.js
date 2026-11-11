@@ -459,6 +459,52 @@ function addErrorMessage(base64Text) {
     scrollToBottom();
 }
 
+// Connection failure notice with a button that asks Kate to reconnect.
+function addReconnectPrompt(base64Text) {
+    let text;
+    try {
+        text = decodeURIComponent(escape(atob(base64Text)));
+    } catch (e) {
+        text = base64Text;
+    }
+
+    const container = document.getElementById('messages');
+    const el = document.createElement('div');
+    el.className = 'message error reconnect-prompt';
+
+    const header = document.createElement('div');
+    header.className = 'message-header';
+    header.innerHTML = '<span class="message-role error">⚠ Connection</span>';
+
+    const content = document.createElement('div');
+    content.className = 'message-content';
+    const label = document.createElement('span');
+    label.textContent = text;
+    const button = document.createElement('button');
+    button.className = 'reconnect-button';
+    button.textContent = 'Reconnect';
+    button.onclick = () => {
+        disableReconnectPrompts();
+        if (window.bridge) {
+            window.bridge.requestReconnect();
+        }
+    };
+    content.appendChild(label);
+    content.appendChild(button);
+
+    el.appendChild(header);
+    el.appendChild(content);
+    container.appendChild(el);
+    scrollToBottom();
+}
+
+// A new connection attempt has started: earlier Reconnect buttons are stale.
+function disableReconnectPrompts() {
+    document.querySelectorAll('.reconnect-button').forEach((button) => {
+        button.disabled = true;
+    });
+}
+
 // Update message content (for streaming)
 function updateMessage(id, content) {
     if (!messages[id]) return;
