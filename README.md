@@ -85,15 +85,16 @@ repositories; its PKGBUILD is tracked there rather than in this repository.
 
 **Arch Linux / Manjaro:**
 ```bash
-sudo pacman -S cmake extra-cmake-modules qt6-webengine \
-  kf6-ktexteditor kf6-ki18n kf6-kcoreaddons kf6-kxmlgui kf6-syntax-highlighting
+sudo pacman -S cmake extra-cmake-modules qt6-webengine qt6-webchannel qt6-declarative \
+  ktexteditor ki18n kcoreaddons kxmlgui syntax-highlighting kpty kparts
 ```
 
-**Debian / Ubuntu:**
+**Debian / Ubuntu (26.04 or newer):**
 ```bash
-sudo apt install cmake extra-cmake-modules qt6-webengine-dev \
-  libkf6texteditor-dev libkf6i18n-dev libkf6coreaddons-dev \
-  libkf6xmlgui-dev libkf6syntaxhighlighting-dev
+sudo apt install g++ cmake extra-cmake-modules \
+  qt6-base-dev qt6-webengine-dev qt6-webchannel-dev qt6-declarative-dev \
+  libkf6texteditor-dev libkf6i18n-dev libkf6coreaddons-dev libkf6xmlgui-dev \
+  libkf6syntaxhighlighting-dev libkf6pty-dev libkf6parts-dev
 ```
 
 **Fedora:**
