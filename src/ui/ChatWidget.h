@@ -51,15 +51,19 @@ public:
     void setFileListProvider(FileListProvider provider);
     void setDocumentProvider(DocumentProvider provider);
 
+    // Whether this chat has the given agent session open (connected or
+    // connecting to it).
+    bool hasAgentSession(const QString &sessionId) const;
+    // Called before resuming a saved session: returns true (after switching
+    // to it) when another chat already has that session open.
+    void setOpenSessionLocator(std::function<bool(const QString &sessionId)> locator)
+    {
+        m_openSessionLocator = std::move(locator);
+    }
+
     // This chat's editor DBus endpoint (questions, edit notifications); its
     // path is handed to the agent's Kate MCP server.
     void setEditorSession(EditorSession *session);
-
-    // Agent-slot hooks wired by KateCodeView so the plugin-level gate can be
-    // consulted before any session is started.
-    void setAgentSlotHooks(std::function<bool()> acquire,
-                           std::function<void()> release,
-                           std::function<bool()> available);
 
     // Context chunk management
     void addContextChunk(const QString &filePath, int startLine, int endLine, const QString &content);
@@ -91,9 +95,6 @@ public Q_SLOTS:
     void showUserQuestion(const QString &requestId, const QString &questionsJson);
     // Remove user question UI (on timeout or cancel)
     void removeUserQuestion(const QString &requestId);
-    // Called by KateCodePlugin::agentActivityChanged() to refresh connect/resume
-    // button enabled-states when another window acquires or releases the slot.
-    void refreshAgentAvailability();
     // Capture edit data from EditorDBusService for diff display
     void onEditApplied(const QString &filePath, const QString &oldText, const QString &newText);
 
@@ -168,9 +169,6 @@ private:
     void updateTerminalSize();
     void resetWebView();
     void connectWebViewSignals();
-    // Returns false (and shows a system message) if another window holds the
-    // agent slot; returns true if this widget can proceed to start a session.
-    bool ensureAgentSlot();
     // Pending session action for after initialize completes
     enum class PendingAction {
         None,
@@ -186,11 +184,6 @@ private:
     ContextProvider m_selectionProvider;
     ContextProvider m_projectRootProvider;
     FileListProvider m_fileListProvider;
-
-    // Agent-slot hooks (set by KateCodeView; default-empty = no gate)
-    std::function<bool()> m_tryAcquireAgentSlot;
-    std::function<void()> m_releaseAgentSlot;
-    std::function<bool()> m_agentSlotAvailable;
 
     // Last-seen connection status, kept in sync at the top of onStatusChanged()
     ConnectionStatus m_lastStatus = ConnectionStatus::Disconnected;
@@ -251,6 +244,7 @@ private:
     bool m_shutdownDone = false;
 
     QPointer<EditorSession> m_editorSession;
+    std::function<bool(const QString &)> m_openSessionLocator;
 
     // This chat's provider. Starts as the global default (activeProvider);
     // choosing one here also makes it the default for new chats, but never

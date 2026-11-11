@@ -46,6 +46,11 @@ public Q_SLOTS:
     // Open a new chat tab and switch to it.
     void newSession();
 
+public:
+    // Switch to the chat (other than exclude) that has the given agent
+    // session open; false if this window has none.
+    bool activateChatWithSession(const QString &sessionId, ChatWidget *exclude);
+
 private Q_SLOTS:
     void addSelectionToContext();
 

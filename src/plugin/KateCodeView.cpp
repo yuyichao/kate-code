@@ -195,6 +195,16 @@ ChatWidget *KateCodeView::createChat()
     QPointer<KateCodeView> self(this);
     QPointer<ChatWidget> chatGuard(chat);
     KateCodePlugin *plugin = m_plugin;
+    // Resuming a saved session that another chat (in any window) already has
+    // open switches to that chat instead of loading it a second time.
+    chat->setOpenSessionLocator([plugin, chatGuard](const QString &sessionId) {
+        for (KateCodeView *view : plugin->views()) {
+            if (view->activateChatWithSession(sessionId, chatGuard)) {
+                return true;
+            }
+        }
+        return false;
+    });
 
     chat->setFilePathProvider([self]() { return self ? self->getCurrentFilePath() : QString(); });
     chat->setSelectionProvider([self]() { return self ? self->getCurrentSelection() : QString(); });
@@ -208,14 +218,6 @@ ChatWidget *KateCodeView::createChat()
 
     chat->setSettingsStore(m_plugin->settings());
 
-    // Process-wide single-agent gate: one connected chat per Kate process,
-    // because the editor DBus service (MCP tools) is shared and not yet
-    // routed per session. The plugin outlives every chat.
-    chat->setAgentSlotHooks(
-        [plugin, chat]() { return plugin->acquireAgentSlot(chat); },
-        [plugin, chat]() { plugin->releaseAgentSlot(chat); },
-        [plugin, chat]() { return plugin->agentSlotAvailableFor(chat); });
-    connect(m_plugin, &KateCodePlugin::agentActivityChanged, chat, &ChatWidget::refreshAgentAvailability);
 
     connect(chat, &ChatWidget::jumpToEditRequested, this, &KateCodeView::jumpToEdit);
 
@@ -269,6 +271,20 @@ void KateCodeView::activateChat(ChatWidget *chat)
     m_mainWindow->activateWidget(chat);
     chat->setFocus();
     scheduleSessionPanelRefresh();
+}
+
+bool KateCodeView::activateChatWithSession(const QString &sessionId, ChatWidget *exclude)
+{
+    for (ChatWidget *chat : liveChats()) {
+        if (chat != exclude && chat->hasAgentSession(sessionId)) {
+            if (QWidget *window = m_mainWindow->window()) {
+                window->activateWindow();
+            }
+            activateChat(chat);
+            return true;
+        }
+    }
+    return false;
 }
 
 QList<ChatWidget *> KateCodeView::liveChats() const

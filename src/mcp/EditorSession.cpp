@@ -24,6 +24,7 @@ EditorSession::EditorSession(EditorDBusService *service, const QString &objectPa
     , m_service(service)
     , m_objectPath(objectPath)
 {
+    setObjectName(objectPath);
 }
 
 EditorSession::~EditorSession()

@@ -63,7 +63,9 @@ Settings > Configure Kate > Plugins > Enable "Kate Code"
 ### Plugin Structure
 - Chats are editor-area widgets added with `KTextEditor::MainWindow::addWidget()` (Kate owns and deletes them; they can move between splits). Kate calls an invokable `bool shouldClose()` before closing such a tab
 - The side panel (`createToolView()` with `KTextEditor::MainWindow::Left`) holds the session list
-- Only one chat per Kate process can be connected at a time (agent slot in KateCodePlugin), because the editor DBus service used by the MCP tools is not routed per session
+- Several chats can run agents at once. Each chat owns an `EditorSession` DBus endpoint (`/KateCode/Session/sN`, interface `org.kde.katecode.Editor`); its kate-mcp-server gets the path in `KATECODE_DBUS_PATH` (service name in `KATECODE_DBUS_SERVICE`), so questions and edit notifications reach that chat only. The shared `/KateCode/Editor` object only serves document tools
+- Never block a DBus call or ACP request in a nested event loop (other sessions' requests would nest inside it): askUserQuestion uses a delayed DBus reply, terminal/wait_for_exit a callback
+- Each chat keeps its own provider; `ACP/activeProvider` is only the default for new chats
 - Kate keeps the enabled-plugin list in the session file (`kate/anonymous.katesession`, `[Kate Plugins]`), not in `katerc`
 - K_PLUGIN_CLASS_WITH_JSON macro requires katecode.json in same directory
 - Plugin views are children of MainWindow and cleaned up automatically

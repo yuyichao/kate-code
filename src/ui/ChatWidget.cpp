@@ -291,13 +291,6 @@ ChatWidget::~ChatWidget()
     // interruption flag and touch no widget state, so this returns quickly.
     stopFileScans(true);
 
-    // The Disconnected handler that normally releases the process-wide agent
-    // slot is cut off below, so give the slot back here; otherwise closing a
-    // connected tab would block every other chat from connecting.
-    if (m_releaseAgentSlot) {
-        m_releaseAgentSlot();
-    }
-
     if (!m_shutdownDone) {
         m_shutdownDone = true;
         if (m_session) {
@@ -461,55 +454,6 @@ void ChatWidget::setEditorSession(EditorSession *session)
     }
 }
 
-void ChatWidget::setAgentSlotHooks(std::function<bool()> acquire,
-                                   std::function<void()> release,
-                                   std::function<bool()> available)
-{
-    m_tryAcquireAgentSlot = std::move(acquire);
-    m_releaseAgentSlot    = std::move(release);
-    m_agentSlotAvailable  = std::move(available);
-}
-
-bool ChatWidget::ensureAgentSlot()
-{
-    if (m_tryAcquireAgentSlot && !m_tryAcquireAgentSlot()) {
-        Message sysMsg;
-        sysMsg.id        = QStringLiteral("sys_agent_busy");
-        sysMsg.role      = QStringLiteral("system");
-        sysMsg.timestamp = QDateTime::currentDateTime();
-        sysMsg.content   = QStringLiteral(
-            "An agent is already active in another Kate window. "
-            "Only one agent can run at a time within a single Kate process; "
-            "use a separate Kate window/process, or stop the other agent.");
-        m_chatWebView->addMessage(sysMsg);
-        return false;
-    }
-    return true;
-}
-
-void ChatWidget::refreshAgentAvailability()
-{
-    // Only adjust buttons when we are not in an active session; leave
-    // onStatusChanged's own logic intact for Connecting and Connected.
-    if (m_lastStatus != ConnectionStatus::Disconnected
-        && m_lastStatus != ConnectionStatus::Error) {
-        return;
-    }
-
-    const bool available = !m_agentSlotAvailable || m_agentSlotAvailable();
-    m_connectButton->setEnabled(available);
-    m_resumeSessionButton->setEnabled(available);
-
-    if (!available) {
-        m_connectButton->setToolTip(
-            QStringLiteral("An agent is active in another Kate window"));
-        m_statusIndicator->setToolTip(
-            QStringLiteral("An agent is active in another Kate window"));
-    } else {
-        m_connectButton->setToolTip(QStringLiteral("Connect"));
-    }
-}
-
 void ChatWidget::setSettingsStore(SettingsStore *settings)
 {
     m_settingsStore = settings;
@@ -545,11 +489,6 @@ void ChatWidget::onConnectClicked()
         return;
     }
 
-    // Check the process-wide single-agent gate before starting anything.
-    if (!ensureAgentSlot()) {
-        return;
-    }
-
     // Reset user message tracking for new session
     m_userSentMessage = false;
 
@@ -577,11 +516,6 @@ void ChatWidget::onConnectClicked()
 
 void ChatWidget::onResumeSessionClicked()
 {
-    // Check the process-wide single-agent gate before starting anything.
-    if (!ensureAgentSlot()) {
-        return;
-    }
-
     // Get current project root
     QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
 
@@ -589,17 +523,13 @@ void ChatWidget::onResumeSessionClicked()
     // them - not the optional AI summaries - as the source of resumable sessions.
     QStringList sessionIds = m_summaryStore->listTranscriptSessions(projectRoot);
     if (sessionIds.isEmpty()) {
-        // No sessions to resume - show message. Give the slot back if no
-        // session is running, otherwise other windows stay blocked forever.
+        // No sessions to resume - show message.
         Message sysMsg;
         sysMsg.id = QStringLiteral("sys_no_sessions");
         sysMsg.role = QStringLiteral("system");
         sysMsg.content = QStringLiteral("No previous sessions found for: %1").arg(projectRoot);
         sysMsg.timestamp = QDateTime::currentDateTime();
         m_chatWebView->addMessage(sysMsg);
-        if (!m_session->isConnected() && m_releaseAgentSlot) {
-            m_releaseAgentSlot();
-        }
         return;
     }
 
@@ -608,13 +538,16 @@ void ChatWidget::onResumeSessionClicked()
     if (dialog.exec() != QDialog::Accepted
         || dialog.selectedResult() != SessionSelectionDialog::Result::Resume) {
         // Cancelled or "Start new session" chosen - user can click Connect.
-        if (!m_session->isConnected() && m_releaseAgentSlot) {
-            m_releaseAgentSlot();
-        }
         return;
     }
 
     const QString selectedId = dialog.selectedSessionId();
+
+    // The same agent session must not be loaded into two chats (they would
+    // write one transcript); switch to the chat that has it instead.
+    if (m_openSessionLocator && !hasAgentSession(selectedId) && m_openSessionLocator(selectedId)) {
+        return;
+    }
 
     // Resolve the prior-session context to inject (option A). Prefer an existing
     // AI summary; otherwise optionally summarise the raw transcript on demand;
@@ -636,11 +569,6 @@ void ChatWidget::onResumeSessionClicked()
         m_userSentMessage = false;
         m_session->stop();
         resetWebView();
-        // stop() released the agent slot via the Disconnected handler;
-        // re-acquire before starting the replacement session.
-        if (!ensureAgentSlot()) {
-            return;
-        }
     }
 
     // Reset user message tracking for new session
@@ -713,11 +641,6 @@ QString ChatWidget::resolveResumeContext(const QString &projectRoot, const QStri
 
 void ChatWidget::onNewSessionClicked()
 {
-    // Check the process-wide single-agent gate before starting anything.
-    if (!ensureAgentSlot()) {
-        return;
-    }
-
     // Trigger summary generation BEFORE resetting state, since stop() will
     // emit statusChanged(Disconnected) which calls triggerSummaryGeneration()
     // and that checks m_userSentMessage
@@ -735,12 +658,6 @@ void ChatWidget::onNewSessionClicked()
 
     // Stop current session
     m_session->stop();
-
-    // stop() released the agent slot via the Disconnected handler; re-acquire
-    // before starting the replacement session so the gate stays accurate.
-    if (!ensureAgentSlot()) {
-        return;
-    }
 
     // Destroy and recreate WebView to reclaim Chromium memory
     resetWebView();
@@ -797,8 +714,8 @@ void ChatWidget::onMessageSubmitted(const QString &message)
 
 void ChatWidget::onStatusChanged(ConnectionStatus status)
 {
-    // Keep m_lastStatus in sync first so refreshAgentAvailability() and any
-    // slot called from within this function sees the updated value.
+    // Keep m_lastStatus in sync first so any slot called from within this
+    // function sees the updated value.
     m_lastStatus = status;
 
     Message sysMsg;
@@ -807,9 +724,6 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
 
     switch (status) {
     case ConnectionStatus::Disconnected:
-        if (m_releaseAgentSlot) {
-            m_releaseAgentSlot();
-        }
         if (m_editorSession) {
             m_editorSession->cancelPendingQuestions(QStringLiteral("the agent session ended"));
         }
@@ -909,9 +823,6 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         m_injectContextOnConnect = false;
         break;
     case ConnectionStatus::Error:
-        if (m_releaseAgentSlot) {
-            m_releaseAgentSlot();
-        }
         if (m_editorSession) {
             m_editorSession->cancelPendingQuestions(QStringLiteral("the agent session ended"));
         }
@@ -927,9 +838,6 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         m_acpLogger->endSession();
         break;
     }
-
-    // Let all windows re-evaluate their button states after any status change.
-    refreshAgentAvailability();
 
     updateWindowTitle();
     Q_EMIT sessionInfoChanged();
@@ -970,8 +878,8 @@ void ChatWidget::onToolCallAdded(const QString &messageId, const ToolCall &toolC
 
 void ChatWidget::onEditApplied(const QString &filePath, const QString &oldText, const QString &newText)
 {
-    // The DBus service is shared by every window in this Kate process; only
-    // the window running the agent should collect its edits.
+    // Edits come from this chat's own endpoint or session; ignore any that
+    // arrive while no agent is connected (nothing would consume them).
     if (!m_session->isConnected()) {
         return;
     }
@@ -1756,11 +1664,7 @@ void ChatWidget::updateTerminalSize()
 
 void ChatWidget::showUserQuestion(const QString &requestId, const QString &questionsJson)
 {
-    // The DBus service is shared by every chat in this Kate process; only the
-    // chat running the agent (at most one, see the agent slot) shows it.
-    if (!m_session->isConnected()) {
-        return;
-    }
+    // Comes from this chat's own editor endpoint (EditorSession).
     qDebug() << "[ChatWidget] showUserQuestion called, requestId:" << requestId;
     m_chatWebView->showUserQuestion(requestId, questionsJson);
 }
@@ -1893,4 +1797,18 @@ ACPProvider ChatWidget::currentProvider() const
     }
     const ACPProvider provider = m_settingsStore->providerById(m_providerId);
     return provider.executable.isEmpty() ? m_settingsStore->activeProvider() : provider;
+}
+
+bool ChatWidget::hasAgentSession(const QString &sessionId) const
+{
+    if (sessionId.isEmpty()) {
+        return false;
+    }
+    if (m_lastStatus == ConnectionStatus::Connected) {
+        return m_session->sessionId() == sessionId;
+    }
+    if (m_lastStatus == ConnectionStatus::Connecting) {
+        return m_pendingSessionId == sessionId || m_loadingSessionId == sessionId;
+    }
+    return false;
 }
