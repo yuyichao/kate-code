@@ -77,6 +77,9 @@ public:
     void setAvailableCommands(const QList<SlashCommand> &commands);
     void setAvailableFiles(const QStringList &files);
     void setPromptRunning(bool running);
+    // Context window usage in the status row: the percentage, with the token
+    // counts in the tooltip. used < 0 hides it.
+    void setContextUsage(qint64 used, qint64 size);
 
     // Session config options from the agent (model, effort, fast mode, ...).
     // "mode" is shown by the mode dropdown and skipped here.
@@ -112,6 +115,7 @@ private:
     QPushButton *m_attachFileButton;
     QComboBox *m_modeComboBox;
     QLabel *m_waitingLabel;
+    QLabel *m_contextLabel;
     bool m_promptRunning = false;
     bool m_inputEnabled = false;
     QCompleter *m_completer;

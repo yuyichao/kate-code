@@ -272,7 +272,8 @@ ChatWidget::ChatWidget(QWidget *parent)
 
     // Session options (model, effort, ...). Connected with this widget as
     // context so ~ChatWidget's disconnect covers them.
-    connect(m_session, &ACPSession::usageChanged, this, [this]() {
+    connect(m_session, &ACPSession::usageChanged, this, [this](const SessionUsage &usage) {
+        m_inputWidget->setContextUsage(usage.used, usage.size);
         Q_EMIT sessionInfoChanged();
     });
     connect(m_session, &ACPSession::titleChanged, this, &ChatWidget::onSessionTitleChanged);

@@ -347,17 +347,6 @@ void KateCodeView::scheduleSessionPanelRefresh()
     }, Qt::QueuedConnection);
 }
 
-static QString formatTokens(qint64 tokens)
-{
-    if (tokens >= 1000000) {
-        return QStringLiteral("%1M").arg(tokens / 1000000.0, 0, 'f', 1);
-    }
-    if (tokens >= 1000) {
-        return QStringLiteral("%1k").arg(qRound(tokens / 1000.0));
-    }
-    return QString::number(tokens);
-}
-
 void KateCodeView::refreshSessionPanel()
 {
     if (!m_sessionPanel) {
@@ -387,23 +376,13 @@ void KateCodeView::refreshSessionPanel()
             break;
         }
 
+        // Context usage is shown in the chat's own status row.
         const SessionUsage usage = chat->usage();
-        QStringList detail;
-        if (usage.used >= 0) {
-            if (usage.size > 0) {
-                detail << QStringLiteral("Context %1 / %2 (%3%)")
-                              .arg(formatTokens(usage.used), formatTokens(usage.size))
-                              .arg(qRound(100.0 * usage.used / usage.size));
-            } else {
-                detail << QStringLiteral("Context %1").arg(formatTokens(usage.used));
-            }
-        }
         if (usage.cost >= 0) {
-            detail << (usage.currency == QStringLiteral("USD")
-                           ? QStringLiteral("$%1").arg(usage.cost, 0, 'f', 2)
-                           : QStringLiteral("%1 %2").arg(usage.cost, 0, 'f', 2).arg(usage.currency));
+            entry.detail = usage.currency == QStringLiteral("USD")
+                ? QStringLiteral("$%1").arg(usage.cost, 0, 'f', 2)
+                : QStringLiteral("%1 %2").arg(usage.cost, 0, 'f', 2).arg(usage.currency);
         }
-        entry.detail = detail.join(QStringLiteral(" · "));
         entry.active = (chat == m_lastActiveChat);
         entries.append(entry);
     }

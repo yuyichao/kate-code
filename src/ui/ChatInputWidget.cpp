@@ -311,7 +311,16 @@ ChatInputWidget::ChatInputWidget(QWidget *parent)
 
     modeLayout->addWidget(modeLabel);
     modeLayout->addWidget(m_modeComboBox);
+    // Context window usage, left of the waiting indicator
+    m_contextLabel = new QLabel(this);
+    m_contextLabel->setObjectName(QStringLiteral("contextUsageLabel"));
+    m_contextLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_contextLabel->setStyleSheet(QStringLiteral("QLabel { color: palette(mid); font-size: 11px; }"));
+    m_contextLabel->hide();
+
     modeLayout->addStretch();
+    modeLayout->addWidget(m_contextLabel);
+    modeLayout->addSpacing(8);
     modeLayout->addWidget(m_waitingLabel);
 
     mainLayout->addLayout(modeLayout);
@@ -597,6 +606,38 @@ void ChatInputWidget::setPromptRunning(bool running)
     m_promptRunning = running;
     m_stopButton->setEnabled(running);
     updateWaitingIndicator();
+}
+
+static QString formatTokens(qint64 tokens)
+{
+    if (tokens >= 1000000) {
+        return QStringLiteral("%1M").arg(tokens / 1000000.0, 0, 'f', 1);
+    }
+    if (tokens >= 1000) {
+        return QStringLiteral("%1k").arg(qRound(tokens / 1000.0));
+    }
+    return QString::number(tokens);
+}
+
+void ChatInputWidget::setContextUsage(qint64 used, qint64 size)
+{
+    if (used < 0) {
+        m_contextLabel->clear();
+        m_contextLabel->setToolTip(QString());
+        m_contextLabel->hide();
+        return;
+    }
+    if (size > 0) {
+        const int percent = qRound(100.0 * used / size);
+        m_contextLabel->setText(QStringLiteral("Context %1%").arg(percent));
+        m_contextLabel->setToolTip(QStringLiteral("Context window: %1 / %2 tokens used")
+                                       .arg(formatTokens(used), formatTokens(size)));
+    } else {
+        // The agent did not report the window size, so there is no percentage.
+        m_contextLabel->setText(QStringLiteral("Context"));
+        m_contextLabel->setToolTip(QStringLiteral("Context window: %1 tokens used").arg(formatTokens(used)));
+    }
+    m_contextLabel->show();
 }
 
 void ChatInputWidget::updateWaitingIndicator()

@@ -21,7 +21,7 @@ public:
         QString title;    // session title
         QString location; // e.g. "Claude Code: kate-code"
         QString status;   // e.g. "Connected"
-        QString detail;   // e.g. "Context 45k / 200k · $0.42"
+        QString detail;   // e.g. "$0.42"
         QString iconName; // theme icon for the status
         bool active = false;
     };
