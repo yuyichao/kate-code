@@ -1,6 +1,7 @@
 #!/bin/bash
-# Build .deb, .rpm, and .pkg.tar.zst packages using Docker
-# Usage: ./build-packages.sh [deb|rpm|arch|all]
+# Build .deb and .rpm packages using Docker
+# (Arch Linux packaging is maintained in the archlinuxcn package repositories.)
+# Usage: ./build-packages.sh [deb|rpm|all]
 
 set -e
 
@@ -29,16 +30,6 @@ build_rpm() {
     echo "=== .rpm package built in dist/ ==="
 }
 
-build_arch() {
-    echo "=== Building .pkg.tar.zst package (Arch) ==="
-    docker build -f Dockerfile.arch -t kate-code-arch .
-    docker rm arch-out 2>/dev/null || true
-    docker create --name arch-out kate-code-arch
-    docker cp arch-out:/dist/. dist/
-    docker rm arch-out
-    echo "=== .pkg.tar.zst package built in dist/ ==="
-}
-
 case "${1:-all}" in
     deb)
         build_deb
@@ -46,16 +37,12 @@ case "${1:-all}" in
     rpm)
         build_rpm
         ;;
-    arch)
-        build_arch
-        ;;
     all)
         build_deb
         build_rpm
-        build_arch
         ;;
     *)
-        echo "Usage: $0 [deb|rpm|arch|all]"
+        echo "Usage: $0 [deb|rpm|all]"
         exit 1
         ;;
 esac

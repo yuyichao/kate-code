@@ -75,11 +75,9 @@ which claude-agent-acp
 
 ### Option 1: Install from Package (Recommended)
 
-#### Arch Linux (AUR or local build)
-```bash
-# Build and install from PKGBUILD
-makepkg -si
-```
+#### Arch Linux
+The `kate-code-git` package is maintained in the archlinuxcn package
+repositories; its PKGBUILD is tracked there rather than in this repository.
 
 #### Fedora / RHEL
 ```bash
