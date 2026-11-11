@@ -137,16 +137,19 @@ void ChatWebView::injectColorScheme()
             qDebug() << "[ChatWebView] No theme JSON, using fallback:" << codeBg;
         }
 
-        inlineCodeBg = isLight ? QStringLiteral("rgba(0, 0, 0, 0.08)")
-                                : QStringLiteral("rgba(0, 0, 0, 0.3)");
+        // Determine if the code background is light or dark (independent of KDE UI theme)
+        bool isLightCodeBg = QColor(codeBg).lightnessF() > 0.5;
+
+        inlineCodeBg = isLightCodeBg ? QStringLiteral("rgba(0, 0, 0, 0.08)")
+                                     : QStringLiteral("rgba(0, 0, 0, 0.3)");
 
         // Theme-aware task purple: darker on light themes, lighter on dark themes for contrast
         QString taskPurple = isLight ? QStringLiteral("#9c27b0") : QStringLiteral("#ce93d8");
         QString taskPurpleBg = isLight ? QStringLiteral("rgba(156, 39, 176, 0.08)")
                                        : QStringLiteral("rgba(206, 147, 216, 0.15)");
 
-        // Terminal text color: dark text on light backgrounds, light text on dark backgrounds
-        QString terminalFg = isLight ? QStringLiteral("#1e1e1e") : QStringLiteral("#e0e0e0");
+        // Terminal text color: based on code background lightness, not KDE UI theme
+        QString terminalFg = isLightCodeBg ? QStringLiteral("#1e1e1e") : QStringLiteral("#e0e0e0");
 
         // Escape the CSS for JavaScript string literal
         QString escapedCSS = kateThemeCSS;
