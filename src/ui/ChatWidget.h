@@ -55,6 +55,12 @@ public:
     // Whether this chat has the given agent session open (connected or
     // connecting to it).
     bool hasAgentSession(const QString &sessionId) const;
+
+    // Resume a saved session in this chat with the provider it ran with
+    // (the default provider if empty or no longer configured). Use instead
+    // of startSession() on a new chat.
+    void resumeSavedSession(const QString &sessionId, const QString &projectRoot,
+                            const QString &providerId);
     // Called before resuming a saved session: returns true (after switching
     // to it) when another chat already has that session open.
     void setOpenSessionLocator(std::function<bool(const QString &sessionId)> locator)
@@ -131,7 +137,6 @@ Q_SIGNALS:
 
 private Q_SLOTS:
     void onReconnectRequested();
-    void onResumeSessionClicked();
     void onNewSessionClicked();
     void onStopClicked();
     void onMessageSubmitted(const QString &message);
@@ -187,6 +192,8 @@ private:
     // Whether ending the session now would interrupt the user's work.
     bool hasUserWork() const;
     void sendQueuedQuickActions();
+    // Record the user's first prompt of the session (for the session list).
+    void notePrompt(const QString &prompt);
     void triggerSummaryGeneration();
     // Ask the live session's agent for the summary, showing a cancellable
     // progress dialogue while it runs. Only valid while connected.
@@ -231,7 +238,6 @@ private:
     ChatWebView *m_chatWebView;
     ChatInputWidget *m_inputWidget;
     QComboBox *m_providerCombo;
-    QToolButton *m_resumeSessionButton;
     QToolButton *m_newSessionButton;
     QToolButton *m_clearOutputButton;
     QToolButton *m_saveOutputButton;
@@ -249,6 +255,9 @@ private:
     SessionStore *m_sessionStore;
     PendingAction m_pendingAction;
     QString m_pendingSessionId;
+    // Saved session being resumed (replaced by a new agent session if it
+    // is restored by context injection).
+    QString m_resumedFromSessionId;
 
     // Summary generation
     SettingsStore *m_settingsStore;

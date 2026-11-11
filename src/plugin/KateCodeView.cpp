@@ -6,6 +6,10 @@
 #include "../mcp/EditorSession.h"
 #include "../ui/ChatWidget.h"
 #include "../ui/SessionPanel.h"
+#include "../ui/SessionSelectionDialog.h"
+#include "../util/AgentIcons.h"
+#include "../util/SessionStore.h"
+#include "../util/SummaryStore.h"
 #include "../util/DiffHighlightManager.h"
 
 #include <KActionCollection>
@@ -20,7 +24,10 @@
 #include <QQuickWidget>
 #include <QDebug>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
+#include <QMessageBox>
+#include <QTextStream>
 #include <QVBoxLayout>
 #include <functional>
 
@@ -30,6 +37,8 @@ KateCodeView::KateCodeView(KateCodePlugin *plugin, KTextEditor::MainWindow *main
     , m_plugin(plugin)
     , m_mainWindow(mainWindow)
     , m_toolView(nullptr)
+    , m_sessionStore(new SessionStore(this))
+    , m_summaryStore(new SummaryStore(this))
     , m_diffHighlightManager(nullptr)
 {
     createToolView();
@@ -40,6 +49,8 @@ KateCodeView::KateCodeView(KateCodePlugin *plugin, KTextEditor::MainWindow *main
     connect(m_mainWindow, &KTextEditor::MainWindow::viewChanged, this, [this](KTextEditor::View *view) {
         if (view) {
             m_lastEditorView = view;
+            // The resumable sessions follow the current project.
+            scheduleSessionPanelRefresh();
         }
     });
 
@@ -190,6 +201,12 @@ void KateCodeView::createToolView()
     m_sessionPanel = new SessionPanel(m_toolView);
     layout->addWidget(m_sessionPanel);
     connect(m_sessionPanel, &SessionPanel::newSessionRequested, this, &KateCodeView::newSession);
+    connect(m_sessionPanel, &SessionPanel::browseRequested, this, &KateCodeView::browseSessions);
+    connect(m_sessionPanel, &SessionPanel::resumeRequested, this, &KateCodeView::resumeSavedSession);
+    connect(m_sessionPanel, &SessionPanel::showAllDirectoriesChanged, this, [this](bool showAll) {
+        m_showAllSessions = showAll;
+        scheduleSessionPanelRefresh();
+    });
     connect(m_sessionPanel, &SessionPanel::entryActivated, this, [this](int index) {
         const QList<ChatWidget *> chats = liveChats();
         if (index >= 0 && index < chats.size()) {
@@ -198,7 +215,7 @@ void KateCodeView::createToolView()
     });
 }
 
-ChatWidget *KateCodeView::createChat()
+ChatWidget *KateCodeView::createChat(bool startSession)
 {
     auto *chat = new ChatWidget();
 
@@ -265,8 +282,117 @@ ChatWidget *KateCodeView::createChat()
     }
     scheduleSessionPanelRefresh();
     // Connect right away; there is no manual connect step.
-    chat->startSession();
+    if (startSession) {
+        chat->startSession();
+    }
     return chat;
+}
+
+void KateCodeView::resumeSavedSession(const QString &sessionId, const QString &projectRoot)
+{
+    if (sessionId.isEmpty() || projectRoot.isEmpty()) {
+        return;
+    }
+    // Already open in a chat (in any window): switch to it.
+    for (KateCodeView *view : m_plugin->views()) {
+        if (view->activateChatWithSession(sessionId, nullptr)) {
+            return;
+        }
+    }
+    const QString providerId = m_sessionStore->findSession(projectRoot, sessionId).providerId;
+    if (ChatWidget *chat = createChat(false)) {
+        activateChat(chat);
+        chat->resumeSavedSession(sessionId, projectRoot, providerId);
+    }
+}
+
+void KateCodeView::browseSessions()
+{
+    const QString projectRoot = getProjectRoot();
+    QWidget *parent = m_mainWindow->window();
+    if (m_summaryStore->listTranscriptSessions(projectRoot).isEmpty()) {
+        QMessageBox::information(parent, QStringLiteral("Kate Code"),
+                                 QStringLiteral("No previous sessions found for %1.").arg(projectRoot));
+        return;
+    }
+    SessionSelectionDialog dialog(projectRoot, m_summaryStore, parent);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    switch (dialog.selectedResult()) {
+    case SessionSelectionDialog::Result::Resume:
+        resumeSavedSession(dialog.selectedSessionId(), projectRoot);
+        break;
+    case SessionSelectionDialog::Result::NewSession:
+        newSession();
+        break;
+    case SessionSelectionDialog::Result::Cancelled:
+        break;
+    }
+}
+
+bool KateCodeView::isSessionOpen(const QString &sessionId) const
+{
+    for (KateCodeView *view : m_plugin->views()) {
+        for (ChatWidget *chat : view->liveChats()) {
+            if (chat->hasAgentSession(sessionId)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The project a transcript belongs to (from its header), whether it has a
+// user message and the first one's text. The latter are only a fallback for
+// sessions the session store does not track: the injected context of a
+// restored session embeds an earlier transcript, which cannot be told apart
+// from real messages. Reads only as far as needed.
+static void readTranscriptStart(const QString &path, QString &projectRoot,
+                                bool &hasUserMessage, QString &firstPrompt)
+{
+    projectRoot.clear();
+    hasUserMessage = false;
+    firstPrompt.clear();
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return;
+    }
+    QTextStream stream(&file);
+    bool inHeader = true;
+    bool inUserMessage = false;
+    qint64 linesRead = 0;
+    QString line;
+    while (stream.readLineInto(&line) && ++linesRead < 5000) {
+        // The header written by TranscriptWriter::startSession() ends at the
+        // first rule.
+        if (inHeader) {
+            if (line.startsWith(QStringLiteral("- **Project:** "))) {
+                projectRoot = line.mid(15).trimmed();
+            } else if (line == QStringLiteral("---")) {
+                inHeader = false;
+            }
+            continue;
+        }
+        if (line.startsWith(QStringLiteral("## "))) {
+            inUserMessage = line.startsWith(QStringLiteral("## User ("));
+            continue;
+        }
+        if (!inUserMessage) {
+            continue;
+        }
+        const QString text = line.trimmed();
+        if (text.isEmpty()) {
+            continue;
+        }
+        if (text.startsWith(QStringLiteral("<system-reminder>"))) {
+            inUserMessage = false;  // a session restore's injected context
+            continue;
+        }
+        hasUserMessage = true;
+        firstPrompt = text;
+        return;
+    }
 }
 
 void KateCodeView::newSession()
@@ -387,6 +513,105 @@ void KateCodeView::refreshSessionPanel()
         entries.append(entry);
     }
     m_sessionPanel->setEntries(entries);
+    refreshResumableSessions();
+}
+
+void KateCodeView::refreshResumableSessions()
+{
+    constexpr int maxEntries = 20;
+    constexpr int maxTitleLength = 80;
+
+    const QString currentRoot = getProjectRoot();
+    auto locationName = [](const QString &root) {
+        if (QDir::cleanPath(root) == QDir::homePath()) {
+            return QStringLiteral("~");
+        }
+        const QString name = QDir(root).dirName();
+        return name.isEmpty() ? root : name;
+    };
+
+    // Most recently active first.
+    const QStringList paths = m_showAllSessions
+        ? m_summaryStore->listAllTranscriptPaths()
+        : [this, &currentRoot]() {
+              QStringList list;
+              for (const QString &id : m_summaryStore->listTranscriptSessions(currentRoot)) {
+                  list << m_summaryStore->transcriptPath(currentRoot, id);
+              }
+              return list;
+          }();
+
+    SettingsStore *settings = m_plugin->settings();
+    QHash<QString, QHash<QString, SessionEntry>> stored; // root -> id -> entry
+    QList<SessionPanel::ResumableEntry> entries;
+    for (const QString &path : paths) {
+        if (entries.size() >= maxEntries) {
+            break;
+        }
+        const QFileInfo file(path);
+        const QString sessionId = file.completeBaseName();
+        const QDateTime modified = file.lastModified();
+        TranscriptInfo &info = m_transcriptInfo[path];
+        if (info.modified != modified) {
+            info.modified = modified;
+            readTranscriptStart(path, info.projectRoot, info.hasUserMessage, info.firstPrompt);
+        }
+        // The transcript header has the real directory (the folder name
+        // encoding is lossy); the current project's list uses its root.
+        const QString root = m_showAllSessions ? info.projectRoot : currentRoot;
+        if (root.isEmpty() || sessionId.isEmpty() || isSessionOpen(sessionId)) {
+            continue;
+        }
+
+        if (!stored.contains(root)) {
+            QHash<QString, SessionEntry> byId;
+            for (const SessionEntry &entry : m_sessionStore->listSessions(root)) {
+                byId.insert(entry.id, entry);
+            }
+            stored.insert(root, byId);
+        }
+        const SessionEntry session = stored.value(root).value(sessionId);
+        // Restored into a newer session, which is listed instead.
+        if (!session.replacedBy.isEmpty()) {
+            continue;
+        }
+        // A session the user never prompted has nothing to resume.
+        const QString firstPrompt = session.tracked ? session.firstPrompt
+            : info.hasUserMessage ? info.firstPrompt : QString();
+        if (firstPrompt.isEmpty()) {
+            continue;
+        }
+
+        SessionPanel::ResumableEntry entry;
+        entry.sessionId = sessionId;
+        entry.projectRoot = root;
+        const QString fullTitle = !session.title.isEmpty() ? session.title : firstPrompt;
+        entry.title = fullTitle.size() > maxTitleLength
+            ? fullTitle.left(maxTitleLength - 1).trimmed() + QChar(0x2026)
+            : fullTitle;
+        const QString when = modified.toString(QStringLiteral("yyyy-MM-dd hh:mm"));
+        entry.detail = m_showAllSessions ? QStringLiteral("%1 · %2").arg(locationName(root), when) : when;
+        const ACPProvider provider = session.providerId.isEmpty()
+            ? ACPProvider()
+            : settings->providerById(session.providerId);
+        entry.icon = settings->agentIcons()->iconFor(provider);
+        QStringList tip = {fullTitle, QStringLiteral("Directory: %1").arg(root)};
+        if (!provider.description.isEmpty()) {
+            tip << QStringLiteral("Agent: %1").arg(provider.description);
+        }
+        tip << QStringLiteral("Last active: %1").arg(when)
+            << QStringLiteral("Session: %1").arg(sessionId)
+            << QStringLiteral("Double-click to resume it in a new chat.");
+        entry.toolTip = tip.join(QLatin1Char('\n'));
+        entries.append(entry);
+    }
+
+    if (m_showAllSessions) {
+        m_sessionPanel->setResumable(QStringLiteral("Previous sessions in all directories"), QString(), entries);
+    } else {
+        m_sessionPanel->setResumable(QStringLiteral("Previous sessions in %1").arg(locationName(currentRoot)),
+                                     currentRoot, entries);
+    }
 }
 
 QString KateCodeView::getCurrentFilePath() const

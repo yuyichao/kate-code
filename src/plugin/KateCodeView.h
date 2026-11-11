@@ -3,6 +3,8 @@
 #include <KTextEditor/Document>
 #include <KTextEditor/MainWindow>
 #include <KXMLGUIClient>
+#include <QDateTime>
+#include <QHash>
 #include <QList>
 #include <QObject>
 #include <QPointer>
@@ -11,6 +13,8 @@ class KateCodePlugin;
 class ChatWidget;
 class DiffHighlightManager;
 class SessionPanel;
+class SessionStore;
+class SummaryStore;
 class QWidget;
 
 namespace KTextEditor {
@@ -45,6 +49,11 @@ public:
 public Q_SLOTS:
     // Open a new chat tab and switch to it.
     void newSession();
+    // Resume a saved session of the project in a new chat tab (or switch to
+    // the chat that has it open).
+    void resumeSavedSession(const QString &sessionId, const QString &projectRoot);
+    // The session browser with summaries, for the current project.
+    void browseSessions();
 
 public:
     // Switch to the chat (other than exclude) that has the given agent
@@ -66,7 +75,9 @@ private Q_SLOTS:
 private:
     void sendQuickAction(const QString &prompt);
     void createToolView();
-    ChatWidget *createChat();
+    // startSession: connect right away (a new session); false when the
+    // caller resumes one instead.
+    ChatWidget *createChat(bool startSession = true);
     // The chat that quick actions and "add to context" go to: the active chat
     // tab, else the last used chat, else a new one.
     ChatWidget *targetChat();
@@ -74,6 +85,8 @@ private:
     KTextEditor::View *editorView() const;
     void scheduleSessionPanelRefresh();
     void refreshSessionPanel();
+    void refreshResumableSessions();
+    bool isSessionOpen(const QString &sessionId) const;
     QList<ChatWidget *> liveChats() const;
 
     KateCodePlugin *m_plugin;
@@ -84,5 +97,16 @@ private:
     QPointer<ChatWidget> m_lastActiveChat;
     QPointer<KTextEditor::View> m_lastEditorView;
     bool m_panelRefreshPending = false;
+    SessionStore *m_sessionStore;
+    SummaryStore *m_summaryStore;
+    bool m_showAllSessions = false; // resumable list: all directories
+    // Start of each transcript, by path, valid for its mtime.
+    struct TranscriptInfo {
+        QDateTime modified;
+        QString projectRoot;
+        bool hasUserMessage = false;
+        QString firstPrompt;
+    };
+    QHash<QString, TranscriptInfo> m_transcriptInfo;
     DiffHighlightManager *m_diffHighlightManager;
 };

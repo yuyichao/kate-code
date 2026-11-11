@@ -37,6 +37,8 @@ public:
     QStringList listTranscriptSessions(const QString &projectRoot) const;
     // Path to a session's transcript file.
     QString transcriptPath(const QString &projectRoot, const QString &sessionId) const;
+    // Every transcript of every project, most recent first.
+    QStringList listAllTranscriptPaths() const;
     // Load a session's transcript content (empty if none).
     QString loadTranscript(const QString &projectRoot, const QString &sessionId) const;
 

@@ -149,6 +149,10 @@ The plugin will be installed to:
 2. The chat connects to the default ACP provider right away, using the current project's directory as its working directory
 3. Choosing another provider from the chat's provider dropdown starts a new session with it
 
+### Resuming a Session
+
+Below the open chats, the side panel lists the previous sessions of the current project (the project of the active document), most recent first, with their title (or first prompt) and logo of the agent they ran with. Double-click one to resume it in a new chat tab, with the same agent. The folder button lists the sessions of all directories instead; the history button opens the session browser, which shows each session's summary.
+
 ### Sending Messages
 
 - Type your message in the input field at the bottom

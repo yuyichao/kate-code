@@ -2,7 +2,6 @@
 #include "ChatWebView.h"
 #include "ChatInputWidget.h"
 #include "PermissionDialog.h"
-#include "SessionSelectionDialog.h"
 #include "../acp/ACPSession.h"
 #include "../config/SettingsStore.h"
 #include "../mcp/EditorSession.h"
@@ -117,14 +116,6 @@ ChatWidget::ChatWidget(QWidget *parent)
     headerLayout->addWidget(m_providerCombo);
     connect(m_providerCombo, &QComboBox::currentIndexChanged, this, &ChatWidget::onProviderComboChanged);
 
-    // Resume Session button (icon only)
-    m_resumeSessionButton = new QToolButton(this);
-    m_resumeSessionButton->setIcon(QIcon::fromTheme(QStringLiteral("view-history")));
-    m_resumeSessionButton->setToolTip(QStringLiteral("Resume Session"));
-    m_resumeSessionButton->setAutoRaise(true);
-    m_resumeSessionButton->setEnabled(false);
-    headerLayout->addWidget(m_resumeSessionButton);
-
     // New Session button (icon only)
     m_newSessionButton = new QToolButton(this);
     m_newSessionButton->setIcon(QIcon::fromTheme(QStringLiteral("document-new")));
@@ -198,7 +189,6 @@ ChatWidget::ChatWidget(QWidget *parent)
     layout->addWidget(m_splitter, 1);
 
     // Connect signals
-    connect(m_resumeSessionButton, &QPushButton::clicked, this, &ChatWidget::onResumeSessionClicked);
     connect(m_newSessionButton, &QPushButton::clicked, this, &ChatWidget::onNewSessionClicked);
     connect(m_saveOutputButton, &QToolButton::clicked, this, [this] {
         // Fetch the path of the live transcript file.
@@ -544,6 +534,7 @@ void ChatWidget::startNewSession(bool resetView, const QString &root)
     m_pendingSummaryContext.clear();
     m_injectContextOnConnect = false;
     m_reconnectSessionId.clear();
+    m_resumedFromSessionId.clear();
 
     stopSessionQuietly();
     m_chatTitle.clear();
@@ -582,40 +573,17 @@ void ChatWidget::onReconnectRequested()
     }
 }
 
-void ChatWidget::onResumeSessionClicked()
+void ChatWidget::resumeSavedSession(const QString &sessionId, const QString &projectRoot,
+                                    const QString &providerId)
 {
-    // Get current project root
-    QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
-
-    // Transcripts are written for every session (even abandoned ones), so use
-    // them - not the optional AI summaries - as the source of resumable sessions.
-    QStringList sessionIds = m_summaryStore->listTranscriptSessions(projectRoot);
-    if (sessionIds.isEmpty()) {
-        // No sessions to resume - show message.
-        Message sysMsg;
-        sysMsg.id = QStringLiteral("sys_no_sessions");
-        sysMsg.role = QStringLiteral("system");
-        sysMsg.content = QStringLiteral("No previous sessions found for: %1").arg(projectRoot);
-        sysMsg.timestamp = QDateTime::currentDateTime();
-        m_chatWebView->addMessage(sysMsg);
-        return;
+    if (m_settingsStore && !providerId.isEmpty()
+        && !m_settingsStore->providerById(providerId).executable.isEmpty()
+        && providerId != m_providerId) {
+        m_providerId = providerId;
+        populateProviderCombo();
+        applyACPBackend();
     }
-
-    // Show dialog to let user select a session to resume
-    SessionSelectionDialog dialog(projectRoot, m_summaryStore, this);
-    if (dialog.exec() != QDialog::Accepted) {
-        return;
-    }
-    switch (dialog.selectedResult()) {
-    case SessionSelectionDialog::Result::Resume:
-        resumeSession(dialog.selectedSessionId(), projectRoot);
-        break;
-    case SessionSelectionDialog::Result::NewSession:
-        startNewSession(true);
-        break;
-    case SessionSelectionDialog::Result::Cancelled:
-        break;
-    }
+    resumeSession(sessionId, projectRoot);
 }
 
 void ChatWidget::resumeSession(const QString &sessionId, const QString &projectRoot)
@@ -647,9 +615,9 @@ void ChatWidget::resumeSession(const QString &sessionId, const QString &projectR
     m_userSentMessage = false;
     stopSessionQuietly();
     // Reconnecting to the same session keeps its title until the agent
-    // reports it again; another session starts without one.
+    // reports it again; another session starts with its stored one.
     if (sessionId != m_lastSessionId) {
-        m_chatTitle.clear();
+        m_chatTitle = m_sessionStore->findSession(projectRoot, sessionId).title;
     }
 
     // Option B (per-provider): try a real ACP session/load, falling back to
@@ -663,6 +631,7 @@ void ChatWidget::resumeSession(const QString &sessionId, const QString &projectR
     }
     m_pendingSummaryContext = resumeContext;
     m_reconnectSessionId = sessionId;
+    m_resumedFromSessionId = sessionId;
     if (provider.trueResume) {
         m_pendingAction = PendingAction::LoadSession;
         m_pendingSessionId = sessionId;
@@ -759,6 +728,7 @@ void ChatWidget::onMessageSubmitted(const QString &message)
 {
     // Track that user has sent a real message (for summary generation)
     m_userSentMessage = true;
+    notePrompt(message);
 
     // Get current Kate context
     QString filePath = m_filePathProvider ? m_filePathProvider() : QString();
@@ -790,7 +760,6 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         }
         m_recentEdits.clear();
         m_inputWidget->setConfigOptions({});
-        m_resumeSessionButton->setEnabled(true);
         m_newSessionButton->setEnabled(true);
         m_providerCombo->setEnabled(true);
         m_inputWidget->setEnabled(false);
@@ -822,7 +791,6 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
                                    m_settingsStore->acpLogSubdirectory());
         }
         m_chatWebView->disableReconnectPrompts();
-        m_resumeSessionButton->setEnabled(false);
         m_newSessionButton->setEnabled(false);
         m_providerCombo->setEnabled(false);
         m_statusIndicator->setStyleSheet(QStringLiteral("QLabel { color: #f0ad4e; font-size: 14px; }"));
@@ -832,7 +800,6 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         m_chatWebView->addMessage(sysMsg);
         break;
     case ConnectionStatus::Connected:
-        m_resumeSessionButton->setEnabled(true);
         m_newSessionButton->setEnabled(true);
         // Switching provider starts a new session with it.
         m_providerCombo->setEnabled(true);
@@ -849,7 +816,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         // during the connect handshake.
         {
             const QString projectRoot = m_session->workingDir();
-            m_sessionStore->saveSession(projectRoot, m_session->sessionId());
+            m_sessionStore->recordSession(projectRoot, m_session->sessionId(), m_providerId);
             m_lastSessionId = m_session->sessionId();
             m_lastProjectRoot = projectRoot;
             m_reconnectSessionId = m_session->sessionId();
@@ -864,6 +831,16 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         // The framing matters: a raw transcript ends with the last exchange,
         // and without it agents treat that as a fresh instruction and re-run
         // the previous task.
+        // A session restored by context injection is a new agent session:
+        // carry the previous title over, before the injected context would
+        // make the agent title it after that.
+        if (m_injectContextOnConnect && !m_chatTitle.isEmpty()) {
+            m_session->setTitle(m_chatTitle);
+        }
+        if (m_injectContextOnConnect) {
+            m_sessionStore->markReplaced(m_session->workingDir(), m_resumedFromSessionId, m_session->sessionId());
+        }
+        m_resumedFromSessionId.clear();
         if (m_injectContextOnConnect && !m_pendingSummaryContext.isEmpty()) {
             QString contextMessage = QStringLiteral(
                 "<system-reminder>\n"
@@ -886,7 +863,6 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
             m_editorSession->cancelPendingQuestions(QStringLiteral("the agent session ended"));
         }
         m_inputWidget->setConfigOptions({});
-        m_resumeSessionButton->setEnabled(true);
         m_newSessionButton->setEnabled(true);
         m_providerCombo->setEnabled(true);
         m_statusIndicator->setStyleSheet(QStringLiteral("QLabel { color: #d9534f; font-size: 14px; }"));
@@ -1201,11 +1177,29 @@ void ChatWidget::sendPromptWithSelection(const QString &prompt, const QString &f
         return;
     }
     m_userSentMessage = true;
+    notePrompt(prompt);
 
     // Send prompt with selection directly to ACP (no context chunks for quick actions)
     m_session->sendMessage(prompt, filePath, selection, QList<ContextChunk>());
 
     qDebug() << "[ChatWidget] Sent quick action prompt with selection from:" << filePath;
+}
+
+void ChatWidget::notePrompt(const QString &prompt)
+{
+    const QString sessionId = m_session->sessionId();
+    if (sessionId.isEmpty()) {
+        return;
+    }
+    QString firstLine;
+    for (const QString &line : prompt.split(QLatin1Char('\n'))) {
+        firstLine = line.simplified();
+        if (!firstLine.isEmpty()) {
+            break;
+        }
+    }
+    constexpr int maxLength = 200;
+    m_sessionStore->setFirstPrompt(m_session->workingDir(), sessionId, firstLine.left(maxLength));
 }
 
 void ChatWidget::sendQueuedQuickActions()
@@ -1898,6 +1892,11 @@ void ChatWidget::resetWebView()
 
 void ChatWidget::onSessionTitleChanged(const QString &title)
 {
+    // Kept with the saved session for the session list and resuming (also
+    // when unchanged here: a resumed title is new to the restored session).
+    if (!title.isEmpty() && !m_session->sessionId().isEmpty()) {
+        m_sessionStore->setSessionTitle(m_session->workingDir(), m_session->sessionId(), title);
+    }
     if (title == m_chatTitle) {
         return;
     }

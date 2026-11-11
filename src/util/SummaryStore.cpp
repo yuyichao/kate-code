@@ -2,8 +2,12 @@
 
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QStandardPaths>
 #include <QTextStream>
+
+#include <algorithm>
+#include <utility>
 
 SummaryStore::SummaryStore(QObject *parent)
     : QObject(parent)
@@ -89,6 +93,24 @@ QStringList SummaryStore::listTranscriptSessions(const QString &projectRoot) con
         sessionIds << file.chopped(3); // Remove ".md"
     }
     return sessionIds;
+}
+
+QStringList SummaryStore::listAllTranscriptPaths() const
+{
+    QDir base(QDir::homePath() + QStringLiteral("/.kate-code/transcripts"));
+    QFileInfoList files;
+    for (const QString &project : base.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        files += QDir(base.filePath(project)).entryInfoList({QStringLiteral("*.md")}, QDir::Files);
+    }
+    std::sort(files.begin(), files.end(), [](const QFileInfo &a, const QFileInfo &b) {
+        return a.lastModified() > b.lastModified();
+    });
+    QStringList paths;
+    paths.reserve(files.size());
+    for (const QFileInfo &file : std::as_const(files)) {
+        paths << file.absoluteFilePath();
+    }
+    return paths;
 }
 
 QString SummaryStore::transcriptPath(const QString &projectRoot, const QString &sessionId) const

@@ -35,10 +35,12 @@ void SessionStore::addSession(const QString &projectRoot, const QString &session
 
     // If session already exists, preserve its name/note unless new ones are provided
     QString resolvedNote = note;
+    SessionEntry previous;
     for (const SessionEntry &e : existing) {
         if (e.id == sessionId) {
             if (name.isEmpty()) sessionName = e.name;
             if (note.isEmpty()) resolvedNote = e.note;
+            previous = e;
             break;
         }
     }
@@ -53,6 +55,11 @@ void SessionStore::addSession(const QString &projectRoot, const QString &session
     entry.name = sessionName;
     entry.note = resolvedNote;
     entry.timestamp = QDateTime::currentDateTime();
+    entry.title = previous.title;
+    entry.providerId = previous.providerId;
+    entry.firstPrompt = previous.firstPrompt;
+    entry.replacedBy = previous.replacedBy;
+    entry.tracked = previous.tracked;
     existing.prepend(entry);
 
     if (existing.size() > MaxSessions) {
@@ -84,6 +91,11 @@ QList<SessionEntry> SessionStore::listSessions(const QString &projectRoot) const
         entry.id = settings.value(QStringLiteral("id")).toString();
         entry.name = settings.value(QStringLiteral("name")).toString();
         entry.note = settings.value(QStringLiteral("note")).toString();
+        entry.title = settings.value(QStringLiteral("title")).toString();
+        entry.providerId = settings.value(QStringLiteral("provider")).toString();
+        entry.firstPrompt = settings.value(QStringLiteral("firstPrompt")).toString();
+        entry.replacedBy = settings.value(QStringLiteral("replacedBy")).toString();
+        entry.tracked = settings.value(QStringLiteral("tracked"), false).toBool();
         entry.timestamp = QDateTime::fromString(
             settings.value(QStringLiteral("timestamp")).toString(), Qt::ISODate);
         if (!entry.id.isEmpty()) {
@@ -174,6 +186,94 @@ void SessionStore::saveSession(const QString &projectRoot, const QString &sessio
     addSession(projectRoot, sessionId, QString());
 }
 
+void SessionStore::recordSession(const QString &projectRoot, const QString &sessionId, const QString &providerId)
+{
+    addSession(projectRoot, sessionId, QString());
+    QList<SessionEntry> sessions = listSessions(projectRoot);
+    for (auto &entry : sessions) {
+        if (entry.id == sessionId) {
+            if (!entry.tracked || (!providerId.isEmpty() && entry.providerId != providerId)) {
+                entry.tracked = true;
+                if (!providerId.isEmpty()) {
+                    entry.providerId = providerId;
+                }
+                writeAll(projectRoot, sessions);
+            }
+            return;
+        }
+    }
+}
+
+void SessionStore::setFirstPrompt(const QString &projectRoot, const QString &sessionId, const QString &prompt)
+{
+    if (prompt.isEmpty()) {
+        return;
+    }
+    QList<SessionEntry> sessions = listSessions(projectRoot);
+    for (auto &entry : sessions) {
+        if (entry.id == sessionId) {
+            if (entry.firstPrompt.isEmpty()) {
+                entry.firstPrompt = prompt;
+                writeAll(projectRoot, sessions);
+            }
+            return;
+        }
+    }
+}
+
+void SessionStore::markReplaced(const QString &projectRoot, const QString &oldSessionId, const QString &newSessionId)
+{
+    if (oldSessionId.isEmpty() || newSessionId.isEmpty() || oldSessionId == newSessionId) {
+        return;
+    }
+    QList<SessionEntry> sessions = listSessions(projectRoot);
+    QString firstPrompt;
+    for (auto &entry : sessions) {
+        if (entry.id == oldSessionId) {
+            firstPrompt = entry.firstPrompt;
+            // Without a first prompt to carry over, the new session is not
+            // listed until prompted; keep the old one listed meanwhile.
+            if (!firstPrompt.isEmpty()) {
+                entry.replacedBy = newSessionId;
+            }
+        }
+    }
+    if (firstPrompt.isEmpty()) {
+        return;
+    }
+    for (auto &entry : sessions) {
+        if (entry.id == newSessionId && entry.firstPrompt.isEmpty()) {
+            entry.firstPrompt = firstPrompt;
+        }
+    }
+    writeAll(projectRoot, sessions);
+}
+
+void SessionStore::setSessionTitle(const QString &projectRoot, const QString &sessionId, const QString &title)
+{
+    QList<SessionEntry> sessions = listSessions(projectRoot);
+    for (auto &entry : sessions) {
+        if (entry.id == sessionId) {
+            if (entry.title != title) {
+                entry.title = title;
+                writeAll(projectRoot, sessions);
+            }
+            return;
+        }
+    }
+}
+
+SessionEntry SessionStore::findSession(const QString &projectRoot, const QString &sessionId) const
+{
+    const QList<SessionEntry> sessions = listSessions(projectRoot);
+    for (const SessionEntry &entry : sessions) {
+        if (entry.id == sessionId) {
+            return entry;
+        }
+    }
+    return {};
+}
+
 void SessionStore::writeAll(const QString &projectRoot, const QList<SessionEntry> &sessions)
 {
     if (projectRoot.isEmpty()) {
@@ -193,6 +293,21 @@ void SessionStore::writeAll(const QString &projectRoot, const QList<SessionEntry
         m_settings.setValue(QStringLiteral("name"), sessions.at(i).name);
         m_settings.setValue(QStringLiteral("note"), sessions.at(i).note);
         m_settings.setValue(QStringLiteral("timestamp"), sessions.at(i).timestamp.toString(Qt::ISODate));
+        if (!sessions.at(i).title.isEmpty()) {
+            m_settings.setValue(QStringLiteral("title"), sessions.at(i).title);
+        }
+        if (!sessions.at(i).providerId.isEmpty()) {
+            m_settings.setValue(QStringLiteral("provider"), sessions.at(i).providerId);
+        }
+        if (!sessions.at(i).firstPrompt.isEmpty()) {
+            m_settings.setValue(QStringLiteral("firstPrompt"), sessions.at(i).firstPrompt);
+        }
+        if (!sessions.at(i).replacedBy.isEmpty()) {
+            m_settings.setValue(QStringLiteral("replacedBy"), sessions.at(i).replacedBy);
+        }
+        if (sessions.at(i).tracked) {
+            m_settings.setValue(QStringLiteral("tracked"), true);
+        }
     }
     m_settings.endArray();
     m_settings.endGroup();

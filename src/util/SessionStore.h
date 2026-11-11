@@ -11,6 +11,11 @@ struct SessionEntry {
     QString name;
     QString note;
     QDateTime timestamp;
+    QString title;      // the session's title (from the agent or renamed)
+    QString providerId; // ACP provider the session ran with
+    QString firstPrompt; // first line of the user's first prompt
+    QString replacedBy;  // restored (context injection) as this session
+    bool tracked = false; // recorded with prompt tracking (firstPrompt is reliable)
 };
 
 /**
@@ -55,6 +60,23 @@ public:
 
     // Compatibility: save a single session (adds to front of list with auto-name)
     void saveSession(const QString &projectRoot, const QString &sessionId);
+
+    // Record a started session (moved to the front, keeping its title) and
+    // the provider it runs with.
+    void recordSession(const QString &projectRoot, const QString &sessionId, const QString &providerId);
+
+    // Store the session's title; no-op for a session not in the list.
+    void setSessionTitle(const QString &projectRoot, const QString &sessionId, const QString &title);
+
+    // Store the user's first prompt (kept once set).
+    void setFirstPrompt(const QString &projectRoot, const QString &sessionId, const QString &prompt);
+
+    // A session restored into a new agent session by context injection: the
+    // new one carries its first prompt, the old one is marked replaced.
+    void markReplaced(const QString &projectRoot, const QString &oldSessionId, const QString &newSessionId);
+
+    // The stored entry for a session (empty id if none).
+    SessionEntry findSession(const QString &projectRoot, const QString &sessionId) const;
 
     // List all project roots that have saved sessions
     QStringList listAllProjectRoots() const;
