@@ -45,6 +45,10 @@ public Q_SLOTS:
     // Returns JSON object with answers keyed by question header, or "ERROR: ..." on failure.
     QString askUserQuestion(const QString &questionsJson);
 
+    // Sends text to Kate's embedded terminal without executing it (no Enter).
+    // Returns "OK" on success or "ERROR: ..." on failure.
+    QString pasteToTerminal(const QString &text);
+
 Q_SIGNALS:
     // Emitted when editDocument succeeds, with the edit parameters
     void editApplied(const QString &filePath, const QString &oldText, const QString &newText);

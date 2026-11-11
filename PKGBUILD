@@ -14,6 +14,7 @@ depends=(
     'syntax-highlighting'
     'kwallet'
     'kpty'
+    'kparts'
     'qt6-webengine'
 )
 makedepends=(

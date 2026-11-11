@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libkf6syntaxhighlighting-dev \
     libkf6wallet-dev \
     libkf6pty-dev \
+    libkf6parts-dev \
     qt6-webengine-dev \
     devscripts \
     debhelper \

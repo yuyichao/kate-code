@@ -18,6 +18,7 @@ RUN dnf install -y \
     kf6-syntax-highlighting-devel \
     kf6-kwallet-devel \
     kf6-kpty-devel \
+    kf6-kparts-devel \
     qt6-qtwebengine-devel \
     && dnf clean all
 

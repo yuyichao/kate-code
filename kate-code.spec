@@ -16,6 +16,7 @@ BuildRequires:  kf6-kcoreaddons-devel
 BuildRequires:  kf6-kxmlgui-devel
 BuildRequires:  kf6-syntax-highlighting-devel
 BuildRequires:  kf6-kpty-devel
+BuildRequires:  kf6-kparts-devel
 BuildRequires:  qt6-webenginewidgets-devel
 
 Recommends:     claude-code-acp

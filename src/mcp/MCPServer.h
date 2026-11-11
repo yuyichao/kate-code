@@ -28,6 +28,7 @@ private:
     QJsonObject executeEdit(const QJsonObject &arguments);
     QJsonObject executeWrite(const QJsonObject &arguments);
     QJsonObject executeAskUserQuestion(const QJsonObject &arguments);
+    QJsonObject executePasteToTerminal(const QJsonObject &arguments);
 
     QJsonObject makeResponse(int id, const QJsonObject &result);
     QJsonObject makeErrorResponse(int id, int code, const QString &message);

@@ -17,6 +17,7 @@ RUN pacman -Syu --noconfirm && \
     syntax-highlighting \
     kwallet \
     kpty \
+    kparts \
     qt6-webengine \
     git \
     && pacman -Scc --noconfirm

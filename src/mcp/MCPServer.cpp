@@ -307,8 +307,38 @@ QJsonObject MCPServer::handleToolsList(int id, const QJsonObject &params)
     askUserAnnotations[QStringLiteral("destructiveHint")] = false;
     askUserTool[QStringLiteral("annotations")] = askUserAnnotations;
 
+    // katecode_paste_to_terminal tool definition
+    QJsonObject pasteTerminalTool;
+    pasteTerminalTool[QStringLiteral("name")] = QStringLiteral("katecode_paste_to_terminal");
+    pasteTerminalTool[QStringLiteral("description")] =
+        QStringLiteral("Sends a single line of text to Kate's embedded terminal without executing it (no Enter key). "
+                       "The user can review the text and press Enter themselves. "
+                       "Text containing line breaks or other control characters is rejected. "
+                       "Requires Kate's terminal plugin to be enabled.");
+
+    QJsonObject pasteTextProp;
+    pasteTextProp[QStringLiteral("type")] = QStringLiteral("string");
+    pasteTextProp[QStringLiteral("description")] = QStringLiteral("The single line of text to paste into the terminal");
+
+    QJsonObject pasteTerminalProps;
+    pasteTerminalProps[QStringLiteral("text")] = pasteTextProp;
+
+    QJsonObject pasteTerminalSchema;
+    pasteTerminalSchema[QStringLiteral("type")] = QStringLiteral("object");
+    pasteTerminalSchema[QStringLiteral("properties")] = pasteTerminalProps;
+    pasteTerminalSchema[QStringLiteral("required")] = QJsonArray{QStringLiteral("text")};
+    pasteTerminalTool[QStringLiteral("inputSchema")] = pasteTerminalSchema;
+
+    QJsonObject pasteTerminalAnnotations;
+    pasteTerminalAnnotations[QStringLiteral("readOnlyHint")] = false;
+    pasteTerminalAnnotations[QStringLiteral("destructiveHint")] = false;
+    pasteTerminalTool[QStringLiteral("annotations")] = pasteTerminalAnnotations;
+
     QJsonObject result;
-    result[QStringLiteral("tools")] = QJsonArray{docsTool, readTool, editTool, writeTool, askUserTool};
+    result[QStringLiteral("tools")] = QJsonArray{
+        docsTool, readTool, editTool, writeTool, askUserTool,
+        pasteTerminalTool
+    };
 
     return makeResponse(id, result);
 }
@@ -337,6 +367,8 @@ QJsonObject MCPServer::handleToolsCall(int id, const QJsonObject &params)
         return makeResponse(id, executeWrite(arguments));
     } else if (toolName == QStringLiteral("katecode_ask_user")) {
         return makeResponse(id, executeAskUserQuestion(arguments));
+    } else if (toolName == QStringLiteral("katecode_paste_to_terminal")) {
+        return makeResponse(id, executePasteToTerminal(arguments));
     }
 
     return makeErrorResponse(id, -32602, QStringLiteral("Unknown tool: %1").arg(toolName));
@@ -768,5 +800,34 @@ QJsonObject MCPServer::executeAskUserQuestion(const QJsonObject &arguments)
 
     QJsonObject result;
     result[QStringLiteral("content")] = QJsonArray{textContent};
+    return result;
+}
+
+QJsonObject MCPServer::executePasteToTerminal(const QJsonObject &arguments)
+{
+    const QString text = arguments[QStringLiteral("text")].toString();
+    if (text.isEmpty())
+        return makeErrorResult(QStringLiteral("Error: text is required"));
+
+    QDBusInterface iface(editorServiceName(),
+                         QStringLiteral("/KateCode/Editor"),
+                         QStringLiteral("org.kde.katecode.Editor"),
+                         QDBusConnection::sessionBus());
+    if (!iface.isValid())
+        return makeErrorResult(QStringLiteral("Error: Could not connect to Kate editor DBus service."));
+
+    QDBusReply<QString> reply = iface.call(QStringLiteral("pasteToTerminal"), text);
+    if (!reply.isValid())
+        return makeErrorResult(QStringLiteral("Error: DBus call failed: %1").arg(reply.error().message()));
+
+    const QString response = reply.value();
+    bool isError = response.startsWith(QStringLiteral("ERROR:"));
+    QJsonObject textContent;
+    textContent[QStringLiteral("type")] = QStringLiteral("text");
+    textContent[QStringLiteral("text")] = response;
+    QJsonObject result;
+    result[QStringLiteral("content")] = QJsonArray{textContent};
+    if (isError)
+        result[QStringLiteral("isError")] = true;
     return result;
 }
