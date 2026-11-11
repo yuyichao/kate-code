@@ -79,25 +79,6 @@ which claude-agent-acp
 The `kate-code-git` package is maintained in the archlinuxcn package
 repositories; its PKGBUILD is tracked there rather than in this repository.
 
-#### Fedora / RHEL
-```bash
-# Build RPM using Docker
-./build-packages.sh rpm
-
-# Install the resulting package
-sudo dnf install dist/kate-code-1.0.0-1.*.rpm
-```
-
-#### Debian / Ubuntu
-```bash
-# Build deb using Docker
-./build-packages.sh deb
-
-# Install the resulting package
-sudo dpkg -i dist/kate-code_1.0.0-1_amd64.deb
-sudo apt-get install -f  # Install any missing dependencies
-```
-
 ### Option 2: Build from Source
 
 #### Install Build Dependencies
