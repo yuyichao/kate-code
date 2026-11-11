@@ -1,4 +1,9 @@
 #include "ChatInputWidget.h"
+#include "FlowLayout.h"
+
+#include <QActionGroup>
+#include <QMenu>
+#include <QToolButton>
 
 #include <QAbstractItemView>
 #include <QBuffer>
@@ -311,6 +316,16 @@ ChatInputWidget::ChatInputWidget(QWidget *parent)
 
     mainLayout->addLayout(modeLayout);
 
+    // Session option row (model, effort, ...). Wraps onto more lines in a
+    // narrow panel instead of widening it.
+    m_optionsRow = new QWidget(this);
+    m_optionsLayout = new FlowLayout(m_optionsRow, 4);
+    m_optionsRow->hide();
+    // QSplitter ignores height-for-width, so keep the row's minimum height at
+    // its wrapped height for the current width (see updateOptionsRowHeight).
+    m_optionsRow->installEventFilter(this);
+    mainLayout->addWidget(m_optionsRow);
+
     // Input row
     auto *inputLayout = new QHBoxLayout();
     inputLayout->setContentsMargins(0, 0, 0, 0);
@@ -397,6 +412,7 @@ void ChatInputWidget::setEnabled(bool enabled)
     m_sendButton->setEnabled(enabled);
     m_modeComboBox->setEnabled(enabled);
     m_attachFileButton->setEnabled(enabled);
+    m_optionsRow->setEnabled(enabled);
     // Stop button state is controlled by setPromptRunning(), not general enabled state
     updateWaitingIndicator();
 }
@@ -418,6 +434,11 @@ QString ChatInputWidget::permissionMode() const
 
 bool ChatInputWidget::eventFilter(QObject *obj, QEvent *event)
 {
+    if (obj == m_optionsRow && event->type() == QEvent::Resize) {
+        updateOptionsRowHeight();
+        return false;
+    }
+
     if (obj == m_textEdit && event->type() == QEvent::KeyPress) {
         QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
 
@@ -709,4 +730,229 @@ void ChatInputWidget::onAttachFileClicked()
 
     m_textEdit->setTextCursor(cursor);
     m_textEdit->setFocus();
+}
+
+// ---------------------------------------------------------------------------
+// Session option controls
+// ---------------------------------------------------------------------------
+
+namespace
+{
+struct Choice {
+    QString group;
+    QString value;
+    QString name;
+    QString description;
+};
+
+// ACP select choices may be a flat array or grouped one level deep.
+QList<Choice> selectChoices(const QJsonObject &option)
+{
+    QList<Choice> choices;
+    for (const QJsonValue &entry : option[QStringLiteral("options")].toArray()) {
+        const QJsonObject obj = entry.toObject();
+        if (obj.contains(QStringLiteral("options"))) {
+            const QString group = obj[QStringLiteral("name")].toString(obj[QStringLiteral("group")].toString());
+            for (const QJsonValue &nested : obj[QStringLiteral("options")].toArray()) {
+                const QJsonObject c = nested.toObject();
+                choices.append({group, c[QStringLiteral("value")].toString(),
+                                c[QStringLiteral("name")].toString(), c[QStringLiteral("description")].toString()});
+            }
+        } else {
+            choices.append({QString(), obj[QStringLiteral("value")].toString(),
+                            obj[QStringLiteral("name")].toString(), obj[QStringLiteral("description")].toString()});
+        }
+    }
+    return choices;
+}
+
+bool isBooleanOption(const QJsonObject &option)
+{
+    return option[QStringLiteral("type")].toString() == QStringLiteral("boolean");
+}
+
+bool isSupportedOption(const QJsonObject &option)
+{
+    const QString type = option[QStringLiteral("type")].toString();
+    return type == QStringLiteral("select") || type == QStringLiteral("boolean");
+}
+
+// Longest label shown on an option button; the full text is in the tooltip.
+constexpr int MaxOptionLabelWidth = 160;
+}
+
+QToolButton *ChatInputWidget::optionButton(const QString &configId)
+{
+    if (QToolButton *existing = m_optionButtons.value(configId)) {
+        return existing;
+    }
+
+    auto *button = new QToolButton(m_optionsRow);
+    button->setAutoRaise(true);
+    button->setToolButtonStyle(Qt::ToolButtonTextOnly);
+
+    // Booleans are toggles; selects open a menu that is filled on demand
+    // from the latest option data (choices change with the model).
+    connect(button, &QToolButton::clicked, this, [this, configId](bool checked) {
+        const QJsonObject option = m_optionData.value(configId);
+        if (!isBooleanOption(option)) {
+            return;
+        }
+        QJsonObject optimistic = option;
+        optimistic[QStringLiteral("currentValue")] = checked;
+        m_optionData.insert(configId, optimistic);
+        updateOptionButton(configId);
+        Q_EMIT configOptionChanged(configId, QJsonValue(checked));
+    });
+
+    auto *menu = new QMenu(button);
+    menu->setToolTipsVisible(true);
+    connect(menu, &QMenu::aboutToShow, this, [this, configId, menu]() {
+        populateOptionMenu(configId, menu);
+    });
+    button->setProperty("katecodeMenu", QVariant::fromValue(static_cast<QObject *>(menu)));
+
+    m_optionButtons.insert(configId, button);
+    return button;
+}
+
+void ChatInputWidget::setConfigOptions(const QJsonArray &options)
+{
+    QStringList order;
+    for (const QJsonValue &value : options) {
+        const QJsonObject option = value.toObject();
+        const QString id = option[QStringLiteral("id")].toString();
+        if (id.isEmpty() || id == QStringLiteral("mode") || !isSupportedOption(option)) {
+            continue;
+        }
+        m_optionData.insert(id, option);
+        order.append(id);
+    }
+
+    // Hide options the agent no longer advertises (never delete: a menu may be open).
+    for (auto it = m_optionButtons.constBegin(); it != m_optionButtons.constEnd(); ++it) {
+        if (!order.contains(it.key())) {
+            it.value()->hide();
+            m_optionData.remove(it.key());
+        }
+    }
+
+    // Re-insert the buttons in the agent's order.
+    if (order != m_optionOrder) {
+        for (QToolButton *button : std::as_const(m_optionButtons)) {
+            m_optionsLayout->removeWidget(button);
+        }
+        for (const QString &id : std::as_const(order)) {
+            m_optionsLayout->addWidget(optionButton(id));
+        }
+        m_optionOrder = order;
+    }
+
+    for (const QString &id : std::as_const(order)) {
+        updateOptionButton(id);
+        m_optionButtons.value(id)->show();
+    }
+
+    m_optionsRow->setVisible(!order.isEmpty());
+    updateOptionsRowHeight();
+}
+
+void ChatInputWidget::updateOptionsRowHeight()
+{
+    const int width = m_optionsRow->width();
+    if (width <= 0) {
+        return;
+    }
+    const int height = m_optionsLayout->heightForWidth(width);
+    if (m_optionsRow->minimumHeight() != height) {
+        m_optionsRow->setMinimumHeight(height);
+    }
+}
+
+void ChatInputWidget::updateOptionButton(const QString &configId)
+{
+    QToolButton *button = m_optionButtons.value(configId);
+    if (!button) {
+        return;
+    }
+    const QJsonObject option = m_optionData.value(configId);
+    const QString optionName = option[QStringLiteral("name")].toString(configId);
+    const QString optionDescription = option[QStringLiteral("description")].toString();
+
+    if (isBooleanOption(option)) {
+        button->setMenu(nullptr);
+        button->setPopupMode(QToolButton::DelayedPopup);
+        button->setCheckable(true);
+        button->blockSignals(true);
+        const bool on = option[QStringLiteral("currentValue")].toBool();
+        button->setChecked(on);
+        button->blockSignals(false);
+        button->setText(QStringLiteral("%1: %2").arg(optionName, on ? QStringLiteral("on") : QStringLiteral("off")));
+        button->setToolTip(optionDescription.isEmpty()
+                               ? optionName
+                               : QStringLiteral("%1: %2").arg(optionName, optionDescription));
+        return;
+    }
+
+    // Select: show the current choice; the option name is in the tooltip.
+    auto *menu = qobject_cast<QMenu *>(button->property("katecodeMenu").value<QObject *>());
+    button->setCheckable(false);
+    button->setMenu(menu);
+    button->setPopupMode(QToolButton::InstantPopup);
+
+    const QString current = option[QStringLiteral("currentValue")].toString();
+    QString currentName = current;
+    QString currentDescription;
+    for (const Choice &choice : selectChoices(option)) {
+        if (choice.value == current) {
+            currentName = choice.name.isEmpty() ? choice.value : choice.name;
+            currentDescription = choice.description;
+            break;
+        }
+    }
+    const QString label = QStringLiteral("%1: %2").arg(optionName, currentName);
+    button->setText(button->fontMetrics().elidedText(label, Qt::ElideRight, MaxOptionLabelWidth));
+    QString tip = label;
+    if (!currentDescription.isEmpty()) {
+        tip += QStringLiteral("\n") + currentDescription;
+    } else if (!optionDescription.isEmpty()) {
+        tip += QStringLiteral("\n") + optionDescription;
+    }
+    button->setToolTip(tip);
+}
+
+void ChatInputWidget::populateOptionMenu(const QString &configId, QMenu *menu)
+{
+    menu->clear();
+    const QJsonObject option = m_optionData.value(configId);
+    const QString current = option[QStringLiteral("currentValue")].toString();
+
+    auto *group = new QActionGroup(menu);
+    group->setExclusive(true);
+    QString lastGroup;
+    for (const Choice &choice : selectChoices(option)) {
+        if (!choice.group.isEmpty() && choice.group != lastGroup) {
+            menu->addSection(choice.group);
+            lastGroup = choice.group;
+        }
+        QAction *action = menu->addAction(choice.name.isEmpty() ? choice.value : choice.name);
+        action->setCheckable(true);
+        action->setChecked(choice.value == current);
+        action->setToolTip(choice.description);
+        group->addAction(action);
+        const QString value = choice.value;
+        connect(action, &QAction::triggered, this, [this, configId, value]() {
+            QJsonObject optimistic = m_optionData.value(configId);
+            if (optimistic[QStringLiteral("currentValue")].toString() == value) {
+                return;
+            }
+            // Show the choice right away; the agent's reply confirms or
+            // rolls it back via setConfigOptions().
+            optimistic[QStringLiteral("currentValue")] = value;
+            m_optionData.insert(configId, optimistic);
+            updateOptionButton(configId);
+            updateOptionsRowHeight();
+            Q_EMIT configOptionChanged(configId, QJsonValue(value));
+        });
+    }
 }

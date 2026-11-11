@@ -236,6 +236,16 @@ ChatWidget::ChatWidget(QWidget *parent)
     connect(m_session, &ACPSession::modesAvailable, this, &ChatWidget::onModesAvailable);
     connect(m_session, &ACPSession::modeChanged, this, &ChatWidget::onModeChanged);
     connect(m_session, &ACPSession::commandsAvailable, m_inputWidget, &ChatInputWidget::setAvailableCommands);
+
+    // Session options (model, effort, ...). Connected with this widget as
+    // context so ~ChatWidget's disconnect covers them.
+    connect(m_session, &ACPSession::configOptionsChanged, this, [this](const QJsonArray &options) {
+        m_inputWidget->setConfigOptions(options);
+    });
+    connect(m_inputWidget, &ChatInputWidget::configOptionChanged, this,
+            [this](const QString &configId, const QJsonValue &value) {
+                m_session->setConfigOption(configId, value);
+            });
     connect(m_session, &ACPSession::errorOccurred, this, &ChatWidget::onError);
     connect(m_session, &ACPSession::sessionError, this, &ChatWidget::onSessionError);
     connect(m_session, &ACPSession::promptCancelled, this, &ChatWidget::onPromptCancelled);
@@ -761,6 +771,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
             m_releaseAgentSlot();
         }
         m_recentEdits.clear();
+        m_inputWidget->setConfigOptions({});
         m_connectButton->setIcon(QIcon::fromTheme(QStringLiteral("network-connect")));
         m_connectButton->setToolTip(QStringLiteral("Connect"));
         m_connectButton->setEnabled(true);
@@ -858,6 +869,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         if (m_releaseAgentSlot) {
             m_releaseAgentSlot();
         }
+        m_inputWidget->setConfigOptions({});
         m_connectButton->setIcon(QIcon::fromTheme(QStringLiteral("network-connect")));
         m_connectButton->setToolTip(QStringLiteral("Connect"));
         m_connectButton->setEnabled(true);

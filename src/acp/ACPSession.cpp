@@ -193,6 +193,8 @@ void ACPSession::resetSessionState()
     m_interactiveModeRequestId = -1;
     m_pendingModeValue.clear();
     m_queuedModeValue.clear();
+    m_configRequestOption.clear();
+    m_queuedConfigValues.clear();
     // Reset agent capability flags so they don't leak across reconnections.
     m_supportsImage = false;
     m_supportsEmbeddedContext = false;
@@ -945,6 +947,12 @@ void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject
         return;
     }
 
+    // Interactive change of another config option (model, effort, ...).
+    if (m_configRequestOption.contains(id)) {
+        handleInteractiveConfigResponse(id, result, error);
+        return;
+    }
+
     // A prompt cancelled on behalf of requestSummary() has now fully finished
     // (this is its response), so no further chunks from the old turn can
     // arrive: it is safe to send the parked summary prompt.
@@ -1140,6 +1148,9 @@ void ACPSession::parseSessionSetupResult(const QJsonObject &result)
 void ACPSession::updateSessionConfigOptions(const QJsonArray &configOptions, bool emitChanges)
 {
     m_availableConfigOptions = configOptions;
+    if (emitChanges) {
+        Q_EMIT configOptionsChanged(m_availableConfigOptions);
+    }
 
     for (const QJsonValue &value : configOptions) {
         const QJsonObject option = value.toObject();
@@ -1320,6 +1331,76 @@ void ACPSession::handleInteractiveModeResponse(const QJsonObject &result, const 
     }
 }
 
+void ACPSession::setConfigOption(const QString &configId, const QJsonValue &value)
+{
+    if (m_sessionId.isEmpty() || configId.isEmpty()) {
+        return;
+    }
+    // The permission mode keeps its own path (legacy set_mode fallback).
+    if (configId == QStringLiteral("mode")) {
+        setMode(value.toString());
+        return;
+    }
+
+    // One request per option at a time; remember only the latest value.
+    for (auto it = m_configRequestOption.constBegin(); it != m_configRequestOption.constEnd(); ++it) {
+        if (it.value() == configId) {
+            m_queuedConfigValues.insert(configId, value);
+            return;
+        }
+    }
+    sendConfigOption(configId, value);
+}
+
+void ACPSession::sendConfigOption(const QString &configId, const QJsonValue &value)
+{
+    QJsonObject params;
+    params[QStringLiteral("sessionId")] = m_sessionId;
+    params[QStringLiteral("configId")] = configId;
+    params[QStringLiteral("value")] = value;
+    if (value.isBool()) {
+        // Required by the ACP boolean config-option request variant.
+        params[QStringLiteral("type")] = QStringLiteral("boolean");
+    }
+    const int reqId = m_service->sendRequest(QStringLiteral("session/set_config_option"), params);
+    if (reqId < 0) {
+        qWarning() << "[ACPSession] Failed to send session/set_config_option for" << configId;
+        Q_EMIT configOptionsChanged(m_availableConfigOptions);
+        return;
+    }
+    m_configRequestOption.insert(reqId, configId);
+    qDebug() << "[ACPSession] Sent session/set_config_option" << configId << "=" << value << "reqId=" << reqId;
+}
+
+void ACPSession::handleInteractiveConfigResponse(int id, const QJsonObject &result, const QJsonObject &error)
+{
+    const QString configId = m_configRequestOption.take(id);
+
+    if (!error.isEmpty()) {
+        const QString message = QStringLiteral("Could not change %1: %2")
+                                    .arg(configId,
+                                         error[QStringLiteral("message")].toString(QStringLiteral("unknown error")));
+        qWarning() << "[ACPSession]" << message;
+        Q_EMIT errorOccurred(message);
+        // Roll the controls back to the last confirmed state.
+        Q_EMIT configOptionsChanged(m_availableConfigOptions);
+    } else if (result.contains(QStringLiteral("configOptions"))) {
+        // The agent returns the full list; a model change can replace the
+        // effort choices or add/remove options.
+        updateSessionConfigOptions(result[QStringLiteral("configOptions")].toArray(), true);
+    } else {
+        // Bodyless success (not expected from claude-agent-acp, which always
+        // returns the list): keep showing the last list the agent reported;
+        // a later config_option_update will carry the new value.
+        Q_EMIT configOptionsChanged(m_availableConfigOptions);
+    }
+
+    if (m_queuedConfigValues.contains(configId)) {
+        const QJsonValue queued = m_queuedConfigValues.take(configId);
+        sendConfigOption(configId, queued);
+    }
+}
+
 void ACPSession::completeSessionSetup(bool loadedSession)
 {
     m_status = ConnectionStatus::Connected;
@@ -1331,6 +1412,7 @@ void ACPSession::completeSessionSetup(bool loadedSession)
     if (!m_currentMode.isEmpty()) {
         Q_EMIT modeChanged(m_currentMode);
     }
+    Q_EMIT configOptionsChanged(m_availableConfigOptions);
 
     qDebug() << "[ACPSession]" << (loadedSession ? "Loaded" : "New")
              << "session ready with configured ACP options";

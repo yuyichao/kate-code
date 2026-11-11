@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ACPModels.h"
+#include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
@@ -39,6 +40,13 @@ public:
     void sendMessage(const QString &content, const QString &filePath = QString(), const QString &selection = QString(), const QList<ContextChunk> &contextChunks = QList<ContextChunk>(), const QList<ImageAttachment> &images = QList<ImageAttachment>());
     void sendPermissionResponse(int requestId, const QJsonObject &outcome);
     void setMode(const QString &modeId);
+
+    // Session config options advertised by the agent (model, effort, ...).
+    // configOptionsChanged() fires whenever the agent reports a new list.
+    QJsonArray configOptions() const { return m_availableConfigOptions; }
+    // Interactive change of one config option. Rapid changes to the same
+    // option are coalesced; a rejected change re-emits the confirmed list.
+    void setConfigOption(const QString &configId, const QJsonValue &value);
 
     bool isConnected() const { return m_status == ConnectionStatus::Connected; }
     bool isPromptRunning() const { return m_promptRequestId >= 0; }
@@ -88,6 +96,7 @@ Q_SIGNALS:
     void todosUpdated(const QList<TodoItem> &todos);
     void permissionRequested(const PermissionRequest &request);
     void modesAvailable(const QJsonArray &modes);
+    void configOptionsChanged(const QJsonArray &configOptions);
     void modeChanged(const QString &modeId);
     void commandsAvailable(const QList<SlashCommand> &commands);
     void errorOccurred(const QString &message);
@@ -152,6 +161,9 @@ private:
     void handleSessionConfigResponse(const QJsonObject &result, const QJsonObject &error);
     // Handler for interactive (dropdown) mode-change requests.
     void handleInteractiveModeResponse(const QJsonObject &result, const QJsonObject &error);
+    // Handler for interactive set_config_option requests other than mode.
+    void handleInteractiveConfigResponse(int id, const QJsonObject &result, const QJsonObject &error);
+    void sendConfigOption(const QString &configId, const QJsonValue &value);
     void handleSessionUpdate(const QJsonObject &params);
     void handlePermissionRequest(const QJsonObject &params, int requestId);
     QJsonArray buildMcpServers() const;
@@ -216,6 +228,11 @@ private:
     int m_interactiveModeRequestId = -1;
     QString m_pendingModeValue;
     QString m_queuedModeValue;
+
+    // Interactive changes of other config options: in-flight request per
+    // option id, and the latest value requested while one is in flight.
+    QHash<int, QString> m_configRequestOption;
+    QHash<QString, QJsonValue> m_queuedConfigValues;
 
     // Message counter
     int m_messageCounter;

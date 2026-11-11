@@ -14,6 +14,7 @@ set(katecode_SRCS
     ui/ChatWidget.cpp
     ui/ChatWebView.cpp
     ui/ChatInputWidget.cpp
+    ui/FlowLayout.cpp
     ui/PermissionDialog.cpp
     ui/SessionSelectionDialog.cpp
 
