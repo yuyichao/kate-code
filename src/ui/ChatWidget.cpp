@@ -60,7 +60,7 @@ ChatWidget::ChatWidget(QWidget *parent)
     , m_acpLogger(new ACPLogger(this))
 {
     // Shown by Kate on this widget's editor-area tab.
-    setWindowTitle(QStringLiteral("Kate Code"));
+    setWindowTitle(QStringLiteral("New session"));
     setWindowIcon(QIcon::fromTheme(QStringLiteral("code-context")));
 
     // Create layout
@@ -1896,18 +1896,6 @@ void ChatWidget::resetWebView()
     qDebug() << "[ChatWidget] WebView reset complete";
 }
 
-QString ChatWidget::locationTitle() const
-{
-    const QString provider = m_settingsStore ? currentProvider().description
-                                             : QStringLiteral("Kate Code");
-    const QString dir = m_session->workingDir();
-    if (dir.isEmpty()) {
-        return provider;
-    }
-    const QString name = QDir(dir).dirName();
-    return QStringLiteral("%1: %2").arg(provider, name.isEmpty() ? dir : name);
-}
-
 void ChatWidget::onSessionTitleChanged(const QString &title)
 {
     if (title == m_chatTitle) {
@@ -1992,19 +1980,11 @@ QString ChatWidget::workingDir() const
 
 void ChatWidget::updateWindowTitle()
 {
-    QString title = QStringLiteral("Kate Code");
-    if ((m_lastStatus == ConnectionStatus::Connected || m_lastStatus == ConnectionStatus::Connecting)
-        && !m_session->workingDir().isEmpty()) {
-        title = locationTitle();
-    }
-    if (!m_chatTitle.isEmpty()) {
-        // Keep the tab readable: the full title is in the header and sidebar.
-        constexpr int maxTitleLength = 40;
-        QString chatTitle = m_chatTitle;
-        if (chatTitle.size() > maxTitleLength) {
-            chatTitle = chatTitle.left(maxTitleLength - 1).trimmed() + QChar(0x2026);
-        }
-        title = QStringLiteral("%1 — %2").arg(chatTitle, title);
+    // Keep the tab readable: the full title is in the header and sidebar.
+    constexpr int maxTitleLength = 40;
+    QString title = m_chatTitle.isEmpty() ? QStringLiteral("New session") : m_chatTitle;
+    if (title.size() > maxTitleLength) {
+        title = title.left(maxTitleLength - 1).trimmed() + QChar(0x2026);
     }
     if (windowTitle() != title) {
         setWindowTitle(title);

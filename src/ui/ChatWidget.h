@@ -90,8 +90,6 @@ public:
     // The session's title (from the agent, or renamed by the user); empty
     // until there is one.
     QString chatTitle() const { return m_chatTitle; }
-    // Provider and project directory, e.g. "Claude Code: kate-code".
-    QString locationTitle() const;
     // Logo of this chat's provider (also the tab icon).
     QIcon providerIcon() const { return windowIcon(); }
     ConnectionStatus connectionStatus() const { return m_lastStatus; }

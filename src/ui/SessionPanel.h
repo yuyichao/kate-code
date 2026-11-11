@@ -21,7 +21,6 @@ class SessionPanel : public QWidget
 public:
     struct Entry {
         QString title;    // session title
-        QString location; // e.g. "Claude Code: kate-code"
         QString status;   // e.g. "Connected"
         QString detail;   // e.g. "$0.42"
         QIcon icon;         // provider logo

@@ -356,7 +356,6 @@ void KateCodeView::refreshSessionPanel()
     for (ChatWidget *chat : liveChats()) {
         SessionPanel::Entry entry;
         entry.title = chat->chatTitle().isEmpty() ? QStringLiteral("New session") : chat->chatTitle();
-        entry.location = chat->locationTitle();
         switch (chat->connectionStatus()) {
         case ConnectionStatus::Connected:
             entry.status = QStringLiteral("Connected");
