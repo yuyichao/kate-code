@@ -57,6 +57,7 @@ target_link_libraries(katecode
     Qt6::DBus
     Qt6::Widgets
     Qt6::WebEngineWidgets
+    Qt6::QuickWidgets
     Qt6::WebChannel
 )
 

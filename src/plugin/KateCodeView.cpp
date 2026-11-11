@@ -17,6 +17,7 @@
 #include <KXMLGUIFactory>
 #include <QAction>
 #include <QApplication>
+#include <QQuickWidget>
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
@@ -174,6 +175,17 @@ void KateCodeView::createToolView()
     }
     layout->setContentsMargins(4, 4, 4, 4);
     layout->setSpacing(4);
+
+    // Chats render through a QWebEngineView, which needs the main window to
+    // composite through the GPU (RHI). The first such widget in a window that
+    // is already shown makes Qt destroy and recreate the native window, which
+    // the compositor animates like a window closing and reopening. A hidden
+    // QQuickWidget (what QWebEngineView uses internally) switches the window
+    // over now, while the plugin view is set up, usually before it is shown.
+    auto *rhiWarmup = new QQuickWidget(m_toolView);
+    rhiWarmup->setObjectName(QStringLiteral("katecodeRhiWarmup"));
+    rhiWarmup->setFixedSize(0, 0);
+    rhiWarmup->hide();
 
     m_sessionPanel = new SessionPanel(m_toolView);
     layout->addWidget(m_sessionPanel);
