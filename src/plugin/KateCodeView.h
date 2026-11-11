@@ -22,7 +22,7 @@ public:
     QString getCurrentFilePath() const;
     QString getCurrentSelection() const;
     QString getProjectRoot() const;
-    QStringList getProjectFiles() const;
+    QStringList getProjectPluginFiles(const QString &root) const;
     KTextEditor::Document *findDocumentByPath(const QString &path) const;
 
     // Shutdown hook for summary generation

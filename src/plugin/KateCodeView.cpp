@@ -148,7 +148,7 @@ void KateCodeView::createToolView()
     m_chatWidget->setFilePathProvider([this]() { return getCurrentFilePath(); });
     m_chatWidget->setSelectionProvider([this]() { return getCurrentSelection(); });
     m_chatWidget->setProjectRootProvider([this]() { return getProjectRoot(); });
-    m_chatWidget->setFileListProvider([this]() { return getProjectFiles(); });
+    m_chatWidget->setFileListProvider([this](const QString &root) { return getProjectPluginFiles(root); });
     m_chatWidget->setDocumentProvider([this](const QString &path) { return findDocumentByPath(path); });
 
     // Inject settings store for summary generation
@@ -278,58 +278,39 @@ QString KateCodeView::getProjectRoot() const
     return QFileInfo(filePath).absolutePath();
 }
 
-QStringList KateCodeView::getProjectFiles() const
+QStringList KateCodeView::getProjectPluginFiles(const QString &root) const
 {
-    QString projectRoot = getProjectRoot();
-    if (projectRoot.isEmpty()) {
+    // Kate's project plugin already keeps the active project's file list
+    // (built in the background, VCS-ignore aware). Use it when that project
+    // contains root; otherwise return nothing and let ChatWidget scan.
+    QObject *projectPlugin = m_mainWindow->pluginView(QStringLiteral("kateprojectplugin"));
+    if (!projectPlugin || root.isEmpty()) {
         return QStringList();
     }
 
+    const QString baseDir = projectPlugin->property("projectBaseDir").toString();
+    if (baseDir.isEmpty()) {
+        return QStringList();
+    }
+    const QString cleanRoot = QDir::cleanPath(root);
+    const QString cleanBase = QDir::cleanPath(baseDir);
+    if (cleanRoot != cleanBase && !cleanRoot.startsWith(cleanBase + QLatin1Char('/'))) {
+        return QStringList();
+    }
+
+    const QStringList absoluteFiles = projectPlugin->property("projectFiles").toStringList();
+    const QDir rootDir(cleanRoot);
     QStringList files;
-    QDir rootDir(projectRoot);
-
-    // Directories to ignore
-    static const QStringList ignoredDirs = {
-        QStringLiteral(".git"),
-        QStringLiteral(".hg"),
-        QStringLiteral(".svn"),
-        QStringLiteral("node_modules"),
-        QStringLiteral("build"),
-        QStringLiteral("dist"),
-        QStringLiteral("target"),
-        QStringLiteral(".idea"),
-        QStringLiteral(".vscode"),
-        QStringLiteral("__pycache__"),
-        QStringLiteral(".pytest_cache"),
-        QStringLiteral(".tox"),
-        QStringLiteral("venv"),
-        QStringLiteral(".venv"),
-        QStringLiteral("env")
-    };
-
-    // Recursive function to scan directories
-    std::function<void(const QDir &, const QString &)> scanDir = [&](const QDir &dir, const QString &relativePath) {
-        // Get all entries
-        QFileInfoList entries = dir.entryInfoList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-
-        for (const QFileInfo &entry : entries) {
-            QString name = entry.fileName();
-            QString relPath = relativePath.isEmpty() ? name : relativePath + QStringLiteral("/") + name;
-
-            if (entry.isDir()) {
-                // Skip ignored directories
-                if (!ignoredDirs.contains(name)) {
-                    scanDir(QDir(entry.filePath()), relPath);
-                }
-            } else if (entry.isFile()) {
-                files.append(relPath);
-            }
+    files.reserve(absoluteFiles.size());
+    for (const QString &path : absoluteFiles) {
+        const QString relative = rootDir.relativeFilePath(path);
+        if (!relative.startsWith(QLatin1String("../")) && !QDir::isAbsolutePath(relative)) {
+            files.append(relative);
         }
-    };
+    }
+    files.sort();
 
-    scanDir(rootDir, QString());
-
-    qDebug() << "[KateCode] Found" << files.size() << "files in project";
+    qDebug() << "[KateCode] Using" << files.size() << "files from the Kate project plugin for" << cleanRoot;
     return files;
 }
 

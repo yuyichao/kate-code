@@ -10,6 +10,7 @@
 #include "../util/SessionStore.h"
 #include "../util/KateThemeConverter.h"
 #include "../util/KDEColorScheme.h"
+#include "../util/ProjectFileScanner.h"
 #include "../util/SummaryGenerator.h"
 #include "../util/SummaryStore.h"
 
@@ -36,6 +37,7 @@
 #include <QResizeEvent>
 #include <QStandardItemModel>
 #include <QStandardPaths>
+#include <QThread>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -266,6 +268,10 @@ ChatWidget::~ChatWidget()
     // block on the network and pump the event loop, which is unsafe inside a
     // destructor.  Summaries stay on the application-quit path (onAboutToQuit ->
     // prepareForShutdown); the child destructors handle the subprocess and page.
+    // Join file-scan workers before members go away; they only check the
+    // interruption flag and touch no widget state, so this returns quickly.
+    stopFileScans(true);
+
     if (!m_shutdownDone) {
         m_shutdownDone = true;
         if (m_session) {
@@ -340,6 +346,64 @@ void ChatWidget::setProjectRootProvider(ContextProvider provider)
 void ChatWidget::setFileListProvider(FileListProvider provider)
 {
     m_fileListProvider = provider;
+}
+
+void ChatWidget::refreshAvailableFiles(const QString &root)
+{
+    // Supersede any scan still running for an earlier session.
+    stopFileScans(false);
+    const quint64 generation = ++m_fileScanGeneration;
+
+    if (m_fileListProvider) {
+        const QStringList known = m_fileListProvider(root);
+        if (!known.isEmpty()) {
+            m_inputWidget->setAvailableFiles(known);
+            return;
+        }
+    }
+
+    // Clear stale entries from a previous project until the scan finishes.
+    m_inputWidget->setAvailableFiles({});
+
+    auto result = std::make_shared<ProjectFileScanner::Result>();
+    QThread *thread = QThread::create([root, result]() {
+        *result = ProjectFileScanner::scan(root, ProjectFileScanner::DefaultMaxFiles, []() {
+            return QThread::currentThread()->isInterruptionRequested();
+        });
+    });
+    thread->setObjectName(QStringLiteral("KateCodeFileScan"));
+
+    // finished is emitted on the worker thread; using this widget as the
+    // context queues the handler onto the GUI thread and drops it if the
+    // widget is gone.
+    connect(thread, &QThread::finished, this, [this, generation, result, root]() {
+        if (result->cancelled || generation != m_fileScanGeneration) {
+            return;
+        }
+        qDebug() << "[ChatWidget] Found" << result->files.size() << "files under" << root
+                 << (result->truncated ? "(truncated)" : "");
+        m_inputWidget->setAvailableFiles(result->files);
+    });
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+
+    m_fileScanThreads.append(thread);
+    thread->start(QThread::LowPriority);
+}
+
+void ChatWidget::stopFileScans(bool wait)
+{
+    for (const QPointer<QThread> &thread : std::as_const(m_fileScanThreads)) {
+        if (thread) {
+            thread->requestInterruption();
+            if (wait) {
+                thread->wait();
+            }
+        }
+    }
+    m_fileScanThreads.removeAll(nullptr);
+    if (wait) {
+        m_fileScanThreads.clear();
+    }
 }
 
 void ChatWidget::setDocumentProvider(DocumentProvider provider)
@@ -765,11 +829,8 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
             m_lastProjectRoot = projectRoot;
         }
 
-        // Populate file list for @-completion
-        if (m_fileListProvider) {
-            QStringList files = m_fileListProvider();
-            m_inputWidget->setAvailableFiles(files);
-        }
+        // Populate file list for @-completion (never blocks on a disk walk)
+        refreshAvailableFiles(m_session->workingDir());
 
         // Auto-send prior-session context if resuming via option A (context
         // injection). When option B (true resume) succeeds the flag is false,

@@ -3,6 +3,8 @@
 #include "../acp/ACPModels.h"
 #include <QJsonArray>
 #include <QSplitter>
+#include <QPointer>
+#include <QThread>
 #include <QWidget>
 #include <functional>
 
@@ -36,7 +38,9 @@ public:
 
     // Context providers (callbacks to get current file/selection/project root from Kate)
     using ContextProvider = std::function<QString()>;
-    using FileListProvider = std::function<QStringList()>;
+    // Returns files (relative to root) already known to the editor, or an
+    // empty list if it has none; ChatWidget then scans root off the GUI thread.
+    using FileListProvider = std::function<QStringList(const QString &root)>;
     using DocumentProvider = std::function<KTextEditor::Document*(const QString &path)>;
     void setFilePathProvider(ContextProvider provider);
     void setSelectionProvider(ContextProvider provider);
@@ -223,6 +227,13 @@ private:
 
     // Set to true by prepareForShutdown() so a second call is a no-op.
     bool m_shutdownDone = false;
+
+    // @-completion file list. Large trees are scanned on worker threads so
+    // connecting never blocks the GUI; only the latest scan's result is used.
+    void refreshAvailableFiles(const QString &root);
+    void stopFileScans(bool wait);
+    QList<QPointer<QThread>> m_fileScanThreads;
+    quint64 m_fileScanGeneration = 0;
 
     // Session id passed to the in-flight session/load, so a failed load can
     // drop just that entry from the stored session list.

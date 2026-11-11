@@ -30,6 +30,7 @@ set(katecode_SRCS
     util/DiffHighlightManager.cpp
     util/EditTracker.cpp
     util/SessionStore.cpp
+    util/ProjectFileScanner.cpp
     util/TranscriptWriter.cpp
     util/SummaryStore.cpp
     util/SummaryGenerator.cpp
