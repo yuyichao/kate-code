@@ -1,7 +1,6 @@
 #include "TerminalManager.h"
 
 #include <QDebug>
-#include <QEventLoop>
 #include <QTimer>
 
 #include <KPtyDevice>
@@ -14,6 +13,9 @@ TerminalManager::TerminalManager(QObject *parent)
 
 TerminalManager::~TerminalManager()
 {
+    // The owner (ACPSession) is being destroyed: drop pending waits without
+    // running their callbacks, which would call back into it.
+    m_waiters.clear();
     releaseAll();
 }
 
@@ -132,6 +134,7 @@ void TerminalManager::onProcessFinished(int exitCode, QProcess::ExitStatus exitS
     QString output = QString::fromUtf8(m_terminals[terminalId].outputBuffer);
     Q_EMIT outputAvailable(terminalId, output, true);
     Q_EMIT terminalExited(terminalId, exitCode);
+    completeWaiters(terminalId);
 }
 
 void TerminalManager::onProcessError(QProcess::ProcessError error)
@@ -143,6 +146,16 @@ void TerminalManager::onProcessError(QProcess::ProcessError error)
 
     QString terminalId = process->property("terminalId").toString();
     qWarning() << "[TerminalManager] Terminal" << terminalId << "error:" << error << process->errorString();
+
+    // A process that never started emits no finished(): end the terminal
+    // here so waiters do not sit until their timeout.
+    if (error == QProcess::FailedToStart && m_terminals.contains(terminalId)
+        && m_terminals[terminalId].status == TerminalStatus::Running) {
+        m_terminals[terminalId].status = TerminalStatus::Exited;
+        m_terminals[terminalId].exitCode = -1;
+        Q_EMIT terminalExited(terminalId, -1);
+        completeWaiters(terminalId);
+    }
 }
 
 void TerminalManager::truncateOutputIfNeeded(const QString &terminalId)
@@ -180,72 +193,72 @@ TerminalManager::OutputResult TerminalManager::getOutput(const QString &terminal
     return result;
 }
 
-TerminalManager::WaitResult TerminalManager::waitForExit(const QString &terminalId, int timeoutMs)
+TerminalManager::WaitResult TerminalManager::currentResult(const QString &terminalId) const
 {
     WaitResult result;
-
-    if (!m_terminals.contains(terminalId)) {
-        qWarning() << "[TerminalManager] waitForExit: terminal not found:" << terminalId;
-        return result;
+    auto it = m_terminals.constFind(terminalId);
+    if (it == m_terminals.constEnd()) {
+        return result; // released: success false, no output
     }
-
-    auto &data = m_terminals[terminalId];
-
-    // If already finished, return immediately
-    if (data.status != TerminalStatus::Running) {
-        result.output = QString::fromUtf8(data.outputBuffer);
-        result.truncated = data.truncated;
-        result.exitStatus = data.exitCode;
-        result.success = true;
-        return result;
-    }
-
-    // Wait for process to finish using event loop
-    QEventLoop loop;
-
-    // Connect to finished signal
-    QMetaObject::Connection finishedConn = connect(data.process, &QProcess::finished,
-        &loop, &QEventLoop::quit);
-
-    // Set up timeout if specified
-    QTimer timer;
-    if (timeoutMs > 0) {
-        timer.setSingleShot(true);
-        connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
-        timer.start(timeoutMs);
-    }
-
-    // Wait
-    loop.exec();
-
-    disconnect(finishedConn);
-    timer.stop();
-
-    // The nested loop pumps arbitrary events: terminal/release from the agent
-    // or a disconnect (releaseAll) may have removed the entry, so the earlier
-    // `data` reference can dangle. Re-look the terminal up before reading.
-    auto it = m_terminals.find(terminalId);
-    if (it == m_terminals.end()) {
-        qDebug() << "[TerminalManager] waitForExit: terminal released during wait:" << terminalId;
-        result.success = false;
-        return result;
-    }
-
-    // Check if we timed out
-    if (it->status == TerminalStatus::Running) {
-        // Timeout occurred
-        qDebug() << "[TerminalManager] waitForExit: timeout for terminal" << terminalId;
-        result.output = QString::fromUtf8(it->outputBuffer);
-        result.truncated = it->truncated;
-        result.success = false;
-        return result;
-    }
-
     result.output = QString::fromUtf8(it->outputBuffer);
     result.truncated = it->truncated;
-    result.exitStatus = it->exitCode;
-    result.success = true;
+    if (it->status != TerminalStatus::Running) {
+        result.exitStatus = it->exitCode;
+        result.success = true;
+    }
     return result;
+}
+
+void TerminalManager::waitForExit(const QString &terminalId, int timeoutMs, WaitCallback callback)
+{
+    auto it = m_terminals.constFind(terminalId);
+    if (it == m_terminals.constEnd() || it->status != TerminalStatus::Running) {
+        callback(currentResult(terminalId));
+        return;
+    }
+
+    Waiter waiter{m_nextWaiterId++, terminalId, std::move(callback), nullptr};
+    if (timeoutMs > 0) {
+        waiter.timer = new QTimer(this);
+        waiter.timer->setSingleShot(true);
+        const quint64 id = waiter.id;
+        connect(waiter.timer, &QTimer::timeout, this, [this, id]() { completeWaiter(id); });
+        waiter.timer->start(timeoutMs);
+    }
+    m_waiters.append(std::move(waiter));
+}
+
+void TerminalManager::completeWaiter(quint64 waiterId)
+{
+    for (int i = 0; i < m_waiters.size(); ++i) {
+        if (m_waiters.at(i).id == waiterId) {
+            Waiter waiter = m_waiters.takeAt(i);
+            if (waiter.timer) {
+                waiter.timer->deleteLater();
+            }
+            waiter.callback(currentResult(waiter.terminalId));
+            return;
+        }
+    }
+}
+
+void TerminalManager::completeWaiters(const QString &terminalId)
+{
+    // Callbacks may add or complete waiters, so take matching ones first.
+    QList<Waiter> done;
+    for (int i = m_waiters.size() - 1; i >= 0; --i) {
+        if (m_waiters.at(i).terminalId == terminalId) {
+            done.prepend(m_waiters.takeAt(i));
+        }
+    }
+    const WaitResult result = currentResult(terminalId);
+    for (const Waiter &waiter : std::as_const(done)) {
+        if (waiter.timer) {
+            waiter.timer->stop();
+            waiter.timer->deleteLater();
+        }
+        waiter.callback(result);
+    }
 }
 
 bool TerminalManager::killTerminal(const QString &terminalId)
@@ -296,6 +309,8 @@ bool TerminalManager::releaseTerminal(const QString &terminalId)
     }
 
     m_terminals.remove(terminalId);
+    // Answer pending waits: the terminal is gone.
+    completeWaiters(terminalId);
     return true;
 }
 

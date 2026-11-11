@@ -4,9 +4,12 @@
 #include <QHash>
 #include <QObject>
 #include <QProcessEnvironment>
+#include <functional>
 #include <optional>
 
 #include <KPtyProcess>
+
+class QTimer;
 
 class TerminalManager : public QObject
 {
@@ -30,15 +33,18 @@ public:
     };
     OutputResult getOutput(const QString &terminalId) const;
 
-    // Wait for terminal to exit (blocking with event processing)
-    // Returns false if terminal not found or timeout
+    // Wait for a terminal to exit without blocking: callback runs once, when
+    // the process exits (success), the timeout expires, the process fails to
+    // start or the terminal is released (success false). It may run before
+    // this returns if the terminal has already exited.
     struct WaitResult {
         QString output;
         bool truncated = false;
         int exitStatus = -1;
         bool success = false;
     };
-    WaitResult waitForExit(const QString &terminalId, int timeoutMs = -1);
+    using WaitCallback = std::function<void(const WaitResult &)>;
+    void waitForExit(const QString &terminalId, int timeoutMs, WaitCallback callback);
 
     // Kill the terminal process (keeps terminal valid for output queries)
     bool killTerminal(const QString &terminalId);
@@ -85,7 +91,20 @@ private:
         QString command;  // For debugging/display
     };
 
+    struct Waiter {
+        quint64 id;
+        QString terminalId;
+        WaitCallback callback;
+        QTimer *timer;
+    };
+    // Complete (and remove) the waiters of a terminal, or one waiter by id.
+    void completeWaiters(const QString &terminalId);
+    void completeWaiter(quint64 waiterId);
+    WaitResult currentResult(const QString &terminalId) const;
+
     QHash<QString, TerminalData> m_terminals;
+    QList<Waiter> m_waiters;
+    quint64 m_nextWaiterId = 0;
     int m_idCounter = 0;
     int m_defaultColumns = 120;  // Default terminal width
     int m_defaultRows = 40;      // Default terminal height

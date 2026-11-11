@@ -2277,19 +2277,23 @@ void ACPSession::handleTerminalWaitForExit(const QJsonObject &params, int reques
         return;
     }
 
-    auto waitResult = m_terminalManager->waitForExit(terminalId, timeoutMs);
+    // Answer when the command exits (or the wait ends otherwise) instead of
+    // blocking here: a nested event loop would make one session's wait hold
+    // up every other session's requests.
+    m_terminalManager->waitForExit(terminalId, timeoutMs,
+                                   [this, requestId](const TerminalManager::WaitResult &waitResult) {
+        QJsonObject result;
+        result[QStringLiteral("output")] = waitResult.output;
+        result[QStringLiteral("truncated")] = waitResult.truncated;
 
-    QJsonObject result;
-    result[QStringLiteral("output")] = waitResult.output;
-    result[QStringLiteral("truncated")] = waitResult.truncated;
+        if (waitResult.success) {
+            QJsonObject exitStatus;
+            exitStatus[QStringLiteral("exitCode")] = waitResult.exitStatus;
+            result[QStringLiteral("exitStatus")] = exitStatus;
+        }
 
-    if (waitResult.success) {
-        QJsonObject exitStatus;
-        exitStatus[QStringLiteral("exitCode")] = waitResult.exitStatus;
-        result[QStringLiteral("exitStatus")] = exitStatus;
-    }
-
-    m_service->sendResponse(requestId, result);
+        m_service->sendResponse(requestId, result);
+    });
 }
 
 void ACPSession::handleTerminalKill(const QJsonObject &params, int requestId)
