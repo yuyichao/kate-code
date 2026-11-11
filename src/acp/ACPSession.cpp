@@ -936,6 +936,29 @@ void ACPSession::onNotification(const QString &method, const QJsonObject &params
     }
 }
 
+// The JSON-RPC message plus the agent's details when it gives any: agents
+// often answer with a generic "Internal error" and put the cause (e.g. the
+// Claude Code process' stderr) in error.data.
+static QString describeError(const QJsonObject &error)
+{
+    QString text = error[QStringLiteral("message")].toString(QStringLiteral("Unknown error"));
+    const QJsonValue data = error[QStringLiteral("data")];
+    QString details;
+    if (data.isString()) {
+        details = data.toString();
+    } else if (data.isObject()) {
+        const QJsonObject obj = data.toObject();
+        details = obj[QStringLiteral("details")].toString(obj[QStringLiteral("message")].toString());
+        if (details.isEmpty() && !obj.isEmpty()) {
+            details = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
+        }
+    }
+    if (!details.isEmpty() && details != text) {
+        text += QStringLiteral(": ") + details.trimmed();
+    }
+    return text;
+}
+
 void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject &error)
 {
     // Handle session/load errors specially - we want to fall back to new session
@@ -993,7 +1016,7 @@ void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject
 
     if (!error.isEmpty()) {
         qWarning() << "[ACPSession] Error response for id" << id << ":" << error;
-        Q_EMIT errorOccurred(error[QStringLiteral("message")].toString());
+        Q_EMIT errorOccurred(describeError(error));
 
         // A failed session/prompt must still finalise the turn, otherwise
         // isPromptRunning() stays true and every future prompt queues forever.
