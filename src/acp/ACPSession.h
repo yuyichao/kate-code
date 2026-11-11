@@ -19,6 +19,14 @@ class EditTracker;
 class TerminalManager;
 class TranscriptWriter;
 
+// Context-window usage and accumulated cost, from ACP usage_update.
+struct SessionUsage {
+    qint64 used = -1;     // tokens in the context window; -1 = not reported yet
+    qint64 size = 0;      // context window size in tokens (0 = unknown)
+    double cost = -1.0;   // accumulated cost; < 0 = not reported
+    QString currency;
+};
+
 class ACPSession : public QObject
 {
     Q_OBJECT
@@ -47,6 +55,9 @@ public:
     // Interactive change of one config option. Rapid changes to the same
     // option are coalesced; a rejected change re-emits the confirmed list.
     void setConfigOption(const QString &configId, const QJsonValue &value);
+
+    // Latest usage reported by the agent for this session.
+    SessionUsage usage() const { return m_usage; }
 
     bool isConnected() const { return m_status == ConnectionStatus::Connected; }
     bool isPromptRunning() const { return m_promptRequestId >= 0; }
@@ -97,6 +108,7 @@ Q_SIGNALS:
     void permissionRequested(const PermissionRequest &request);
     void modesAvailable(const QJsonArray &modes);
     void configOptionsChanged(const QJsonArray &configOptions);
+    void usageChanged(const SessionUsage &usage);
     void modeChanged(const QString &modeId);
     void commandsAvailable(const QList<SlashCommand> &commands);
     void errorOccurred(const QString &message);
@@ -233,6 +245,8 @@ private:
     // option id, and the latest value requested while one is in flight.
     QHash<int, QString> m_configRequestOption;
     QHash<QString, QJsonValue> m_queuedConfigValues;
+
+    SessionUsage m_usage;
 
     // Message counter
     int m_messageCounter;

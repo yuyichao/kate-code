@@ -195,6 +195,10 @@ void ACPSession::resetSessionState()
     m_queuedModeValue.clear();
     m_configRequestOption.clear();
     m_queuedConfigValues.clear();
+    if (m_usage.used >= 0 || m_usage.cost >= 0) {
+        m_usage = SessionUsage();
+        Q_EMIT usageChanged(m_usage);
+    }
     // Reset agent capability flags so they don't leak across reconnections.
     m_supportsImage = false;
     m_supportsEmbeddedContext = false;
@@ -1998,6 +2002,18 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
 
         qDebug() << "[ACPSession] Plan update with" << todos.size() << "entries";
         Q_EMIT todosUpdated(todos);
+    }
+    else if (updateType == QStringLiteral("usage_update")) {
+        // Context window usage (used/size) and, when known, the session's
+        // accumulated cost.
+        m_usage.used = static_cast<qint64>(update[QStringLiteral("used")].toDouble(-1));
+        m_usage.size = static_cast<qint64>(update[QStringLiteral("size")].toDouble(0));
+        const QJsonObject cost = update[QStringLiteral("cost")].toObject();
+        if (cost.contains(QStringLiteral("amount"))) {
+            m_usage.cost = cost[QStringLiteral("amount")].toDouble(-1);
+            m_usage.currency = cost[QStringLiteral("currency")].toString();
+        }
+        Q_EMIT usageChanged(m_usage);
     }
     else if (updateType == QStringLiteral("config_option_update")) {
         updateSessionConfigOptions(update[QStringLiteral("configOptions")].toArray(),

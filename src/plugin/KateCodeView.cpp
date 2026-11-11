@@ -4,6 +4,7 @@
 #include "../config/SettingsStore.h"
 #include "../mcp/EditorDBusService.h"
 #include "../ui/ChatWidget.h"
+#include "../ui/SessionPanel.h"
 #include "../util/DiffHighlightManager.h"
 
 #include <KActionCollection>
@@ -14,6 +15,7 @@
 #include <KTextEditor/View>
 #include <KXMLGUIFactory>
 #include <QAction>
+#include <QApplication>
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
@@ -26,10 +28,34 @@ KateCodeView::KateCodeView(KateCodePlugin *plugin, KTextEditor::MainWindow *main
     , m_plugin(plugin)
     , m_mainWindow(mainWindow)
     , m_toolView(nullptr)
-    , m_chatWidget(nullptr)
     , m_diffHighlightManager(nullptr)
 {
     createToolView();
+
+    // Remember the last editor view: when a chat tab is active,
+    // activeView() no longer names the file the user is working on.
+    m_lastEditorView = m_mainWindow->activeView();
+    connect(m_mainWindow, &KTextEditor::MainWindow::viewChanged, this, [this](KTextEditor::View *view) {
+        if (view) {
+            m_lastEditorView = view;
+        }
+    });
+
+    // Track the chat the user last worked in (for quick actions).
+    connect(qApp, &QApplication::focusChanged, this, [this](QWidget *, QWidget *now) {
+        if (!now) {
+            return;
+        }
+        for (ChatWidget *chat : liveChats()) {
+            if (chat == now || chat->isAncestorOf(now)) {
+                if (m_lastActiveChat != chat) {
+                    m_lastActiveChat = chat;
+                    scheduleSessionPanelRefresh();
+                }
+                return;
+            }
+        }
+    });
 
     // Create diff highlight manager for showing pending edits in editor
     m_diffHighlightManager = new DiffHighlightManager(m_mainWindow, m_plugin->settings(), this);
@@ -42,6 +68,12 @@ KateCodeView::KateCodeView(KateCodePlugin *plugin, KTextEditor::MainWindow *main
     // Load UI definition file from Qt resources
     setXMLFile(QStringLiteral(":/katecode/katecodeui.rc"));
     qDebug() << "[KateCodeView] Loaded UI file from resources: :/katecode/katecodeui.rc";
+
+    QAction *newSessionAction = new QAction(QIcon::fromTheme(QStringLiteral("code-context")),
+                                            i18n("New Kate Code Session"),
+                                            this);
+    actionCollection()->addAction(QStringLiteral("kate_code_new_session"), newSessionAction);
+    connect(newSessionAction, &QAction::triggered, this, &KateCodeView::newSession);
 
     // Create context menu action for adding selection to context
     QAction *addContextAction = new QAction(QIcon::fromTheme(QStringLiteral("list-add")),
@@ -96,8 +128,7 @@ KateCodeView::~KateCodeView()
     // Remove this view from the plugin's list so onAboutToQuit() cannot
     // dereference us after we are destroyed (e.g. when a window is closed
     // before the application quits).  We do NOT call prepareForShutdown() here:
-    // the tool view (and its ChatWidget) may already have been destroyed by the
-    // MainWindow, so touching m_chatWidget would be a use-after-free.  ChatWidget
+    // the main window may already be tearing down its chat tabs.  ChatWidget
     // severs its own signals in its destructor, and onAboutToQuit() still runs
     // prepareForShutdown() on the application-quit path while everything is
     // alive.
@@ -108,92 +139,249 @@ KateCodeView::~KateCodeView()
         m_mainWindow->guiFactory()->removeClient(this);
     }
 
-    // ToolView is owned by MainWindow and cleaned up automatically
+    // ToolView is owned by MainWindow and cleaned up automatically. Chat tabs
+    // are owned by the main window too; when the plugin is unloaded while the
+    // window stays open, close them with it. While the window itself is
+    // closing (hidden first), leave them to its own teardown.
+    QWidget *window = m_mainWindow ? m_mainWindow->window() : nullptr;
+    if (window && window->isVisible()) {
+        for (ChatWidget *chat : liveChats()) {
+            m_mainWindow->removeWidget(chat);
+        }
+    }
 }
 
 void KateCodeView::createToolView()
 {
-    // Create side panel tool view
+    // Side panel: the session list. The chats themselves are editor tabs.
     m_toolView = m_mainWindow->createToolView(
         m_plugin,
         QStringLiteral("katecode"),
         KTextEditor::MainWindow::Left,
         QIcon::fromTheme(QStringLiteral("code-context")),
-        i18n("Claude Code")
+        i18n("Kate Code")
     );
 
     if (!m_toolView) {
-        qDebug() << "[KateCode] ERROR - toolView is null!";
+        qWarning() << "[KateCode] createToolView returned null";
         return;
     }
 
-    // Work with existing layout if present, or create new one
     QVBoxLayout *layout = qobject_cast<QVBoxLayout *>(m_toolView->layout());
     if (!layout) {
         layout = new QVBoxLayout(m_toolView);
-        qDebug() << "[KateCode] Created new QVBoxLayout";
-    } else {
-        qDebug() << "[KateCode] Using existing QVBoxLayout";
     }
-
     layout->setContentsMargins(4, 4, 4, 4);
     layout->setSpacing(4);
 
-    // Create chat widget
-    m_chatWidget = new ChatWidget(m_toolView);
-    m_chatWidget->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    layout->addWidget(m_chatWidget);
+    m_sessionPanel = new SessionPanel(m_toolView);
+    layout->addWidget(m_sessionPanel);
+    connect(m_sessionPanel, &SessionPanel::newSessionRequested, this, &KateCodeView::newSession);
+    connect(m_sessionPanel, &SessionPanel::entryActivated, this, [this](int index) {
+        const QList<ChatWidget *> chats = liveChats();
+        if (index >= 0 && index < chats.size()) {
+            activateChat(chats.at(index));
+        }
+    });
+}
 
-    // Set context providers so ChatWidget can get current file/selection and project root
-    m_chatWidget->setFilePathProvider([this]() { return getCurrentFilePath(); });
-    m_chatWidget->setSelectionProvider([this]() { return getCurrentSelection(); });
-    m_chatWidget->setProjectRootProvider([this]() { return getProjectRoot(); });
-    m_chatWidget->setFileListProvider([this](const QString &root) { return getProjectPluginFiles(root); });
-    m_chatWidget->setDocumentProvider([this](const QString &path) { return findDocumentByPath(path); });
+ChatWidget *KateCodeView::createChat()
+{
+    auto *chat = new ChatWidget();
 
-    // Inject settings store for summary generation
-    m_chatWidget->setSettingsStore(m_plugin->settings());
+    // Kate owns the chat once it is added, so it can outlive this view (for
+    // example when the plugin is unloaded); every callback checks for that.
+    QPointer<KateCodeView> self(this);
+    QPointer<ChatWidget> chatGuard(chat);
+    KateCodePlugin *plugin = m_plugin;
 
-    // Wire the process-wide single-agent gate so only one window runs an agent
-    // at a time within this Kate process.
-    m_chatWidget->setAgentSlotHooks(
-        [this]() { return m_plugin->acquireAgentSlot(m_chatWidget); },
-        [this]() { m_plugin->releaseAgentSlot(m_chatWidget); },
-        [this]() { return m_plugin->agentSlotAvailableFor(m_chatWidget); });
-    connect(m_plugin, &KateCodePlugin::agentActivityChanged,
-            m_chatWidget, &ChatWidget::refreshAgentAvailability);
+    chat->setFilePathProvider([self]() { return self ? self->getCurrentFilePath() : QString(); });
+    chat->setSelectionProvider([self]() { return self ? self->getCurrentSelection() : QString(); });
+    chat->setProjectRootProvider([self]() { return self ? self->getProjectRoot() : QDir::homePath(); });
+    chat->setFileListProvider([self](const QString &root) {
+        return self ? self->getProjectPluginFiles(root) : QStringList();
+    });
+    chat->setDocumentProvider([self](const QString &path) {
+        return self ? self->findDocumentByPath(path) : nullptr;
+    });
 
-    // Connect edit navigation
-    connect(m_chatWidget, &ChatWidget::jumpToEditRequested, this, &KateCodeView::jumpToEdit);
+    chat->setSettingsStore(m_plugin->settings());
 
-    // EditorDBusService -> ChatWidget: edit data for diff display
-    connect(m_plugin->dbusService(), &EditorDBusService::editApplied,
-            m_chatWidget, &ChatWidget::onEditApplied);
+    // Process-wide single-agent gate: one connected chat per Kate process,
+    // because the editor DBus service (MCP tools) is shared and not yet
+    // routed per session. The plugin outlives every chat.
+    chat->setAgentSlotHooks(
+        [plugin, chat]() { return plugin->acquireAgentSlot(chat); },
+        [plugin, chat]() { plugin->releaseAgentSlot(chat); },
+        [plugin, chat]() { return plugin->agentSlotAvailableFor(chat); });
+    connect(m_plugin, &KateCodePlugin::agentActivityChanged, chat, &ChatWidget::refreshAgentAvailability);
 
-    // Connect user question signals (MCP AskUserQuestion tool)
-    // EditorDBusService -> ChatWidget: show question UI
-    connect(m_plugin->dbusService(), &EditorDBusService::questionRequested,
-            m_chatWidget, &ChatWidget::showUserQuestion);
-    // EditorDBusService -> ChatWidget: remove question UI on timeout/cancel
-    connect(m_plugin->dbusService(), &EditorDBusService::questionCancelled,
-            m_chatWidget, &ChatWidget::removeUserQuestion);
-    // ChatWidget -> EditorDBusService: return user's answer
-    connect(m_chatWidget, &ChatWidget::userQuestionAnswered,
+    connect(chat, &ChatWidget::jumpToEditRequested, this, &KateCodeView::jumpToEdit);
+
+    // Shared DBus service -> chat. Each chat ignores these unless it is the
+    // connected one.
+    connect(m_plugin->dbusService(), &EditorDBusService::editApplied, chat, &ChatWidget::onEditApplied);
+    connect(m_plugin->dbusService(), &EditorDBusService::questionRequested, chat, &ChatWidget::showUserQuestion);
+    connect(m_plugin->dbusService(), &EditorDBusService::questionCancelled, chat, &ChatWidget::removeUserQuestion);
+    connect(chat, &ChatWidget::userQuestionAnswered,
             m_plugin->dbusService(), &EditorDBusService::provideQuestionResponse);
 
-    // Connect debug log output to Kate's Output panel
-    connect(m_chatWidget, &ChatWidget::debugLogMessage, this, [this](const QString &message) {
+    connect(chat, &ChatWidget::debugLogMessage, this, [this](const QString &message) {
         QVariantMap msg;
         msg[QStringLiteral("text")] = message;
         msg[QStringLiteral("type")] = QStringLiteral("Log");
         msg[QStringLiteral("category")] = QStringLiteral("Kate Code");
         m_mainWindow->showMessage(msg);
     });
+
+    connect(chat, &ChatWidget::sessionInfoChanged, this, &KateCodeView::scheduleSessionPanelRefresh);
+    connect(chat, &QObject::destroyed, this, [this]() {
+        m_chats.removeAll(nullptr);
+        scheduleSessionPanelRefresh();
+    });
+
+    m_chats.append(chat);
+    m_lastActiveChat = chat;
+
+    if (!m_mainWindow->addWidget(chat)) {
+        // Hosts older than KTextEditor 5.98 cannot show widgets as tabs.
+        qWarning() << "[KateCode] Main window refused the chat widget";
+        delete chat;
+        return nullptr;
+    }
+    scheduleSessionPanelRefresh();
+    return chat;
+}
+
+void KateCodeView::newSession()
+{
+    if (ChatWidget *chat = createChat()) {
+        activateChat(chat);
+    }
+}
+
+void KateCodeView::activateChat(ChatWidget *chat)
+{
+    if (!chat) {
+        return;
+    }
+    m_lastActiveChat = chat;
+    m_mainWindow->activateWidget(chat);
+    chat->setFocus();
+    scheduleSessionPanelRefresh();
+}
+
+QList<ChatWidget *> KateCodeView::liveChats() const
+{
+    QList<ChatWidget *> chats;
+    for (const QPointer<ChatWidget> &chat : m_chats) {
+        if (chat) {
+            chats.append(chat);
+        }
+    }
+    return chats;
+}
+
+ChatWidget *KateCodeView::targetChat()
+{
+    const QList<ChatWidget *> chats = liveChats();
+    if (auto *active = qobject_cast<ChatWidget *>(m_mainWindow->activeWidget()); active && chats.contains(active)) {
+        return active;
+    }
+    if (m_lastActiveChat) {
+        return m_lastActiveChat;
+    }
+    if (!chats.isEmpty()) {
+        return chats.constLast();
+    }
+    return createChat();
+}
+
+KTextEditor::View *KateCodeView::editorView() const
+{
+    if (KTextEditor::View *view = m_mainWindow->activeView()) {
+        return view;
+    }
+    return m_lastEditorView;
+}
+
+void KateCodeView::scheduleSessionPanelRefresh()
+{
+    if (m_panelRefreshPending) {
+        return;
+    }
+    m_panelRefreshPending = true;
+    QMetaObject::invokeMethod(this, [this]() {
+        m_panelRefreshPending = false;
+        refreshSessionPanel();
+    }, Qt::QueuedConnection);
+}
+
+static QString formatTokens(qint64 tokens)
+{
+    if (tokens >= 1000000) {
+        return QStringLiteral("%1M").arg(tokens / 1000000.0, 0, 'f', 1);
+    }
+    if (tokens >= 1000) {
+        return QStringLiteral("%1k").arg(qRound(tokens / 1000.0));
+    }
+    return QString::number(tokens);
+}
+
+void KateCodeView::refreshSessionPanel()
+{
+    if (!m_sessionPanel) {
+        return;
+    }
+    QList<SessionPanel::Entry> entries;
+    for (ChatWidget *chat : liveChats()) {
+        SessionPanel::Entry entry;
+        entry.title = chat->sessionTitle();
+        switch (chat->connectionStatus()) {
+        case ConnectionStatus::Connected:
+            entry.status = QStringLiteral("Connected");
+            entry.iconName = QStringLiteral("network-connect");
+            break;
+        case ConnectionStatus::Connecting:
+            entry.status = QStringLiteral("Connecting");
+            entry.iconName = QStringLiteral("network-connecting");
+            break;
+        case ConnectionStatus::Error:
+            entry.status = QStringLiteral("Error");
+            entry.iconName = QStringLiteral("dialog-error");
+            break;
+        case ConnectionStatus::Disconnected:
+            entry.status = QStringLiteral("Not connected");
+            entry.iconName = QStringLiteral("network-disconnect");
+            break;
+        }
+
+        const SessionUsage usage = chat->usage();
+        QStringList detail;
+        if (usage.used >= 0) {
+            if (usage.size > 0) {
+                detail << QStringLiteral("Context %1 / %2 (%3%)")
+                              .arg(formatTokens(usage.used), formatTokens(usage.size))
+                              .arg(qRound(100.0 * usage.used / usage.size));
+            } else {
+                detail << QStringLiteral("Context %1").arg(formatTokens(usage.used));
+            }
+        }
+        if (usage.cost >= 0) {
+            detail << (usage.currency == QStringLiteral("USD")
+                           ? QStringLiteral("$%1").arg(usage.cost, 0, 'f', 2)
+                           : QStringLiteral("%1 %2").arg(usage.cost, 0, 'f', 2).arg(usage.currency));
+        }
+        entry.detail = detail.join(QStringLiteral(" · "));
+        entry.active = (chat == m_lastActiveChat);
+        entries.append(entry);
+    }
+    m_sessionPanel->setEntries(entries);
 }
 
 QString KateCodeView::getCurrentFilePath() const
 {
-    KTextEditor::View *view = m_mainWindow->activeView();
+    KTextEditor::View *view = editorView();
     if (view && view->document()) {
         return view->document()->url().toLocalFile();
     }
@@ -202,7 +390,7 @@ QString KateCodeView::getCurrentFilePath() const
 
 QString KateCodeView::getCurrentSelection() const
 {
-    KTextEditor::View *view = m_mainWindow->activeView();
+    KTextEditor::View *view = editorView();
     if (view) {
         return view->selectionText();
     }
@@ -343,7 +531,7 @@ KTextEditor::Document *KateCodeView::findDocumentByPath(const QString &path) con
 
 void KateCodeView::addSelectionToContext()
 {
-    KTextEditor::View *view = m_mainWindow->activeView();
+    KTextEditor::View *view = editorView();
     if (!view || !view->document()) {
         qWarning() << "[KateCode] No active view or document";
         return;
@@ -366,9 +554,9 @@ void KateCodeView::addSelectionToContext()
     int startLine = selectionRange.start().line() + 1;  // Convert to 1-based
     int endLine = selectionRange.end().line() + 1;
 
-    // Add to chat widget's context
-    if (m_chatWidget) {
-        m_chatWidget->addContextChunk(filePath, startLine, endLine, selection);
+    // Add to the target chat's context
+    if (ChatWidget *chat = targetChat()) {
+        chat->addContextChunk(filePath, startLine, endLine, selection);
         qDebug() << "[KateCode] Added selection to context:" << filePath
                  << "lines" << startLine << "-" << endLine;
     } else {
@@ -398,7 +586,7 @@ void KateCodeView::addTests()
 
 void KateCodeView::sendQuickAction(const QString &prompt)
 {
-    KTextEditor::View *view = m_mainWindow->activeView();
+    KTextEditor::View *view = editorView();
     if (!view || !view->document()) {
         qWarning() << "[KateCode] No active view or document for quick action";
         return;
@@ -412,12 +600,12 @@ void KateCodeView::sendQuickAction(const QString &prompt)
 
     QString filePath = view->document()->url().toLocalFile();
 
-    // Send prompt with selection through ChatWidget
-    if (m_chatWidget) {
-        m_chatWidget->sendPromptWithSelection(prompt, filePath, selection);
+    // Send prompt with selection through the target chat
+    if (ChatWidget *chat = targetChat()) {
+        chat->sendPromptWithSelection(prompt, filePath, selection);
 
-        // Show and focus the chat panel so user sees response
-        m_mainWindow->showToolView(m_toolView);
+        // Show the chat so the user sees the response
+        activateChat(chat);
 
         qDebug() << "[KateCode] Sent quick action prompt with selection from:" << filePath;
     } else {
@@ -427,8 +615,8 @@ void KateCodeView::sendQuickAction(const QString &prompt)
 
 void KateCodeView::prepareForShutdown()
 {
-    if (m_chatWidget) {
-        m_chatWidget->prepareForShutdown();
+    for (ChatWidget *chat : liveChats()) {
+        chat->prepareForShutdown();
     }
 }
 

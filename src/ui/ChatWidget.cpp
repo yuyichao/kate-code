@@ -26,6 +26,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHBoxLayout>
+#include <QMessageBox>
 #include <QIcon>
 #include <QImage>
 #include <QLabel>
@@ -51,6 +52,10 @@ ChatWidget::ChatWidget(QWidget *parent)
     , m_summaryGenerator(nullptr)
     , m_acpLogger(new ACPLogger(this))
 {
+    // Shown by Kate on this widget's editor-area tab.
+    setWindowTitle(QStringLiteral("Kate Code"));
+    setWindowIcon(QIcon::fromTheme(QStringLiteral("code-context")));
+
     // Create layout
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(4, 4, 4, 4);
@@ -239,6 +244,9 @@ ChatWidget::ChatWidget(QWidget *parent)
 
     // Session options (model, effort, ...). Connected with this widget as
     // context so ~ChatWidget's disconnect covers them.
+    connect(m_session, &ACPSession::usageChanged, this, [this]() {
+        Q_EMIT sessionInfoChanged();
+    });
     connect(m_session, &ACPSession::configOptionsChanged, this, [this](const QJsonArray &options) {
         m_inputWidget->setConfigOptions(options);
     });
@@ -281,6 +289,13 @@ ChatWidget::~ChatWidget()
     // Join file-scan workers before members go away; they only check the
     // interruption flag and touch no widget state, so this returns quickly.
     stopFileScans(true);
+
+    // The Disconnected handler that normally releases the process-wide agent
+    // slot is cut off below, so give the slot back here; otherwise closing a
+    // connected tab would block every other chat from connecting.
+    if (m_releaseAgentSlot) {
+        m_releaseAgentSlot();
+    }
 
     if (!m_shutdownDone) {
         m_shutdownDone = true;
@@ -884,6 +899,9 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
 
     // Let all windows re-evaluate their button states after any status change.
     refreshAgentAvailability();
+
+    updateWindowTitle();
+    Q_EMIT sessionInfoChanged();
 }
 
 void ChatWidget::onMessageAdded(const Message &message)
@@ -1697,6 +1715,11 @@ void ChatWidget::updateTerminalSize()
 
 void ChatWidget::showUserQuestion(const QString &requestId, const QString &questionsJson)
 {
+    // The DBus service is shared by every chat in this Kate process; only the
+    // chat running the agent (at most one, see the agent slot) shows it.
+    if (!m_session->isConnected()) {
+        return;
+    }
     qDebug() << "[ChatWidget] showUserQuestion called, requestId:" << requestId;
     m_chatWebView->showUserQuestion(requestId, questionsJson);
 }
@@ -1772,4 +1795,47 @@ void ChatWidget::resetWebView()
     connectWebViewSignals();
 
     qDebug() << "[ChatWidget] WebView reset complete";
+}
+
+QString ChatWidget::sessionTitle() const
+{
+    return windowTitle();
+}
+
+SessionUsage ChatWidget::usage() const
+{
+    return m_session->usage();
+}
+
+QString ChatWidget::workingDir() const
+{
+    return m_session->workingDir();
+}
+
+void ChatWidget::updateWindowTitle()
+{
+    QString title = QStringLiteral("Kate Code");
+    const QString dir = m_session->workingDir();
+    if ((m_lastStatus == ConnectionStatus::Connected || m_lastStatus == ConnectionStatus::Connecting)
+        && !dir.isEmpty()) {
+        const QString provider = m_settingsStore ? m_settingsStore->activeProvider().description
+                                                 : QStringLiteral("Kate Code");
+        const QString name = QDir(dir).dirName();
+        title = QStringLiteral("%1: %2").arg(provider, name.isEmpty() ? dir : name);
+    }
+    if (windowTitle() != title) {
+        setWindowTitle(title);
+    }
+}
+
+bool ChatWidget::shouldClose()
+{
+    if (m_lastStatus != ConnectionStatus::Connected && m_lastStatus != ConnectionStatus::Connecting) {
+        return true;
+    }
+    const auto answer = QMessageBox::question(
+        this, QStringLiteral("Close Kate Code Session"),
+        QStringLiteral("This chat has a live agent session. Closing it stops the agent."),
+        QMessageBox::Close | QMessageBox::Cancel, QMessageBox::Cancel);
+    return answer == QMessageBox::Close;
 }

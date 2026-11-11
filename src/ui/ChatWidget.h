@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../acp/ACPModels.h"
+#include "../acp/ACPSession.h"
 #include <QJsonArray>
 #include <QSplitter>
 #include <QPointer>
@@ -68,6 +69,17 @@ public:
     // Shutdown hook - generates summary and waits for completion
     void prepareForShutdown();
 
+    // Summary of this chat for the session list (KateCodeView side panel).
+    // sessionInfoChanged() fires when any of these change.
+    QString sessionTitle() const;
+    ConnectionStatus connectionStatus() const { return m_lastStatus; }
+    SessionUsage usage() const;
+    QString workingDir() const;
+
+    // Called by Kate before closing this widget's tab; asks for confirmation
+    // while an agent session is live.
+    Q_INVOKABLE bool shouldClose();
+
 public Q_SLOTS:
     // Show user question UI (MCP AskUserQuestion tool)
     void showUserQuestion(const QString &requestId, const QString &questionsJson);
@@ -95,6 +107,9 @@ Q_SIGNALS:
 
     // User question response (MCP AskUserQuestion tool)
     void userQuestionAnswered(const QString &requestId, const QString &responseJson);
+
+    // Title, status or usage changed (see sessionTitle()).
+    void sessionInfoChanged();
 
 private Q_SLOTS:
     void onConnectClicked();
@@ -133,6 +148,7 @@ private Q_SLOTS:
     void onUserQuestionAnswered(const QString &requestId, const QJsonObject &answers);
 
 private:
+    void updateWindowTitle();
     void triggerSummaryGeneration();
     // Ask the live session's agent for the summary, showing a cancellable
     // progress dialogue while it runs. Only valid while connected.

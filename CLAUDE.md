@@ -30,18 +30,19 @@ Settings > Configure Kate > Plugins > Enable "Kate Code"
 - **Plugin**: KateCodePlugin, KateCodeView - Kate integration
 - **ACP**: ACPService, ACPSession - JSON-RPC 2.0 over stdin/stdout to claude-agent-acp
 - **MCP**: MCPServer - Built-in MCP server executable for Kate editor tools
-- **UI**: ChatWidget, ChatWebView, ChatInputWidget, PermissionDialog
+- **UI**: ChatWidget, ChatWebView, ChatInputWidget, PermissionDialog, SessionPanel
 - **Util**: KDEColorScheme - reads ~/.config/kdeglobals
 
 ### Key Files
 - `src/plugin/KateCodePlugin.{h,cpp}` - Plugin registration via K_PLUGIN_CLASS_WITH_JSON
-- `src/plugin/KateCodeView.{h,cpp}` - Creates side panel tool view, provides Kate context
+- `src/plugin/KateCodeView.{h,cpp}` - Per-window view: opens chats as editor-area tabs, side panel session list, provides Kate context
 - `src/acp/ACPService.{h,cpp}` - QProcess-based claude-agent-acp subprocess management
 - `src/acp/ACPSession.{h,cpp}` - Protocol flow and session state management
 - `src/acp/ACPModels.h` - Data structures (Message, ToolCall, TodoItem, etc.)
 - `src/mcp/MCPServer.{h,cpp}` - MCP protocol handler (initialize, tools/list, tools/call)
 - `src/mcp/main.cpp` - MCP server entry point (stdio JSON-RPC loop)
-- `src/ui/ChatWidget.{h,cpp}` - Main chat interface with ACP integration
+- `src/ui/ChatWidget.{h,cpp}` - Main chat interface with ACP integration (one per editor tab)
+- `src/ui/SessionPanel.{h,cpp}` - Side panel listing the window's open chats with status and usage
 - `src/ui/ChatWebView.{h,cpp}` - QWebEngineView for HTML/CSS/JS rendering
 - `src/ui/ChatInputWidget.{h,cpp}` - Multiline text input with send button
 - `src/ui/PermissionDialog.{h,cpp}` - Modal dialog for tool approval requests
@@ -60,7 +61,10 @@ Settings > Configure Kate > Plugins > Enable "Kate Code"
 - Qt6 components: Core, Widgets, WebEngineWidgets
 
 ### Plugin Structure
-- Use `createToolView()` with `KTextEditor::MainWindow::Left` for side panel
+- Chats are editor-area widgets added with `KTextEditor::MainWindow::addWidget()` (Kate owns and deletes them; they can move between splits). Kate calls an invokable `bool shouldClose()` before closing such a tab
+- The side panel (`createToolView()` with `KTextEditor::MainWindow::Left`) holds the session list
+- Only one chat per Kate process can be connected at a time (agent slot in KateCodePlugin), because the editor DBus service used by the MCP tools is not routed per session
+- Kate keeps the enabled-plugin list in the session file (`kate/anonymous.katesession`, `[Kate Plugins]`), not in `katerc`
 - K_PLUGIN_CLASS_WITH_JSON macro requires katecode.json in same directory
 - Plugin views are children of MainWindow and cleaned up automatically
 
