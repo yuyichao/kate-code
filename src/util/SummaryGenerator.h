@@ -26,6 +26,10 @@ public:
 
     bool isGenerating() const { return !m_jobs.isEmpty(); }
 
+    // Provider used when the summary provider is "the current agent" (or
+    // missing): the owning chat's provider. Empty: the global default.
+    void setFallbackProviderId(const QString &id) { m_fallbackProviderId = id; }
+
     // Block until all pending jobs complete (for shutdown). The default is
     // generous because an ACP subprocess is slower to start than an HTTP call.
     void waitForPendingRequests(int timeoutMs = 60000);
@@ -39,6 +43,8 @@ Q_SIGNALS:
     void summaryError(const QString &sessionId, const QString &error);
 
 private:
+    QString m_fallbackProviderId;
+
     struct SummaryJob {
         QString sessionId;
         QString projectRoot;

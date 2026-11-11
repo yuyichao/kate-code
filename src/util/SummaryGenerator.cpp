@@ -86,7 +86,7 @@ void SummaryGenerator::generateSummary(const QString &sessionId,
             qWarning() << "[SummaryGenerator] Summary provider" << providerId
                        << "not found; falling back to the active provider";
         }
-        providerId = m_settings->activeProviderId();
+        providerId = m_fallbackProviderId.isEmpty() ? m_settings->activeProviderId() : m_fallbackProviderId;
         provider = m_settings->providerById(providerId);
     }
     if (provider.executable.isEmpty()) {

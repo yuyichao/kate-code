@@ -16,6 +16,7 @@ class Document;
 class ACPSession;
 class ACPLogger;
 class EditorSession;
+struct ACPProvider;
 class ChatWebView;
 class ChatInputWidget;
 class SessionStore;
@@ -250,6 +251,12 @@ private:
     bool m_shutdownDone = false;
 
     QPointer<EditorSession> m_editorSession;
+
+    // This chat's provider. Starts as the global default (activeProvider);
+    // choosing one here also makes it the default for new chats, but never
+    // changes another chat's provider.
+    QString m_providerId;
+    ACPProvider currentProvider() const;
 
     // @-completion file list. Large trees are scanned on worker threads so
     // connecting never blocks the GUI; only the latest scan's result is used.

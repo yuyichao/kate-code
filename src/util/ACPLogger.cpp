@@ -1,5 +1,6 @@
 #include "ACPLogger.h"
 
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDebug>
 #include <QDir>
@@ -66,8 +67,13 @@ void ACPLogger::openNewFile()
 
     // Named by connection time, since the ACP session id is not yet known when
     // the first initialize payloads flow.
+    // Several sessions (and Kate processes) can start in the same second, so
+    // add the process id and a per-process counter.
+    static int s_sequence = 0;
     const QString stamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-hhmmss"));
-    const QString filePath = dirPath + QStringLiteral("/acp-") + stamp + QStringLiteral(".json");
+    const QString filePath = dirPath + QStringLiteral("/acp-") + stamp
+                             + QStringLiteral("-p%1-%2").arg(QCoreApplication::applicationPid()).arg(s_sequence++)
+                             + QStringLiteral(".json");
 
     m_file.setFileName(filePath);
     if (!m_file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {

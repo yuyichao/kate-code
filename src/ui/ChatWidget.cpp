@@ -648,7 +648,7 @@ void ChatWidget::onResumeSessionClicked()
 
     // Option B (per-provider): try a real ACP session/load, falling back to
     // context injection if it fails. Otherwise use option A directly.
-    const ACPProvider provider = m_settingsStore->activeProvider();
+    const ACPProvider provider = currentProvider();
     if (provider.trueResume) {
         m_pendingAction = PendingAction::LoadSession;
         m_pendingSessionId = selectedId;
@@ -827,7 +827,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         m_titleLabel->setText(QStringLiteral("Kate Code - Session"));
         sysMsg.id = QStringLiteral("sys_disconnected");
         sysMsg.content = QStringLiteral("Disconnected from %1").arg(
-            m_settingsStore ? m_settingsStore->activeProvider().description
+            m_settingsStore ? currentProvider().description
                             : QStringLiteral("ACP"));
         m_chatWebView->addMessage(sysMsg);
 
@@ -1639,8 +1639,11 @@ void ChatWidget::applyACPBackend()
     if (!m_settingsStore || !m_session) {
         return;
     }
+    if (m_summaryGenerator) {
+        m_summaryGenerator->setFallbackProviderId(m_providerId);
+    }
 
-    ACPProvider provider = m_settingsStore->activeProvider();
+    ACPProvider provider = currentProvider();
     QStringList args;
     if (!provider.options.isEmpty()) {
         args = QProcess::splitCommand(provider.options);
@@ -1664,7 +1667,12 @@ void ChatWidget::populateProviderCombo()
     m_providerCombo->clear();
 
     const auto providerList = m_settingsStore->providers();
-    QString activeId = m_settingsStore->activeProviderId();
+    // This chat's provider; adopt the global default when it is unset or has
+    // been removed from the settings.
+    if (m_providerId.isEmpty() || m_settingsStore->providerById(m_providerId).executable.isEmpty()) {
+        m_providerId = m_settingsStore->activeProviderId();
+    }
+    const QString activeId = m_providerId;
     int activeIndex = 0;
 
     for (int i = 0; i < providerList.size(); ++i) {
@@ -1702,9 +1710,11 @@ void ChatWidget::onProviderComboChanged(int index)
         return;
     }
 
-    QString providerId = m_providerCombo->itemData(index).toString();
-    m_settingsStore->setActiveProviderId(providerId);
+    m_providerId = m_providerCombo->itemData(index).toString();
     applyACPBackend();
+    // Remember the choice as the default for new chats. This notifies every
+    // chat (settingsChanged), but each keeps its own m_providerId.
+    m_settingsStore->setActiveProviderId(m_providerId);
 }
 
 void ChatWidget::resizeEvent(QResizeEvent *event)
@@ -1854,7 +1864,7 @@ void ChatWidget::updateWindowTitle()
     const QString dir = m_session->workingDir();
     if ((m_lastStatus == ConnectionStatus::Connected || m_lastStatus == ConnectionStatus::Connecting)
         && !dir.isEmpty()) {
-        const QString provider = m_settingsStore ? m_settingsStore->activeProvider().description
+        const QString provider = m_settingsStore ? currentProvider().description
                                                  : QStringLiteral("Kate Code");
         const QString name = QDir(dir).dirName();
         title = QStringLiteral("%1: %2").arg(provider, name.isEmpty() ? dir : name);
@@ -1874,4 +1884,13 @@ bool ChatWidget::shouldClose()
         QStringLiteral("This chat has a live agent session. Closing it stops the agent."),
         QMessageBox::Close | QMessageBox::Cancel, QMessageBox::Cancel);
     return answer == QMessageBox::Close;
+}
+
+ACPProvider ChatWidget::currentProvider() const
+{
+    if (!m_settingsStore) {
+        return ACPProvider();
+    }
+    const ACPProvider provider = m_settingsStore->providerById(m_providerId);
+    return provider.executable.isEmpty() ? m_settingsStore->activeProvider() : provider;
 }
