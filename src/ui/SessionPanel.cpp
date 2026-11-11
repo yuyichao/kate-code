@@ -4,6 +4,7 @@
 #include <QIcon>
 #include <QLabel>
 #include <QListWidget>
+#include <QPainter>
 #include <QPushButton>
 #include <QVBoxLayout>
 
@@ -59,7 +60,7 @@ void SessionPanel::setEntries(const QList<Entry> &entries)
         if (!secondLine.isEmpty()) {
             text += QLatin1Char('\n') + secondLine;
         }
-        auto *item = new QListWidgetItem(QIcon::fromTheme(entry.iconName), text, m_list);
+        auto *item = new QListWidgetItem(withStatusBadge(entry.icon, entry.statusColor), text, m_list);
         item->setToolTip(text);
         if (entry.active) {
             QFont font = item->font();
@@ -72,4 +73,36 @@ void SessionPanel::setEntries(const QList<Entry> &entries)
         auto *hint = new QListWidgetItem(QStringLiteral("No open sessions. Use \"New Session\" to start a chat."), m_list);
         hint->setFlags(Qt::NoItemFlags);
     }
+}
+
+QIcon SessionPanel::withStatusBadge(const QIcon &icon, const QColor &color) const
+{
+    if (!color.isValid()) {
+        return icon;
+    }
+    QIcon result;
+    const qreal dpr = devicePixelRatioF();
+    for (const int size : {16, 22, 32}) {
+        for (const QIcon::Mode mode : {QIcon::Normal, QIcon::Selected}) {
+            QPixmap pixmap = icon.pixmap(QSize(size, size), dpr, mode);
+            if (pixmap.isNull()) {
+                pixmap = QPixmap(QSize(size, size) * dpr);
+                pixmap.setDevicePixelRatio(dpr);
+                pixmap.fill(Qt::transparent);
+            }
+            QPainter painter(&pixmap);
+            painter.setRenderHint(QPainter::Antialiasing);
+            // A dot in the bottom-right corner, ringed in the background
+            // colour so it stands apart from the logo.
+            const qreal diameter = size * 0.45;
+            const QRectF dot(size - diameter, size - diameter, diameter, diameter);
+            painter.setPen(QPen(palette().color(mode == QIcon::Selected ? QPalette::Highlight : QPalette::Base),
+                                qMax(1.0, size / 16.0)));
+            painter.setBrush(color);
+            painter.drawEllipse(dot.adjusted(0.5, 0.5, -0.5, -0.5));
+            painter.end();
+            result.addPixmap(pixmap, mode);
+        }
+    }
+    return result;
 }

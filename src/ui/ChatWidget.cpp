@@ -7,6 +7,7 @@
 #include "../config/SettingsStore.h"
 #include "../mcp/EditorSession.h"
 #include "../util/ACPLogger.h"
+#include "../util/AgentIcons.h"
 #include "../util/EditTracker.h"
 #include "../util/SessionStore.h"
 #include "../util/KateThemeConverter.h"
@@ -41,6 +42,7 @@
 #include <QResizeEvent>
 #include <QStandardItemModel>
 #include <QStandardPaths>
+#include <QTabBar>
 #include <QThread>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -498,6 +500,9 @@ void ChatWidget::setSettingsStore(SettingsStore *settings)
         // Connect settings changes for diff colors
         connect(m_settingsStore, &SettingsStore::settingsChanged,
                 this, &ChatWidget::onSettingsChanged);
+        // Registry logos arrive in the background.
+        connect(m_settingsStore->agentIcons(), &AgentIcons::iconsChanged,
+                this, &ChatWidget::updateProviderIcons);
 
         // Apply initial settings
         applyDiffColors();
@@ -1620,6 +1625,49 @@ void ChatWidget::applyDiffColors()
     m_chatWebView->updateDiffColors(removeBackground, addBackground);
 }
 
+void ChatWidget::updateProviderIcons()
+{
+    if (!m_settingsStore) {
+        return;
+    }
+    AgentIcons *icons = m_settingsStore->agentIcons();
+    for (int i = 0; i < m_providerCombo->count(); ++i) {
+        const ACPProvider provider = m_settingsStore->providerById(m_providerCombo->itemData(i).toString());
+        m_providerCombo->setItemIcon(i, icons->iconFor(provider));
+    }
+    const QIcon icon = icons->iconFor(currentProvider());
+    // Kate shows this on the chat's editor tab.
+    if (icon.cacheKey() != windowIcon().cacheKey()) {
+        setWindowIcon(icon);
+        updateKateTabIcon();
+        Q_EMIT sessionInfoChanged();
+    }
+}
+
+void ChatWidget::updateKateTabIcon()
+{
+    // Kate reads a widget tab's icon only when it sets the tab up, and after
+    // that follows title changes only. To update the icon later (a registry
+    // logo arriving, a provider switch), give the tab a unique title for a
+    // moment, which Kate applies synchronously, to find the tab(s) showing
+    // this chat, and set their icon directly.
+    QWidget *top = window();
+    if (top == this) {
+        return;  // not in a Kate window yet; Kate reads windowIcon() when adding it
+    }
+    const QString title = windowTitle();
+    const QString marker = QStringLiteral("katecode-tab-%1").arg(quintptr(this), 0, 16);
+    setWindowTitle(marker);
+    for (QTabBar *bar : top->findChildren<QTabBar *>()) {
+        for (int i = 0; i < bar->count(); ++i) {
+            if (bar->tabText(i) == marker) {
+                bar->setTabIcon(i, windowIcon());
+            }
+        }
+    }
+    setWindowTitle(title);
+}
+
 void ChatWidget::applyACPBackend()
 {
     if (!m_settingsStore || !m_session) {
@@ -1637,6 +1685,7 @@ void ChatWidget::applyACPBackend()
     m_session->setExecutable(provider.executable, args);
     m_session->setMcpConfigPath(provider.mcpConfigPath);
     m_session->setSessionConfig(provider.sessionConfig);
+    updateProviderIcons();
     qDebug() << "[ChatWidget] ACP backend configured:" << provider.executable << args
              << "MCP config:" << provider.mcpConfigPath
              << "session config keys:" << provider.sessionConfig.keys();
@@ -1688,6 +1737,7 @@ void ChatWidget::populateProviderCombo()
 
     m_providerCombo->setCurrentIndex(activeIndex);
     m_providerCombo->blockSignals(false);
+    updateProviderIcons();
 }
 
 void ChatWidget::onProviderComboChanged(int index)

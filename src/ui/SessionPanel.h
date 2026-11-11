@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QColor>
+#include <QIcon>
 #include <QWidget>
 
 class QListWidget;
@@ -22,7 +24,8 @@ public:
         QString location; // e.g. "Claude Code: kate-code"
         QString status;   // e.g. "Connected"
         QString detail;   // e.g. "$0.42"
-        QString iconName; // theme icon for the status
+        QIcon icon;         // provider logo
+        QColor statusColor; // badge drawn on the logo
         bool active = false;
     };
 
@@ -35,6 +38,8 @@ Q_SIGNALS:
     void entryActivated(int index);
 
 private:
+    QIcon withStatusBadge(const QIcon &icon, const QColor &color) const;
+
     QListWidget *m_list;
     int m_entryCount = 0;
 };

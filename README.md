@@ -47,7 +47,7 @@ See what the active agent is doing with inline tool call displays:
 
 ### System Requirements
 - KDE Plasma / Kate text editor
-- Qt 6 (Core, DBus, Widgets, WebEngineWidgets, WebChannel)
+- Qt 6 (Core, DBus, Widgets, WebEngineWidgets, WebChannel, Network, Svg)
 - KDE Frameworks 6 (KF6):
   - KTextEditor
   - KI18n
@@ -85,21 +85,21 @@ repositories; its PKGBUILD is tracked there rather than in this repository.
 
 **Arch Linux / Manjaro:**
 ```bash
-sudo pacman -S cmake extra-cmake-modules qt6-webengine qt6-webchannel qt6-declarative \
+sudo pacman -S cmake extra-cmake-modules qt6-webengine qt6-webchannel qt6-declarative qt6-svg \
   ktexteditor ki18n kcoreaddons kxmlgui syntax-highlighting kpty kparts
 ```
 
 **Debian / Ubuntu (26.04 or newer):**
 ```bash
 sudo apt install g++ cmake extra-cmake-modules \
-  qt6-base-dev qt6-webengine-dev qt6-webchannel-dev qt6-declarative-dev \
+  qt6-base-dev qt6-webengine-dev qt6-webchannel-dev qt6-declarative-dev qt6-svg-dev \
   libkf6texteditor-dev libkf6i18n-dev libkf6coreaddons-dev libkf6xmlgui-dev \
   libkf6syntaxhighlighting-dev libkf6pty-dev libkf6parts-dev
 ```
 
 **Fedora:**
 ```bash
-sudo dnf install cmake extra-cmake-modules gcc-c++ qt6-qtwebengine-devel \
+sudo dnf install cmake extra-cmake-modules gcc-c++ qt6-qtwebengine-devel qt6-qtsvg-devel \
   kf6-ktexteditor-devel kf6-ki18n-devel kf6-kcoreaddons-devel \
   kf6-kxmlgui-devel kf6-syntax-highlighting-devel
 ```
@@ -107,7 +107,7 @@ sudo dnf install cmake extra-cmake-modules gcc-c++ qt6-qtwebengine-devel \
 **openSUSE Tumbleweed:**
 ```bash
 sudo zypper install cmake kf6-extra-cmake-modules gcc-c++ \
-  qt6-base-devel qt6-webchannel-devel qt6-webenginewidgets-devel \
+  qt6-base-devel qt6-webchannel-devel qt6-webenginewidgets-devel qt6-svg-devel \
   kf6-ktexteditor-devel kf6-ki18n-devel kf6-kcoreaddons-devel \
   kf6-kxmlgui-devel kf6-syntax-highlighting-devel kf6-kpty-devel
 ```
@@ -220,6 +220,8 @@ This feature is experimental and behavior may change in future releases.
 ### ACP Providers
 
 Manage providers under **Settings → Configure Kate → Kate Code → General**. Providers can be added, edited, removed, and reordered. Each entry can configure its executable, command-line options, MCP configuration, ACP session settings, and resume capability. The seeded Claude Code and Vibe entries are ordinary editable providers.
+
+Each provider's logo is shown on its chat tabs, in the provider dropdown and in the session list. It is the provider's explicit icon (a theme icon name or an image file) if set, otherwise the icon of its entry in the [ACP agent registry](https://agentclientprotocol.com/get-started/registry) (the "ACP registry id", e.g. `claude-acp`; the seeded providers have one), otherwise a generic icon. Registry icons are downloaded from `cdn.agentclientprotocol.com` and cached under `~/.cache/kate-code/acp-registry`; Kate Code only contacts the registry for providers with a registry id and no cached (or a week-old) icon.
 
 ### Color Scheme
 

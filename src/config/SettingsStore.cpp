@@ -1,5 +1,7 @@
 #include "SettingsStore.h"
 
+#include "../util/AgentIcons.h"
+
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -14,12 +16,14 @@ const QString SettingsStore::CURRENT_AGENT_PROVIDER_ID = QStringLiteral("__curre
 SettingsStore::SettingsStore(QObject *parent)
     : QObject(parent)
     , m_settings(QStringLiteral("kate-code"), QStringLiteral("kate-code"))
+    , m_agentIcons(new AgentIcons(this))
 {
     qDebug() << "[SettingsStore] Initialized, config file:" << m_settings.fileName();
     migrateOldBackendSettings();
     // The Anthropic-API summariser is gone; drop its stale model setting.
     m_settings.remove(QStringLiteral("Summaries/model"));
     seedDefaultProvidersIfNeeded();
+    backfillRegistryIds();
 }
 
 SettingsStore::~SettingsStore() = default;
@@ -119,8 +123,8 @@ QList<ACPProvider> SettingsStore::defaultProviders() const
 {
     // Seed providers offered on first run. They are fully editable and removable
     // afterwards, so this list is only used to populate empty storage.
-    ACPProvider claude{QStringLiteral("claude-code"), QStringLiteral("Claude Code"), QStringLiteral("claude-agent-acp"), QString(), QString(), {}, true, false};
-    ACPProvider vibe{QStringLiteral("vibe-mistral"), QStringLiteral("Vibe (Mistral)"), QStringLiteral("vibe-acp"), QString(), QString(), {}, true, false};
+    ACPProvider claude{QStringLiteral("claude-code"), QStringLiteral("Claude Code"), QStringLiteral("claude-agent-acp"), QString(), QString(), {}, true, false, QStringLiteral("claude-acp"), QString()};
+    ACPProvider vibe{QStringLiteral("vibe-mistral"), QStringLiteral("Vibe (Mistral)"), QStringLiteral("vibe-acp"), QString(), QString(), {}, true, false, QStringLiteral("mistral-vibe"), QString()};
     return {claude, vibe};
 }
 
@@ -148,6 +152,8 @@ QList<ACPProvider> SettingsStore::storedProviders() const
             }
         }
         p.trueResume = m_settings.value(QStringLiteral("trueResume"), false).toBool();
+        p.registryId = m_settings.value(QStringLiteral("registryId")).toString();
+        p.icon = m_settings.value(QStringLiteral("icon")).toString();
         p.builtin = false;
         if (!p.id.isEmpty() && !p.executable.isEmpty()) {
             list.append(p);
@@ -170,6 +176,8 @@ void SettingsStore::writeProviders(const QList<ACPProvider> &list)
         m_settings.setValue(QStringLiteral("sessionConfig"),
                             QString::fromUtf8(QJsonDocument(list[i].sessionConfig).toJson(QJsonDocument::Compact)));
         m_settings.setValue(QStringLiteral("trueResume"), list[i].trueResume);
+        m_settings.setValue(QStringLiteral("registryId"), list[i].registryId);
+        m_settings.setValue(QStringLiteral("icon"), list[i].icon);
     }
     m_settings.endArray();
     m_settings.sync();
@@ -201,6 +209,34 @@ void SettingsStore::seedDefaultProvidersIfNeeded()
     m_settings.setValue(QStringLiteral("ACP/seeded"), true);
     m_settings.sync();
     qDebug() << "[SettingsStore] Seeded default providers, total:" << merged.size();
+}
+
+void SettingsStore::backfillRegistryIds()
+{
+    // Providers seeded before registry ids existed get the default provider's
+    // id once; a value the user clears afterwards stays cleared.
+    if (m_settings.value(QStringLiteral("ACP/registryIdsSeeded"), false).toBool()) {
+        return;
+    }
+    QList<ACPProvider> list = storedProviders();
+    bool changed = false;
+    const QList<ACPProvider> defaults = defaultProviders();
+    for (ACPProvider &p : list) {
+        if (!p.registryId.isEmpty()) {
+            continue;
+        }
+        for (const ACPProvider &seed : defaults) {
+            if (seed.id == p.id) {
+                p.registryId = seed.registryId;
+                changed = true;
+            }
+        }
+    }
+    if (changed) {
+        writeProviders(list);
+    }
+    m_settings.setValue(QStringLiteral("ACP/registryIdsSeeded"), true);
+    m_settings.sync();
 }
 
 QList<ACPProvider> SettingsStore::providers() const

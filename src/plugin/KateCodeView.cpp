@@ -360,22 +360,23 @@ void KateCodeView::refreshSessionPanel()
         switch (chat->connectionStatus()) {
         case ConnectionStatus::Connected:
             entry.status = QStringLiteral("Connected");
-            entry.iconName = QStringLiteral("network-connect");
+            entry.statusColor = QColor(0x5c, 0xb8, 0x5c);
             break;
         case ConnectionStatus::Connecting:
             entry.status = QStringLiteral("Connecting");
-            entry.iconName = QStringLiteral("network-connecting");
+            entry.statusColor = QColor(0xf0, 0xad, 0x4e);
             break;
         case ConnectionStatus::Error:
             entry.status = QStringLiteral("Error");
-            entry.iconName = QStringLiteral("dialog-error");
+            entry.statusColor = QColor(0xd9, 0x53, 0x4f);
             break;
         case ConnectionStatus::Disconnected:
             entry.status = QStringLiteral("Not connected");
-            entry.iconName = QStringLiteral("network-disconnect");
+            entry.statusColor = QColor(0x88, 0x88, 0x88);
             break;
         }
 
+        entry.icon = chat->providerIcon();
         // Context usage is shown in the chat's own status row.
         const SessionUsage usage = chat->usage();
         if (usage.cost >= 0) {

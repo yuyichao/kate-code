@@ -1,5 +1,6 @@
 #include "KateCodeConfigPage.h"
 #include "SettingsStore.h"
+#include "../util/AgentIcons.h"
 
 #include <KLocalizedString>
 
@@ -85,6 +86,8 @@ static QString providerToolTip(const ACPProvider &provider)
         i18n("CLI options: %1", provider.options.isEmpty() ? i18n("(none)") : provider.options),
         i18n("MCP config JSON: %1", provider.mcpConfigPath.isEmpty() ? i18n("(none)") : provider.mcpConfigPath),
         i18n("True resume: %1", provider.trueResume ? i18n("Yes") : i18n("No")),
+        i18n("Icon: %1", provider.icon.isEmpty() ? i18n("(from the ACP registry)") : provider.icon),
+        i18n("ACP registry id: %1", provider.registryId.isEmpty() ? i18n("(none)") : provider.registryId),
     };
     if (provider.sessionConfig.isEmpty()) {
         lines.append(i18n("ACP session configuration: (none)"));
@@ -106,6 +109,15 @@ KateCodeConfigPage::KateCodeConfigPage(SettingsStore *settings, QWidget *parent)
 
     // Load current settings
     reset();
+
+    // Registry logos arrive in the background.
+    connect(m_settings->agentIcons(), &AgentIcons::iconsChanged, this, [this]() {
+        for (int row = 0; row < m_providerList->count(); ++row) {
+            QListWidgetItem *item = m_providerList->item(row);
+            item->setIcon(m_settings->agentIcons()->iconFor(
+                m_settings->providerById(item->data(Qt::UserRole).toString())));
+        }
+    });
 }
 
 KateCodeConfigPage::~KateCodeConfigPage() = default;
@@ -359,7 +371,7 @@ void KateCodeConfigPage::populateProviderList()
     m_providerList->clear();
     const auto providerList = m_settings->providers();
     for (const auto &p : providerList) {
-        auto *item = new QListWidgetItem(p.description, m_providerList);
+        auto *item = new QListWidgetItem(m_settings->agentIcons()->iconFor(p), p.description, m_providerList);
         item->setData(Qt::UserRole, p.id);
         item->setToolTip(providerToolTip(p));
         if (p.id == selectedId) {
@@ -625,6 +637,24 @@ bool KateCodeConfigPage::editProviderDialog(ACPProvider &provider, const QString
     resumeCheck->setChecked(provider.trueResume);
     formLayout->addRow(i18n("True resume:"), resumeCheck);
 
+    // The agent's entry in the ACP registry provides its logo.
+    auto *registryCombo = new QComboBox(&dialog);
+    registryCombo->setEditable(true);
+    registryCombo->setInsertPolicy(QComboBox::NoInsert);
+    registryCombo->addItem(QString());
+    for (const auto &agent : m_settings->agentIcons()->registryAgents()) {
+        registryCombo->addItem(agent.first);
+        registryCombo->setItemData(registryCombo->count() - 1, agent.second, Qt::ToolTipRole);
+    }
+    registryCombo->setCurrentText(provider.registryId);
+    registryCombo->lineEdit()->setPlaceholderText(i18n("e.g. claude-acp, codex-acp, gemini (optional)"));
+    registryCombo->setToolTip(i18n("Id of the agent in the ACP registry (agentclientprotocol.com); its icon is used for this provider."));
+    formLayout->addRow(i18n("ACP registry id:"), registryCombo);
+
+    auto *iconEdit = new QLineEdit(provider.icon, &dialog);
+    iconEdit->setPlaceholderText(i18n("Theme icon name or image file (optional, overrides the registry icon)"));
+    formLayout->addRow(i18n("Icon:"), iconEdit);
+
     auto *configLabel = new QLabel(i18n("ACP session configuration"), &dialog);
     QFont labelFont = configLabel->font();
     labelFont.setBold(true);
@@ -688,6 +718,12 @@ bool KateCodeConfigPage::editProviderDialog(ACPProvider &provider, const QString
             QMessageBox::warning(&dialog, i18n("Invalid Provider"), i18n("Description and Executable are required."));
             continue;
         }
+        const QString registryId = registryCombo->currentText().trimmed();
+        if (!registryId.isEmpty() && !AgentIcons::isValidRegistryId(registryId)) {
+            QMessageBox::warning(&dialog, i18n("Invalid Provider"),
+                                 i18n("An ACP registry id contains only lowercase letters, digits and hyphens."));
+            continue;
+        }
 
         QJsonObject sessionConfig;
         bool valid = true;
@@ -721,6 +757,8 @@ bool KateCodeConfigPage::editProviderDialog(ACPProvider &provider, const QString
         provider.mcpConfigPath = mcpEdit->text().trimmed();
         provider.trueResume = resumeCheck->isChecked();
         provider.sessionConfig = sessionConfig;
+        provider.icon = iconEdit->text().trimmed();
+        provider.registryId = registryCombo->currentText().trimmed();
         return true;
     }
     return false;

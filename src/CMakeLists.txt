@@ -36,6 +36,7 @@ set(katecode_SRCS
     util/ProjectFileScanner.cpp
     util/TranscriptWriter.cpp
     util/SummaryStore.cpp
+    util/AgentIcons.cpp
     util/SummaryGenerator.cpp
     util/ACPLogger.cpp
 )
@@ -59,6 +60,8 @@ target_link_libraries(katecode
     Qt6::WebEngineWidgets
     Qt6::QuickWidgets
     Qt6::WebChannel
+    Qt6::Network
+    Qt6::Svg
 )
 
 # Installation

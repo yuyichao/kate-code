@@ -18,7 +18,11 @@ struct ACPProvider {
     QJsonObject sessionConfig; // ACP session config option id -> desired JSON value
     bool builtin = false; // true for the default-seeded providers (kept for reference only)
     bool trueResume = false; // try ACP session/load (option B) before falling back to context injection (option A)
+    QString registryId;   // ACP registry id (e.g. "claude-acp"), used for the icon
+    QString icon;         // Explicit icon: theme icon name or image file (overrides the registry icon)
 };
+
+class AgentIcons;
 
 // Color schemes for diff highlighting (colorblind-friendly options)
 enum class DiffColorScheme {
@@ -42,6 +46,9 @@ class SettingsStore : public QObject
 public:
     explicit SettingsStore(QObject *parent = nullptr);
     ~SettingsStore() override;
+
+    // Provider logos (see AgentIcons).
+    AgentIcons *agentIcons() const { return m_agentIcons; }
 
     // Summary settings (stored in QSettings)
     bool summariesEnabled() const;
@@ -113,9 +120,11 @@ Q_SIGNALS:
 private:
     void migrateOldBackendSettings();
     void seedDefaultProvidersIfNeeded();
+    void backfillRegistryIds();
     QList<ACPProvider> defaultProviders() const;
     QList<ACPProvider> storedProviders() const;
     void writeProviders(const QList<ACPProvider> &list);
 
     mutable QSettings m_settings;
+    AgentIcons *m_agentIcons;
 };

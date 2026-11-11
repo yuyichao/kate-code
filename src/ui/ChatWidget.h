@@ -92,6 +92,8 @@ public:
     QString chatTitle() const { return m_chatTitle; }
     // Provider and project directory, e.g. "Claude Code: kate-code".
     QString locationTitle() const;
+    // Logo of this chat's provider (also the tab icon).
+    QIcon providerIcon() const { return windowIcon(); }
     ConnectionStatus connectionStatus() const { return m_lastStatus; }
     SessionUsage usage() const;
     QString workingDir() const;
@@ -167,6 +169,9 @@ private Q_SLOTS:
 
 private:
     void updateWindowTitle();
+    // Provider logos on the tab and in the provider dropdown.
+    void updateProviderIcons();
+    void updateKateTabIcon();
     // Header title label (elided to its width) and rename controls.
     void updateTitleLabel();
     void onSessionTitleChanged(const QString &title);

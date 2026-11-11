@@ -29,6 +29,8 @@ find_package(Qt6 REQUIRED COMPONENTS
     WebEngineWidgets
     QuickWidgets
     WebChannel
+    Network
+    Svg
 )
 
 add_subdirectory(src)
