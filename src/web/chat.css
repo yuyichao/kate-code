@@ -426,6 +426,17 @@ body {
     padding: 0;
 }
 
+/* Every block of highlighted code uses the editor's code colours. The Kate
+   theme CSS only colours tokens, so plain text needs --code-fg to stay
+   readable when the editor and KDE UI themes differ (light vs dark). */
+.message pre:has(> code.hljs) {
+    background-color: var(--code-bg, #282c34);
+}
+
+pre code.hljs {
+    color: var(--code-fg, inherit);
+}
+
 .message.assistant .message-content pre {
     background-color: var(--code-bg, #282c34);
     margin: 0;
@@ -728,10 +739,11 @@ pre.diff {
     overflow-x: auto;
     margin: 0;
     padding: 0;
-    background-color: rgba(0, 0, 0, 0.2);
+    /* Same colours as the editor, so Kate-theme syntax colours stay readable */
+    background-color: var(--code-bg, #282c34);
     border-radius: 3px;
     line-height: 1.5;
-    color: var(--fg-primary);
+    color: var(--code-fg, var(--fg-primary));
 }
 
 /* Diff line types - only direct children are block-level lines */
@@ -741,14 +753,12 @@ pre.diff > span {
 }
 
 pre.diff .diff-header {
-    color: var(--fg-secondary);
+    opacity: 0.7;
     font-weight: 600;
 }
 
-pre.diff .diff-context {
-    /* Inherit syntax highlighting colors, fallback to primary */
-    color: var(--fg-primary);
-}
+/* Diff lines inherit the code foreground; only the background marks
+   additions and removals, so syntax highlighting shows through. */
 
 pre.diff .diff-remove {
     background-color: var(--diff-remove-bg, #7a4347);

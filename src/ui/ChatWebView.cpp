@@ -111,6 +111,7 @@ void ChatWebView::injectColorScheme()
 
     QString hljsTheme;
     QString codeBg;
+    QString codeFg;  // default text colour inside code blocks
     QString inlineCodeBg;
 
     if (!kateThemeCSS.isEmpty()) {
@@ -122,6 +123,12 @@ void ChatWebView::injectColorScheme()
         QJsonObject themeJson = KateThemeConverter::loadKateTheme(themeName);
 
         if (!themeJson.isEmpty()) {
+            // Kate's "Normal" text colour: the highlight CSS only colours
+            // tokens, so plain code text needs it to match the code background.
+            codeFg = themeJson[QStringLiteral("text-styles")].toObject()
+                         [QStringLiteral("Normal")].toObject()
+                         [QStringLiteral("text-color")].toString();
+
             QJsonObject editorColors = themeJson[QStringLiteral("editor-colors")].toObject();
             QString kateCodeBg = editorColors[QStringLiteral("BackgroundColor")].toString();
 
@@ -139,6 +146,9 @@ void ChatWebView::injectColorScheme()
 
         // Determine if the code background is light or dark (independent of KDE UI theme)
         bool isLightCodeBg = QColor(codeBg).lightnessF() > 0.5;
+        if (codeFg.isEmpty()) {
+            codeFg = isLightCodeBg ? QStringLiteral("#1e1e1e") : QStringLiteral("#e0e0e0");
+        }
 
         inlineCodeBg = isLightCodeBg ? QStringLiteral("rgba(0, 0, 0, 0.08)")
                                      : QStringLiteral("rgba(0, 0, 0, 0.3)");
@@ -160,10 +170,10 @@ void ChatWebView::injectColorScheme()
 
         // Add code background and font variables to CSS vars
         // Don't quote font family here - quotes will be added in CSS usage
-        QString fullCssVars = cssVars + QStringLiteral("; --code-bg: %1; --inline-code-bg: %2; --code-font-family: %3; --code-font-size: %4px; --task-purple: %5; --task-purple-bg: %6; --terminal-fg: %7")
+        QString fullCssVars = cssVars + QStringLiteral("; --code-bg: %1; --inline-code-bg: %2; --code-font-family: %3; --code-font-size: %4px; --task-purple: %5; --task-purple-bg: %6; --terminal-fg: %7; --code-fg: %8")
                                             .arg(codeBg, inlineCodeBg, fontFamily)
                                             .arg(fontSize)
-                                            .arg(taskPurple, taskPurpleBg, terminalFg);
+                                            .arg(taskPurple, taskPurpleBg, terminalFg, codeFg);
 
         QString script = QStringLiteral(
             "applyColorScheme('%1'); "
@@ -178,6 +188,8 @@ void ChatWebView::injectColorScheme()
         hljsTheme = isLight ? QStringLiteral("vendor/atom-one-light.min.css")
                             : QStringLiteral("vendor/atom-one-dark.min.css");
         codeBg = isLight ? QStringLiteral("#fafafa") : QStringLiteral("#282c34");
+        // Default text colours of the bundled atom-one light/dark themes
+        codeFg = isLight ? QStringLiteral("#383a42") : QStringLiteral("#abb2bf");
         inlineCodeBg = isLight ? QStringLiteral("rgba(0, 0, 0, 0.08)")
                                 : QStringLiteral("rgba(0, 0, 0, 0.3)");
 
@@ -189,10 +201,10 @@ void ChatWebView::injectColorScheme()
         // Terminal text color: dark text on light backgrounds, light text on dark backgrounds
         QString terminalFg = isLight ? QStringLiteral("#1e1e1e") : QStringLiteral("#e0e0e0");
 
-        QString fullCssVars = cssVars + QStringLiteral("; --code-bg: %1; --inline-code-bg: %2; --code-font-family: %3; --code-font-size: %4px; --task-purple: %5; --task-purple-bg: %6; --terminal-fg: %7")
+        QString fullCssVars = cssVars + QStringLiteral("; --code-bg: %1; --inline-code-bg: %2; --code-font-family: %3; --code-font-size: %4px; --task-purple: %5; --task-purple-bg: %6; --terminal-fg: %7; --code-fg: %8")
                                             .arg(codeBg, inlineCodeBg, fontFamily)
                                             .arg(fontSize)
-                                            .arg(taskPurple, taskPurpleBg, terminalFg);
+                                            .arg(taskPurple, taskPurpleBg, terminalFg, codeFg);
 
         QString script = QStringLiteral(
             "applyColorScheme('%1'); "
