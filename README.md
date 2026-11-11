@@ -60,17 +60,17 @@ See what the active agent is doing with inline tool call displays:
 
 ### Runtime Dependencies
 - At least one ACP-compatible agent executable installed and available in `PATH`
-- Kate Code seeds editable provider entries for Claude Code (`claude-code-acp`) and Vibe (`vibe-acp`), and supports custom ACP providers
+- Kate Code seeds editable provider entries for Claude Code (`claude-agent-acp`) and Vibe (`vibe-acp`), and supports custom ACP providers
 
 ## Installation
 
 ### Install an ACP provider
 
-Install the ACP-compatible agent you want to use and ensure its executable is available in `PATH`. For example, follow the [claude-code-acp installation instructions](https://github.com/zed-industries/claude-code-acp) for Claude Code.
+Install the ACP-compatible agent you want to use and ensure its executable is available in `PATH`. For example, follow the [claude-agent-acp installation instructions](https://github.com/agentclientprotocol/claude-agent-acp) for Claude Code (the installed binary is named `claude-agent-acp`).
 
 Verify the executable, for example:
 ```bash
-which claude-code-acp
+which claude-agent-acp
 ```
 
 ### Option 1: Install from Package (Recommended)
@@ -141,8 +141,8 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 # Build
 cmake --build build
 
-# Install to system (requires sudo)
-sudo cmake --install build
+# Install to system (requires sudo) - Arch/Fedora/most distros need --prefix /usr
+sudo cmake --install build --prefix /usr
 
 # Or install to user directory
 cmake --install build --prefix ~/.local
@@ -333,5 +333,5 @@ Contributions welcome! Please:
 ## Acknowledgments
 
 - Built with Qt 6 and KDE Frameworks 6
-- Supports ACP-compatible agents, with seeded providers for [claude-code-acp](https://github.com/zed-industries/claude-code-acp) and Vibe
+- Supports ACP-compatible agents, with seeded providers for [claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp) and Vibe
 - Markdown rendering by [marked.js](https://marked.js.org/)
