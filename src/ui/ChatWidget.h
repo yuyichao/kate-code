@@ -27,6 +27,7 @@ class QComboBox;
 class QPushButton;
 class QToolButton;
 class QLabel;
+class QLineEdit;
 
 class ChatWidget : public QWidget
 {
@@ -86,7 +87,11 @@ public:
 
     // Summary of this chat for the session list (KateCodeView side panel).
     // sessionInfoChanged() fires when any of these change.
-    QString sessionTitle() const;
+    // The session's title (from the agent, or renamed by the user); empty
+    // until there is one.
+    QString chatTitle() const { return m_chatTitle; }
+    // Provider and project directory, e.g. "Claude Code: kate-code".
+    QString locationTitle() const;
     ConnectionStatus connectionStatus() const { return m_lastStatus; }
     SessionUsage usage() const;
     QString workingDir() const;
@@ -105,6 +110,7 @@ public Q_SLOTS:
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 Q_SIGNALS:
     // Diff highlighting signals for KateCodeView integration
@@ -120,7 +126,7 @@ Q_SIGNALS:
     // User question response (MCP AskUserQuestion tool)
     void userQuestionAnswered(const QString &requestId, const QString &responseJson);
 
-    // Title, status or usage changed (see sessionTitle()).
+    // Title, status or usage changed (see chatTitle()).
     void sessionInfoChanged();
 
 private Q_SLOTS:
@@ -161,6 +167,11 @@ private Q_SLOTS:
 
 private:
     void updateWindowTitle();
+    // Header title label (elided to its width) and rename controls.
+    void updateTitleLabel();
+    void onSessionTitleChanged(const QString &title);
+    void beginRename();
+    void finishRename(bool accept);
     // Stop any session (live, connecting or failed) and start a new one in
     // projectRoot (empty: the current project).
     void startNewSession(bool resetView, const QString &projectRoot = QString());
@@ -222,6 +233,9 @@ private:
     QToolButton *m_clearOutputButton;
     QToolButton *m_saveOutputButton;
     QLabel *m_titleLabel;
+    QLineEdit *m_titleEdit;
+    QToolButton *m_renameButton;
+    QString m_chatTitle;
     QLabel *m_statusIndicator;
     QWidget *m_contextChipsContainer;
     // Splitter separating the chat view from the input area

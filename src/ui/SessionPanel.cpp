@@ -49,6 +49,9 @@ void SessionPanel::setEntries(const QList<Entry> &entries)
     m_list->clear();
     for (const Entry &entry : entries) {
         QString text = entry.title;
+        if (!entry.location.isEmpty()) {
+            text += QLatin1Char('\n') + entry.location;
+        }
         QString secondLine = entry.status;
         if (!entry.detail.isEmpty()) {
             secondLine += QStringLiteral(" · ") + entry.detail;

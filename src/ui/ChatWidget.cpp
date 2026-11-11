@@ -30,7 +30,9 @@
 #include <QMessageBox>
 #include <QIcon>
 #include <QImage>
+#include <QKeyEvent>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPixmap>
 #include <QPointer>
 #include <QProcess>
@@ -69,11 +71,42 @@ ChatWidget::ChatWidget(QWidget *parent)
     headerLayout->setContentsMargins(4, 4, 4, 4);
     headerLayout->setSpacing(8);
 
-    // Title: "Kate Code - Session"
-    m_titleLabel = new QLabel(QStringLiteral("Kate Code - Session"), this);
+    // Session title: the agent's, or one the user set. Double-click (or the
+    // rename button) edits it in place.
+    m_titleLabel = new QLabel(this);
+    m_titleLabel->setObjectName(QStringLiteral("sessionTitleLabel"));
     m_titleLabel->setStyleSheet(QStringLiteral("QLabel { font-weight: bold; }"));
-    headerLayout->addWidget(m_titleLabel);
-    headerLayout->addStretch();
+    m_titleLabel->setTextFormat(Qt::PlainText);
+    // Ignored width: the label takes the free space and is elided to it,
+    // instead of a long title widening the whole header.
+    m_titleLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_titleLabel->installEventFilter(this);
+    headerLayout->addWidget(m_titleLabel, 1);
+
+    m_titleEdit = new QLineEdit(this);
+    m_titleEdit->setObjectName(QStringLiteral("sessionTitleEdit"));
+    m_titleEdit->setPlaceholderText(QStringLiteral("Session title"));
+    m_titleEdit->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    m_titleEdit->installEventFilter(this);
+    m_titleEdit->hide();
+    headerLayout->addWidget(m_titleEdit, 1);
+    connect(m_titleEdit, &QLineEdit::returnPressed, this, [this]() {
+        finishRename(true);
+    });
+    connect(m_titleEdit, &QLineEdit::editingFinished, this, [this]() {
+        // Focus left the editor (Return is handled above).
+        finishRename(true);
+    });
+
+    m_renameButton = new QToolButton(this);
+    m_renameButton->setObjectName(QStringLiteral("renameSessionButton"));
+    m_renameButton->setIcon(QIcon::fromTheme(QStringLiteral("edit-rename")));
+    m_renameButton->setToolTip(QStringLiteral("Rename Session"));
+    m_renameButton->setAutoRaise(true);
+    m_renameButton->setEnabled(false);
+    connect(m_renameButton, &QToolButton::clicked, this, &ChatWidget::beginRename);
+    headerLayout->addWidget(m_renameButton);
+    updateTitleLabel();
 
     // ACP Provider selector
     m_providerCombo = new QComboBox(this);
@@ -242,6 +275,7 @@ ChatWidget::ChatWidget(QWidget *parent)
     connect(m_session, &ACPSession::usageChanged, this, [this]() {
         Q_EMIT sessionInfoChanged();
     });
+    connect(m_session, &ACPSession::titleChanged, this, &ChatWidget::onSessionTitleChanged);
     connect(m_session, &ACPSession::configOptionsChanged, this, [this](const QJsonArray &options) {
         m_inputWidget->setConfigOptions(options);
     });
@@ -506,6 +540,7 @@ void ChatWidget::startNewSession(bool resetView, const QString &root)
     m_reconnectSessionId.clear();
 
     stopSessionQuietly();
+    m_chatTitle.clear();
     if (resetView) {
         // Destroy and recreate the WebView to reclaim Chromium memory.
         resetWebView();
@@ -605,6 +640,11 @@ void ChatWidget::resumeSession(const QString &sessionId, const QString &projectR
     // again; clearing the flag first stops a duplicate summary.
     m_userSentMessage = false;
     stopSessionQuietly();
+    // Reconnecting to the same session keeps its title until the agent
+    // reports it again; another session starts without one.
+    if (sessionId != m_lastSessionId) {
+        m_chatTitle.clear();
+    }
 
     // Option B (per-provider): try a real ACP session/load, falling back to
     // context injection if it fails. Otherwise use option A directly.
@@ -748,7 +788,6 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         m_newSessionButton->setEnabled(true);
         m_providerCombo->setEnabled(true);
         m_inputWidget->setEnabled(false);
-        m_titleLabel->setText(QStringLiteral("Kate Code - Session"));
         // A failed agent exiting afterwards keeps the error state and its
         // Reconnect button; a deliberate restart shows nothing.
         if (previousStatus != ConnectionStatus::Error) {
@@ -794,7 +833,6 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         m_inputWidget->setEnabled(true);
         m_statusIndicator->setStyleSheet(QStringLiteral("QLabel { color: #5cb85c; font-size: 14px; }"));
         m_statusIndicator->setToolTip(QStringLiteral("Connected"));
-        m_titleLabel->setText(QStringLiteral("Kate Code - Session"));
         sysMsg.id = QStringLiteral("sys_connected");
         sysMsg.content = QStringLiteral("Connected! Session ID: %1").arg(m_session->sessionId());
         m_chatWebView->addMessage(sysMsg);
@@ -854,6 +892,12 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         break;
     }
 
+    // Renaming needs a live session.
+    m_renameButton->setEnabled(status == ConnectionStatus::Connected);
+    if (status != ConnectionStatus::Connected) {
+        finishRename(false);
+    }
+    updateTitleLabel();
     updateWindowTitle();
     Q_EMIT sessionInfoChanged();
 }
@@ -1801,9 +1845,88 @@ void ChatWidget::resetWebView()
     qDebug() << "[ChatWidget] WebView reset complete";
 }
 
-QString ChatWidget::sessionTitle() const
+QString ChatWidget::locationTitle() const
 {
-    return windowTitle();
+    const QString provider = m_settingsStore ? currentProvider().description
+                                             : QStringLiteral("Kate Code");
+    const QString dir = m_session->workingDir();
+    if (dir.isEmpty()) {
+        return provider;
+    }
+    const QString name = QDir(dir).dirName();
+    return QStringLiteral("%1: %2").arg(provider, name.isEmpty() ? dir : name);
+}
+
+void ChatWidget::onSessionTitleChanged(const QString &title)
+{
+    if (title == m_chatTitle) {
+        return;
+    }
+    m_chatTitle = title;
+    updateTitleLabel();
+    updateWindowTitle();
+    Q_EMIT sessionInfoChanged();
+}
+
+void ChatWidget::updateTitleLabel()
+{
+    const QString text = m_chatTitle.isEmpty() ? QStringLiteral("New session") : m_chatTitle;
+    const int width = m_titleLabel->width();
+    m_titleLabel->setText(width > 0
+        ? m_titleLabel->fontMetrics().elidedText(text, Qt::ElideRight, width)
+        : text);
+    QString tip = text;
+    if (m_renameButton->isEnabled()) {
+        tip += QStringLiteral("\n(double-click to rename)");
+    }
+    m_titleLabel->setToolTip(tip);
+}
+
+void ChatWidget::beginRename()
+{
+    if (m_lastStatus != ConnectionStatus::Connected || m_titleEdit->isVisible()) {
+        return;
+    }
+    m_titleEdit->setText(m_chatTitle);
+    m_titleLabel->hide();
+    m_titleEdit->show();
+    m_titleEdit->setFocus();
+    m_titleEdit->selectAll();
+}
+
+void ChatWidget::finishRename(bool accept)
+{
+    if (!m_titleEdit->isVisible()) {
+        return;
+    }
+    const QString title = m_titleEdit->text().simplified();
+    // Hide first: hiding the focused editor emits editingFinished again.
+    m_titleEdit->hide();
+    m_titleLabel->show();
+    updateTitleLabel();
+    if (accept && !title.isEmpty() && title != m_chatTitle) {
+        // The title shown follows titleChanged: the agent may sanitise it, and
+        // reports a failed rename as an error.
+        m_session->setTitle(title);
+    }
+}
+
+bool ChatWidget::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_titleLabel) {
+        if (event->type() == QEvent::MouseButtonDblClick) {
+            beginRename();
+            return true;
+        }
+        if (event->type() == QEvent::Resize) {
+            updateTitleLabel();
+        }
+    } else if (watched == m_titleEdit && event->type() == QEvent::KeyPress
+               && static_cast<QKeyEvent *>(event)->key() == Qt::Key_Escape) {
+        finishRename(false);
+        return true;
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 SessionUsage ChatWidget::usage() const
@@ -1819,13 +1942,18 @@ QString ChatWidget::workingDir() const
 void ChatWidget::updateWindowTitle()
 {
     QString title = QStringLiteral("Kate Code");
-    const QString dir = m_session->workingDir();
     if ((m_lastStatus == ConnectionStatus::Connected || m_lastStatus == ConnectionStatus::Connecting)
-        && !dir.isEmpty()) {
-        const QString provider = m_settingsStore ? currentProvider().description
-                                                 : QStringLiteral("Kate Code");
-        const QString name = QDir(dir).dirName();
-        title = QStringLiteral("%1: %2").arg(provider, name.isEmpty() ? dir : name);
+        && !m_session->workingDir().isEmpty()) {
+        title = locationTitle();
+    }
+    if (!m_chatTitle.isEmpty()) {
+        // Keep the tab readable: the full title is in the header and sidebar.
+        constexpr int maxTitleLength = 40;
+        QString chatTitle = m_chatTitle;
+        if (chatTitle.size() > maxTitleLength) {
+            chatTitle = chatTitle.left(maxTitleLength - 1).trimmed() + QChar(0x2026);
+        }
+        title = QStringLiteral("%1 — %2").arg(chatTitle, title);
     }
     if (windowTitle() != title) {
         setWindowTitle(title);

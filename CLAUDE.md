@@ -62,6 +62,7 @@ Settings > Configure Kate > Plugins > Enable "Kate Code"
 - Never block a DBus call or ACP request in a nested event loop (other sessions' requests would nest inside it): askUserQuestion uses a delayed DBus reply, terminal/wait_for_exit a callback
 - Each chat keeps its own provider; `ACP/activeProvider` is only the default for new chats
 - Chats connect as soon as they are created (`ChatWidget::startSession()`); there is no Connect button. A failed or lost connection shows a Reconnect button in the chat (resumes the last connected session if any), and switching provider starts a new session
+- Session titles come from the agent's `session_info_update.title`; renaming (header label double-click or rename button) sends `session/set_title` when the agent advertises `sessionCapabilities.title`, otherwise the title is kept locally. The title is shown in the chat header, the tab (`windowTitle`, elided) and the side panel
 - Kate keeps the enabled-plugin list in the session file (`kate/anonymous.katesession`, `[Kate Plugins]`), not in `katerc`
 - K_PLUGIN_CLASS_WITH_JSON macro requires katecode.json in same directory
 - Plugin views are children of MainWindow and cleaned up automatically

@@ -205,6 +205,33 @@ void ACPSession::resetSessionState()
     m_supportsImage = false;
     m_supportsEmbeddedContext = false;
     m_supportsPromptQueueing = false;
+    m_supportsSetTitle = false;
+    // Not announced: the chat keeps showing the last title until the next
+    // session reports its own.
+    m_title.clear();
+    m_setTitleRequestIds.clear();
+}
+
+void ACPSession::setTitle(const QString &title)
+{
+    const QString trimmed = title.simplified();
+    if (trimmed.isEmpty() || m_status != ConnectionStatus::Connected || m_sessionId.isEmpty()) {
+        return;
+    }
+    if (!m_supportsSetTitle) {
+        if (trimmed != m_title) {
+            m_title = trimmed;
+            Q_EMIT titleChanged(m_title);
+        }
+        return;
+    }
+    QJsonObject params;
+    params[QStringLiteral("sessionId")] = m_sessionId;
+    params[QStringLiteral("title")] = trimmed;
+    const int id = m_service->sendRequest(QStringLiteral("session/set_title"), params);
+    if (id >= 0) {
+        m_setTitleRequestIds.insert(id);
+    }
 }
 
 void ACPSession::setTerminalSize(int columns, int rows)
@@ -1001,6 +1028,20 @@ void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject
 
     // Silent summary prompt (requestSummary): resolve it without touching the
     // chat state, and before the generic error handling below.
+    if (m_setTitleRequestIds.remove(id)) {
+        if (!error.isEmpty()) {
+            Q_EMIT errorOccurred(QStringLiteral("Could not rename the session: %1").arg(describeError(error)));
+            return;
+        }
+        // The agent answers with the title as it stored it (sanitised).
+        const QString stored = result[QStringLiteral("title")].toString();
+        if (!stored.isEmpty() && stored != m_title) {
+            m_title = stored;
+            Q_EMIT titleChanged(m_title);
+        }
+        return;
+    }
+
     if (id == m_summaryRequestId) {
         const QString collected = m_summaryCollected.trimmed();
         m_summaryRequestId = -1;
@@ -1100,11 +1141,15 @@ void ACPSession::handleInitializeResponse(int id, const QJsonObject &result)
     m_supportsPromptQueueing = agentCaps[QStringLiteral("_meta")].toObject()
                                     [QStringLiteral("claudeCode")].toObject()
                                     [QStringLiteral("promptQueueing")].toBool(false);
+    // An object (even empty) announces session/set_title.
+    m_supportsSetTitle = agentCaps[QStringLiteral("sessionCapabilities")].toObject()
+                             [QStringLiteral("title")].isObject();
 
     qDebug() << "[ACPSession] Agent capabilities:"
              << "image=" << m_supportsImage
              << "embeddedContext=" << m_supportsEmbeddedContext
-             << "promptQueueing=" << m_supportsPromptQueueing;
+             << "promptQueueing=" << m_supportsPromptQueueing
+             << "setTitle=" << m_supportsSetTitle;
 
     // Don't automatically create session - let ChatWidget decide
     // whether to load an existing session or create a new one
@@ -2080,6 +2125,14 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         Q_EMIT commandsAvailable(commands);
     }
     else if (updateType == QStringLiteral("session_info_update")) {
+        // A title the agent generated or stored (null clears it).
+        if (update.contains(QStringLiteral("title"))) {
+            const QString title = update[QStringLiteral("title")].toString().simplified();
+            if (title != m_title) {
+                m_title = title;
+                Q_EMIT titleChanged(m_title);
+            }
+        }
         // Codex uses this to report thread-level status changes (e.g. upstream stream failures).
         const QString threadStatus =
             update[QStringLiteral("_meta")].toObject()

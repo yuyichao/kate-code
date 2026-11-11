@@ -3,6 +3,7 @@
 #include "ACPModels.h"
 #include <QHash>
 #include <QJsonArray>
+#include <QSet>
 #include <QJsonObject>
 #include <QList>
 #include <QObject>
@@ -59,6 +60,14 @@ public:
     // option are coalesced; a rejected change re-emits the confirmed list.
     void setConfigOption(const QString &configId, const QJsonValue &value);
 
+    // Title of the session: the agent's (session_info_update), or the one
+    // set with setTitle(). titleChanged() fires when it changes.
+    QString title() const { return m_title; }
+    // Rename the session. Agents advertising sessionCapabilities.title store
+    // it (session/set_title); for others it is kept by this client only.
+    void setTitle(const QString &title);
+    bool supportsSetTitle() const { return m_supportsSetTitle; }
+
     // Latest usage reported by the agent for this session.
     SessionUsage usage() const { return m_usage; }
 
@@ -112,6 +121,7 @@ Q_SIGNALS:
     void modesAvailable(const QJsonArray &modes);
     void configOptionsChanged(const QJsonArray &configOptions);
     void usageChanged(const SessionUsage &usage);
+    void titleChanged(const QString &title);
     void modeChanged(const QString &modeId);
     void commandsAvailable(const QList<SlashCommand> &commands);
     void errorOccurred(const QString &message);
@@ -278,4 +288,8 @@ private:
     bool m_supportsImage = false;
     bool m_supportsEmbeddedContext = false;
     bool m_supportsPromptQueueing = false;
+    bool m_supportsSetTitle = false;
+    QString m_title;
+    // In-flight session/set_title requests.
+    QSet<int> m_setTitleRequestIds;
 };
