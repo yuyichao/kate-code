@@ -119,7 +119,7 @@ QList<ACPProvider> SettingsStore::defaultProviders() const
 {
     // Seed providers offered on first run. They are fully editable and removable
     // afterwards, so this list is only used to populate empty storage.
-    ACPProvider claude{QStringLiteral("claude-code"), QStringLiteral("Claude Code"), QStringLiteral("claude-code-acp"), QString(), QString(), {}, true, false};
+    ACPProvider claude{QStringLiteral("claude-code"), QStringLiteral("Claude Code"), QStringLiteral("claude-agent-acp"), QString(), QString(), {}, true, false};
     ACPProvider vibe{QStringLiteral("vibe-mistral"), QStringLiteral("Vibe (Mistral)"), QStringLiteral("vibe-acp"), QString(), QString(), {}, true, false};
     return {claude, vibe};
 }
