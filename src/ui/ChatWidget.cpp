@@ -686,6 +686,12 @@ void ChatWidget::onPromptCancelled()
     qDebug() << "[ChatWidget] Prompt cancelled";
     m_inputWidget->setPromptRunning(false);
 
+    // A question left open would keep that agent's Kate MCP server blocked
+    // in the DBus call (up to the 4 minute timeout).
+    if (m_editorSession) {
+        m_editorSession->cancelPendingQuestions(QStringLiteral("the prompt was stopped"));
+    }
+
     // Add system message to indicate cancellation
     Message sysMsg;
     sysMsg.id = QStringLiteral("sys_cancelled");
