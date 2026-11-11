@@ -15,6 +15,7 @@ class Document;
 
 class ACPSession;
 class ACPLogger;
+class EditorSession;
 class ChatWebView;
 class ChatInputWidget;
 class SessionStore;
@@ -48,6 +49,10 @@ public:
     void setProjectRootProvider(ContextProvider provider);
     void setFileListProvider(FileListProvider provider);
     void setDocumentProvider(DocumentProvider provider);
+
+    // This chat's editor DBus endpoint (questions, edit notifications); its
+    // path is handed to the agent's Kate MCP server.
+    void setEditorSession(EditorSession *session);
 
     // Agent-slot hooks wired by KateCodeView so the plugin-level gate can be
     // consulted before any session is started.
@@ -243,6 +248,8 @@ private:
 
     // Set to true by prepareForShutdown() so a second call is a no-op.
     bool m_shutdownDone = false;
+
+    QPointer<EditorSession> m_editorSession;
 
     // @-completion file list. Large trees are scanned on worker threads so
     // connecting never blocks the GUI; only the latest scan's result is used.

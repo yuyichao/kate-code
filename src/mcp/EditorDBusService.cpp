@@ -4,6 +4,7 @@
 */
 
 #include "EditorDBusService.h"
+#include "EditorSession.h"
 
 #include <kde_terminal_interface.h>
 #include <KTextEditor/Application>
@@ -168,7 +169,6 @@ QString EditorDBusService::editDocument(const QString &filePath, const QString &
         return QStringLiteral("ERROR: Edit succeeded but failed to save document");
     }
 
-    Q_EMIT editApplied(filePath, oldText, newText);
     return QStringLiteral("OK");
 }
 
@@ -228,59 +228,32 @@ QString EditorDBusService::writeDocument(const QString &filePath, const QString 
 
 QString EditorDBusService::askUserQuestion(const QString &questionsJson)
 {
-    // Generate unique request ID
-    QString requestId = QStringLiteral("q_%1_%2")
-        .arg(QCoreApplication::applicationPid())
-        .arg(m_nextQuestionId++);
+    Q_UNUSED(questionsJson);
+    // Reached only by a kate-mcp-server that was not given its chat's
+    // endpoint (KATECODE_DBUS_PATH), e.g. one left over from an older build.
+    return QStringLiteral("ERROR: This Kate MCP server is not attached to a Kate Code chat, so it cannot "
+                          "ask the user. Reconnect the chat session in Kate.");
+}
 
-    qDebug() << "[EditorDBusService] askUserQuestion called, requestId:" << requestId;
-
-    // Create event loop for blocking
-    QEventLoop eventLoop;
-
-    m_pendingQuestions[requestId] = PendingQuestion{
-        &eventLoop,
-        QString(),
-        false
-    };
-
-    // Emit signal to Kate plugin UI
-    Q_EMIT questionRequested(requestId, questionsJson);
-
-    // Set up timeout (5 minutes)
-    QTimer timeoutTimer;
-    timeoutTimer.setSingleShot(true);
-    connect(&timeoutTimer, &QTimer::timeout, &eventLoop, &QEventLoop::quit);
-    timeoutTimer.start(300000);
-
-    qDebug() << "[EditorDBusService] Blocking on event loop for user response...";
-
-    // Block until response or timeout
-    eventLoop.exec();
-
-    timeoutTimer.stop();
-
-    // Retrieve response
-    QString response;
-    if (m_pendingQuestions.contains(requestId)) {
-        PendingQuestion pending = m_pendingQuestions.take(requestId);
-        if (pending.completed) {
-            response = pending.response;
-            qDebug() << "[EditorDBusService] Got user response:" << response;
-        } else {
-            response = QStringLiteral("ERROR: Question timeout or cancelled");
-            qDebug() << "[EditorDBusService] Question timed out or was cancelled";
-            // Notify UI to remove the question prompt
-            Q_EMIT questionCancelled(requestId);
-        }
-    } else {
-        response = QStringLiteral("ERROR: Request not found");
+EditorSession *EditorDBusService::createSession(QObject *parent)
+{
+    const QString path = QStringLiteral("/KateCode/Session/s%1").arg(m_nextSessionId++);
+    auto *session = new EditorSession(this, path, parent);
+    const bool ok = QDBusConnection::sessionBus().registerObject(path, session, QDBusConnection::ExportAllSlots);
+    if (!ok) {
+        qWarning() << "[KateCode] Failed to register DBus object" << path << ":"
+                   << QDBusConnection::sessionBus().lastError().message();
     }
-
-    return response;
+    session->setRegistered(ok);
+    return session;
 }
 
 QString EditorDBusService::pasteToTerminal(const QString &text)
+{
+    return pasteToTerminalIn(text, nullptr);
+}
+
+QString EditorDBusService::pasteToTerminalIn(const QString &text, KTextEditor::MainWindow *window)
 {
     // sendInput() delivers raw keystrokes: a line break would run the command
     // and other control characters (Ctrl-C/D, escape sequences) act on the
@@ -294,11 +267,13 @@ QString EditorDBusService::pasteToTerminal(const QString &text)
         }
     }
 
-    KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
-    if (!app)
-        return QStringLiteral("ERROR: KTextEditor application not available");
-
-    KTextEditor::MainWindow *mainWindow = app->activeMainWindow();
+    KTextEditor::MainWindow *mainWindow = window;
+    if (!mainWindow) {
+        KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
+        if (!app)
+            return QStringLiteral("ERROR: KTextEditor application not available");
+        mainWindow = app->activeMainWindow();
+    }
     if (!mainWindow)
         return QStringLiteral("ERROR: No active main window");
 
@@ -326,21 +301,4 @@ QString EditorDBusService::pasteToTerminal(const QString &text)
 
     terminal->sendInput(text);
     return QStringLiteral("OK");
-}
-
-void EditorDBusService::provideQuestionResponse(const QString &requestId, const QString &responseJson)
-{
-    qDebug() << "[EditorDBusService] provideQuestionResponse called, requestId:" << requestId;
-
-    if (m_pendingQuestions.contains(requestId)) {
-        m_pendingQuestions[requestId].response = responseJson;
-        m_pendingQuestions[requestId].completed = true;
-
-        // Wake up the waiting event loop
-        if (m_pendingQuestions[requestId].eventLoop) {
-            m_pendingQuestions[requestId].eventLoop->quit();
-        }
-    } else {
-        qWarning() << "[EditorDBusService] No pending question found for requestId:" << requestId;
-    }
 }

@@ -5,6 +5,7 @@
 #include "SessionSelectionDialog.h"
 #include "../acp/ACPSession.h"
 #include "../config/SettingsStore.h"
+#include "../mcp/EditorSession.h"
 #include "../util/ACPLogger.h"
 #include "../util/EditTracker.h"
 #include "../util/SessionStore.h"
@@ -436,6 +437,30 @@ void ChatWidget::setDocumentProvider(DocumentProvider provider)
     m_session->setDocumentProvider(provider);
 }
 
+void ChatWidget::setEditorSession(EditorSession *session)
+{
+    m_editorSession = session;
+    if (!session) {
+        m_session->setEditorObjectPath(QString());
+        return;
+    }
+    connect(session, &EditorSession::editApplied, this, &ChatWidget::onEditApplied);
+    connect(session, &EditorSession::questionRequested, this, &ChatWidget::showUserQuestion);
+    connect(session, &EditorSession::questionCancelled, this, &ChatWidget::removeUserQuestion);
+    connect(this, &ChatWidget::userQuestionAnswered, session, &EditorSession::provideQuestionResponse);
+
+    if (session->isRegistered()) {
+        m_session->setEditorObjectPath(session->objectPath());
+    } else {
+        // Kate tools still work through the shared object, but questions
+        // cannot reach this chat.
+        m_session->setEditorObjectPath(QString());
+        m_chatWebView->showError(QStringLiteral(
+            "Could not register this chat's Kate DBus endpoint; the agent will not be able to ask "
+            "you questions in this chat."));
+    }
+}
+
 void ChatWidget::setAgentSlotHooks(std::function<bool()> acquire,
                                    std::function<void()> release,
                                    std::function<bool()> available)
@@ -785,6 +810,9 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         if (m_releaseAgentSlot) {
             m_releaseAgentSlot();
         }
+        if (m_editorSession) {
+            m_editorSession->cancelPendingQuestions(QStringLiteral("the agent session ended"));
+        }
         m_recentEdits.clear();
         m_inputWidget->setConfigOptions({});
         m_connectButton->setIcon(QIcon::fromTheme(QStringLiteral("network-connect")));
@@ -883,6 +911,9 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
     case ConnectionStatus::Error:
         if (m_releaseAgentSlot) {
             m_releaseAgentSlot();
+        }
+        if (m_editorSession) {
+            m_editorSession->cancelPendingQuestions(QStringLiteral("the agent session ended"));
         }
         m_inputWidget->setConfigOptions({});
         m_connectButton->setIcon(QIcon::fromTheme(QStringLiteral("network-connect")));
@@ -1768,6 +1799,11 @@ void ChatWidget::connectWebViewSignals()
 void ChatWidget::resetWebView()
 {
     qDebug() << "[ChatWidget] Resetting WebView to reclaim memory";
+
+    // Prompts shown in the old view disappear with it: answer their calls.
+    if (m_editorSession) {
+        m_editorSession->cancelPendingQuestions(QStringLiteral("the chat view was reset"));
+    }
 
     // Disconnect signals from session to old web view (prevents dangling connections)
     disconnect(m_session, &ACPSession::terminalOutputUpdated, m_chatWebView, nullptr);

@@ -5,10 +5,14 @@
 
 #pragma once
 
-#include <QEventLoop>
-#include <QHash>
 #include <QObject>
 #include <QStringList>
+
+class EditorSession;
+
+namespace KTextEditor {
+class MainWindow;
+}
 
 class EditorDBusService : public QObject
 {
@@ -22,8 +26,12 @@ public:
     // Returns true on success.
     bool registerOnBus();
 
-    // Called by UI when user responds to a question
-    void provideQuestionResponse(const QString &requestId, const QString &responseJson);
+    // Create the DBus endpoint of one chat (/KateCode/Session/sN), owned by
+    // parent. Check EditorSession::isRegistered() for success.
+    EditorSession *createSession(QObject *parent);
+
+    // Kate's embedded terminal of window (or the active window when null).
+    static QString pasteToTerminalIn(const QString &text, KTextEditor::MainWindow *window);
 
 public Q_SLOTS:
     QStringList listDocuments();
@@ -40,32 +48,14 @@ public Q_SLOTS:
     // Returns "OK" on success or "ERROR: ..." on failure.
     QString writeDocument(const QString &filePath, const QString &content);
 
-    // Ask the user questions - blocks until user responds or timeout.
-    // questionsJson is a JSON array of question objects.
-    // Returns JSON object with answers keyed by question header, or "ERROR: ..." on failure.
+    // Questions belong to a chat: only a chat's own endpoint (EditorSession)
+    // can ask. On this shared object it always fails.
     QString askUserQuestion(const QString &questionsJson);
 
     // Sends text to Kate's embedded terminal without executing it (no Enter).
     // Returns "OK" on success or "ERROR: ..." on failure.
     QString pasteToTerminal(const QString &text);
 
-Q_SIGNALS:
-    // Emitted when editDocument succeeds, with the edit parameters
-    void editApplied(const QString &filePath, const QString &oldText, const QString &newText);
-
-    // Emitted when a question needs to be shown to the user
-    void questionRequested(const QString &requestId, const QString &questionsJson);
-
-    // Emitted when a question times out or is cancelled (UI should remove the prompt)
-    void questionCancelled(const QString &requestId);
-
 private:
-    // Track pending question requests
-    struct PendingQuestion {
-        QEventLoop *eventLoop;
-        QString response;
-        bool completed;
-    };
-    QHash<QString, PendingQuestion> m_pendingQuestions;
-    int m_nextQuestionId = 0;
+    int m_nextSessionId = 0;
 };

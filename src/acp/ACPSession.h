@@ -37,6 +37,9 @@ public:
 
     void setExecutable(const QString &executable, const QStringList &args = QStringList());
     void setMcpConfigPath(const QString &path);
+    // DBus object of this chat's editor endpoint, passed to the Kate MCP
+    // server as KATECODE_DBUS_PATH (empty: the shared legacy object).
+    void setEditorObjectPath(const QString &path) { m_editorObjectPath = path; }
     void setSessionConfig(const QJsonObject &config);
     void start(const QString &workingDir, const QString &permissionMode = QStringLiteral("default"));
     void stop();
@@ -262,6 +265,7 @@ private:
 
     // MCP config path for loading external MCP servers
     QString m_mcpConfigPath;
+    QString m_editorObjectPath;
 
     // Per-provider ACP session configuration applied after session/new or load.
     QJsonObject m_sessionConfig;

@@ -3,6 +3,7 @@
 #include "../acp/ACPModels.h"
 #include "../config/SettingsStore.h"
 #include "../mcp/EditorDBusService.h"
+#include "../mcp/EditorSession.h"
 #include "../ui/ChatWidget.h"
 #include "../ui/SessionPanel.h"
 #include "../util/DiffHighlightManager.h"
@@ -218,13 +219,12 @@ ChatWidget *KateCodeView::createChat()
 
     connect(chat, &ChatWidget::jumpToEditRequested, this, &KateCodeView::jumpToEdit);
 
-    // Shared DBus service -> chat. Each chat ignores these unless it is the
-    // connected one.
-    connect(m_plugin->dbusService(), &EditorDBusService::editApplied, chat, &ChatWidget::onEditApplied);
-    connect(m_plugin->dbusService(), &EditorDBusService::questionRequested, chat, &ChatWidget::showUserQuestion);
-    connect(m_plugin->dbusService(), &EditorDBusService::questionCancelled, chat, &ChatWidget::removeUserQuestion);
-    connect(chat, &ChatWidget::userQuestionAnswered,
-            m_plugin->dbusService(), &EditorDBusService::provideQuestionResponse);
+    // The chat's own editor DBus endpoint: its agent's Kate MCP server calls
+    // this object, so questions and edit notifications reach this chat only.
+    // Owned by the chat; the terminal tool uses this chat's window.
+    EditorSession *editorSession = m_plugin->dbusService()->createSession(chat);
+    editorSession->setMainWindowProvider([self]() { return self ? self->m_mainWindow : nullptr; });
+    chat->setEditorSession(editorSession);
 
     connect(chat, &ChatWidget::debugLogMessage, this, [this](const QString &message) {
         QVariantMap msg;

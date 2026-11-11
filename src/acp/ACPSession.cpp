@@ -599,6 +599,12 @@ QJsonArray ACPSession::buildMcpServers() const
                                              + QString::number(QCoreApplication::applicationPid()));
             envArray.append(entry);
         }
+        if (!m_editorObjectPath.isEmpty()) {
+            QJsonObject entry;
+            entry[QStringLiteral("name")]  = QStringLiteral("KATECODE_DBUS_PATH");
+            entry[QStringLiteral("value")] = m_editorObjectPath;
+            envArray.append(entry);
+        }
 
         kateMcp[QStringLiteral("env")] = envArray;
         mcpServers.append(kateMcp);

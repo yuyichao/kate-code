@@ -25,6 +25,7 @@ set(katecode_SRCS
 
     # MCP layer (DBus service, runs in Kate process)
     mcp/EditorDBusService.cpp
+    mcp/EditorSession.cpp
 
     # Util layer
     util/KDEColorScheme.cpp

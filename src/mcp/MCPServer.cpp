@@ -22,6 +22,22 @@ static QString editorServiceName()
                                 QStringLiteral("org.kde.katecode.editor"));
 }
 
+// Returns the DBus object to call: the endpoint of the chat that started this
+// server (KATECODE_DBUS_PATH, set by ACPSession), so questions and edits are
+// attributed to that chat. The shared legacy object is the fallback.
+static QString editorObjectPath()
+{
+    return qEnvironmentVariable("KATECODE_DBUS_PATH", QStringLiteral("/KateCode/Editor"));
+}
+
+// A valid D-Bus object path: "/" or "/"-separated elements of
+// [A-Za-z0-9_]+ (an invalid path also makes libdbus abort()).
+static bool isValidObjectPath(const QString &path)
+{
+    static const QRegularExpression re(QStringLiteral("\\A(/|(/[A-Za-z0-9_]+)+)\\z"));
+    return re.match(path).hasMatch();
+}
+
 // A valid D-Bus well-known bus name: at least two dot-separated elements,
 // each element matching [A-Za-z_-][A-Za-z0-9_-]* (so it cannot start with a
 // digit). This matters because constructing a QDBusInterface with an invalid
@@ -356,6 +372,11 @@ QJsonObject MCPServer::handleToolsCall(int id, const QJsonObject &params)
             QStringLiteral("Error: invalid Kate editor D-Bus service name: \"%1\". "
                            "Update the Kate Code plugin.").arg(editorServiceName())));
     }
+    if (!isValidObjectPath(editorObjectPath())) {
+        return makeResponse(id, makeErrorResult(
+            QStringLiteral("Error: invalid Kate editor D-Bus object path: \"%1\". "
+                           "Update the Kate Code plugin.").arg(editorObjectPath())));
+    }
 
     if (toolName == QStringLiteral("katecode_documents")) {
         return makeResponse(id, executeDocuments(arguments));
@@ -379,7 +400,7 @@ QJsonObject MCPServer::executeDocuments(const QJsonObject &arguments)
     Q_UNUSED(arguments);
 
     QDBusInterface iface(editorServiceName(),
-                         QStringLiteral("/KateCode/Editor"),
+                         editorObjectPath(),
                          QStringLiteral("org.kde.katecode.Editor"),
                          QDBusConnection::sessionBus());
 
@@ -473,7 +494,7 @@ QJsonObject MCPServer::executeRead(const QJsonObject &arguments)
     }
 
     QDBusInterface iface(editorServiceName(),
-                         QStringLiteral("/KateCode/Editor"),
+                         editorObjectPath(),
                          QStringLiteral("org.kde.katecode.Editor"),
                          QDBusConnection::sessionBus());
 
@@ -579,7 +600,7 @@ QJsonObject MCPServer::executeEdit(const QJsonObject &arguments)
     }
 
     QDBusInterface iface(editorServiceName(),
-                         QStringLiteral("/KateCode/Editor"),
+                         editorObjectPath(),
                          QStringLiteral("org.kde.katecode.Editor"),
                          QDBusConnection::sessionBus());
 
@@ -635,7 +656,7 @@ QJsonObject MCPServer::executeWrite(const QJsonObject &arguments)
     }
 
     QDBusInterface iface(editorServiceName(),
-                         QStringLiteral("/KateCode/Editor"),
+                         editorObjectPath(),
                          QStringLiteral("org.kde.katecode.Editor"),
                          QDBusConnection::sessionBus());
 
@@ -729,7 +750,7 @@ QJsonObject MCPServer::executeAskUserQuestion(const QJsonObject &arguments)
 
     // Call DBus method - this will block until user responds
     QDBusInterface iface(editorServiceName(),
-                         QStringLiteral("/KateCode/Editor"),
+                         editorObjectPath(),
                          QStringLiteral("org.kde.katecode.Editor"),
                          QDBusConnection::sessionBus());
 
@@ -810,7 +831,7 @@ QJsonObject MCPServer::executePasteToTerminal(const QJsonObject &arguments)
         return makeErrorResult(QStringLiteral("Error: text is required"));
 
     QDBusInterface iface(editorServiceName(),
-                         QStringLiteral("/KateCode/Editor"),
+                         editorObjectPath(),
                          QStringLiteral("org.kde.katecode.Editor"),
                          QDBusConnection::sessionBus());
     if (!iface.isValid())
