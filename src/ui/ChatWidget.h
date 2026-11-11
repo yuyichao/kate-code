@@ -224,6 +224,10 @@ private:
     // Set to true by prepareForShutdown() so a second call is a no-op.
     bool m_shutdownDone = false;
 
+    // Session id passed to the in-flight session/load, so a failed load can
+    // drop just that entry from the stored session list.
+    QString m_loadingSessionId;
+
     // Recent edit data captured from EditorDBusService, consumed when tool_call_update arrives
     struct RecentEditData { QString filePath, oldText, newText; };
     QList<RecentEditData> m_recentEdits;

@@ -615,8 +615,8 @@ void ChatWidget::onNewSessionClicked()
     // Get current project root
     QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
 
-    // Clear stored session and any pending summary context
-    m_sessionStore->clearSession(projectRoot);
+    // Clear any pending summary context. The stored session list is kept so
+    // earlier sessions stay available for resuming.
     m_pendingSummaryContext.clear();
 
     // Stop current session
@@ -996,6 +996,7 @@ void ChatWidget::onInitializeComplete()
 
     switch (m_pendingAction) {
     case PendingAction::LoadSession:
+        m_loadingSessionId = m_pendingSessionId;
         m_session->loadSession(m_pendingSessionId);
         break;
     case PendingAction::CreateSession:
@@ -1016,9 +1017,10 @@ void ChatWidget::onSessionLoadFailed(const QString &error)
 {
     qWarning() << "[ChatWidget] Session load failed, creating new:" << error;
 
-    // Clear stale session from storage
-    QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
-    m_sessionStore->clearSession(projectRoot);
+    // Remove the session that could not be loaded from the stored list. Use
+    // the directory the session was started in, matching where it was saved.
+    m_sessionStore->removeSession(m_session->workingDir(), m_loadingSessionId);
+    m_loadingSessionId.clear();
 
     // Show system message
     Message sysMsg;
