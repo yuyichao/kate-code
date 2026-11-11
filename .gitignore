@@ -38,3 +38,6 @@ ui_*.h
 *~
 *.bak
 *.orig
+
+# Package build output (Dockerfile.deb / Dockerfile.rpm)
+dist/
