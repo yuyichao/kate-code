@@ -41,3 +41,5 @@ ui_*.h
 
 # Package build output (Dockerfile.deb / Dockerfile.rpm)
 dist/
+# makepkg staging directory
+pkg/
