@@ -166,6 +166,10 @@ void KateCodeView::createToolView()
     // Connect edit navigation
     connect(m_chatWidget, &ChatWidget::jumpToEditRequested, this, &KateCodeView::jumpToEdit);
 
+    // EditorDBusService -> ChatWidget: edit data for diff display
+    connect(m_plugin->dbusService(), &EditorDBusService::editApplied,
+            m_chatWidget, &ChatWidget::onEditApplied);
+
     // Connect user question signals (MCP AskUserQuestion tool)
     // EditorDBusService -> ChatWidget: show question UI
     connect(m_plugin->dbusService(), &EditorDBusService::questionRequested,

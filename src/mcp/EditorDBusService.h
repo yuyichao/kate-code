@@ -46,6 +46,9 @@ public Q_SLOTS:
     QString askUserQuestion(const QString &questionsJson);
 
 Q_SIGNALS:
+    // Emitted when editDocument succeeds, with the edit parameters
+    void editApplied(const QString &filePath, const QString &oldText, const QString &newText);
+
     // Emitted when a question needs to be shown to the user
     void questionRequested(const QString &requestId, const QString &questionsJson);
 

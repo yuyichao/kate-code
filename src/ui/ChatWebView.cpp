@@ -303,6 +303,22 @@ void ChatWebView::updateToolCall(const QString &messageId, const QString &toolCa
     runJavaScript(script);
 }
 
+void ChatWebView::setToolCallDiff(const QString &messageId, const QString &toolCallId,
+                                   const QString &filePath, const QString &oldText, const QString &newText)
+{
+    QString b64OldText = QString::fromLatin1(oldText.toUtf8().toBase64());
+    QString b64NewText = QString::fromLatin1(newText.toUtf8().toBase64());
+
+    QString script = QStringLiteral("setToolCallDiff('%1', '%2', '%3', '%4', '%5');")
+                         .arg(escapeJsString(messageId),
+                              escapeJsString(toolCallId),
+                              escapeJsString(filePath),
+                              b64OldText,
+                              b64NewText);
+
+    runJavaScript(script);
+}
+
 void ChatWebView::showPermissionRequest(const PermissionRequest &request)
 {
     qDebug() << "[ChatWebView] showPermissionRequest called - requestId:" << request.requestId

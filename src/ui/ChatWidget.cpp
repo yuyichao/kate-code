@@ -228,6 +228,7 @@ ChatWidget::ChatWidget(QWidget *parent)
     connect(m_session, &ACPSession::messageFinished, this, &ChatWidget::onMessageFinished);
     connect(m_session, &ACPSession::toolCallAdded, this, &ChatWidget::onToolCallAdded);
     connect(m_session, &ACPSession::toolCallUpdated, this, &ChatWidget::onToolCallUpdated);
+    connect(m_session, &ACPSession::fsEditApplied, this, &ChatWidget::onEditApplied);
     connect(m_session, &ACPSession::todosUpdated, this, &ChatWidget::onTodosUpdated);
     connect(m_session, &ACPSession::permissionRequested, this, &ChatWidget::onPermissionRequested);
     connect(m_session, &ACPSession::modesAvailable, this, &ChatWidget::onModesAvailable);
@@ -695,6 +696,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         if (m_releaseAgentSlot) {
             m_releaseAgentSlot();
         }
+        m_recentEdits.clear();
         m_connectButton->setIcon(QIcon::fromTheme(QStringLiteral("network-connect")));
         m_connectButton->setToolTip(QStringLiteral("Connect"));
         m_connectButton->setEnabled(true);
@@ -844,9 +846,48 @@ void ChatWidget::onToolCallAdded(const QString &messageId, const ToolCall &toolC
     }
 }
 
+void ChatWidget::onEditApplied(const QString &filePath, const QString &oldText, const QString &newText)
+{
+    // The DBus service is shared by every window in this Kate process; only
+    // the window running the agent should collect its edits.
+    if (!m_session->isConnected()) {
+        return;
+    }
+    m_recentEdits.append({filePath, oldText, newText});
+}
+
 void ChatWidget::onToolCallUpdated(const QString &messageId, const QString &toolCallId, const QString &status, const QString &result, const QString &filePath, const QString &toolName)
 {
-    Q_UNUSED(messageId);
+    // MCP edit parameters never reach us via ACP rawInput, so when an edit
+    // tool completes, attach the edit captured from the DBus service / fs
+    // write. Built-in Write tools also go through fs/write_text_file and
+    // queue an entry; consume it when they complete so it cannot be shown
+    // against a later edit.
+    const bool isEditTool = toolName == QStringLiteral("Edit")
+                         || toolName.endsWith(QStringLiteral("_katecode_edit"))
+                         || toolName == QStringLiteral("mcp__acp__Edit");
+    const bool isWriteTool = toolName == QStringLiteral("Write")
+                          || toolName == QStringLiteral("mcp__acp__Write");
+    if ((isEditTool || isWriteTool) && status == QStringLiteral("completed") && !m_recentEdits.isEmpty()) {
+        // With a known path only an entry for that file may be used; without
+        // one, fall back to the oldest entry.
+        int index = filePath.isEmpty() ? 0 : -1;
+        if (!filePath.isEmpty()) {
+            for (int i = 0; i < m_recentEdits.size(); ++i) {
+                if (m_recentEdits.at(i).filePath == filePath) {
+                    index = i;
+                    break;
+                }
+            }
+        }
+        if (index >= 0) {
+            const RecentEditData edit = m_recentEdits.takeAt(index);
+            if (isEditTool) {
+                m_chatWebView->setToolCallDiff(messageId, toolCallId, edit.filePath, edit.oldText, edit.newText);
+            }
+        }
+    }
+
     m_chatWebView->updateToolCall(messageId, toolCallId, status, result, filePath, toolName);
 
     // Clear highlights when tool call completes or fails

@@ -580,6 +580,25 @@ function updateToolCall(messageId, toolCallId, status, base64Result, filePath, t
     updateMessageDOM(messageId);
 }
 
+// Update tool call diff data after D-Bus edit parameters become available
+// oldText and newText are base64-encoded to safely pass multiline content
+function setToolCallDiff(messageId, toolCallId, filePath, b64OldText, b64NewText) {
+    if (!messages[messageId]) return;
+    let toolCall = messages[messageId].toolCalls.find(tc => tc.id === toolCallId);
+    if (!toolCall) return;
+
+    if (filePath) toolCall.filePath = filePath;
+    try {
+        toolCall.oldText = b64OldText ? decodeURIComponent(escape(atob(b64OldText))) : '';
+        toolCall.newText = b64NewText ? decodeURIComponent(escape(atob(b64NewText))) : '';
+    } catch (e) {
+        console.error('setToolCallDiff decode error:', e);
+        return;
+    }
+
+    updateMessageDOM(messageId);
+}
+
 // Render a message to DOM
 function renderMessage(message) {
     const container = document.getElementById('messages');

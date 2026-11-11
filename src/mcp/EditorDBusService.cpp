@@ -166,6 +166,7 @@ QString EditorDBusService::editDocument(const QString &filePath, const QString &
         return QStringLiteral("ERROR: Edit succeeded but failed to save document");
     }
 
+    Q_EMIT editApplied(filePath, oldText, newText);
     return QStringLiteral("OK");
 }
 

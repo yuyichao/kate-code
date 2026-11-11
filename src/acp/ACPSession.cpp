@@ -2533,6 +2533,23 @@ void ACPSession::handleFsWriteTextFile(const QJsonObject &params, int requestId)
     // Check if this is a new file
     bool isNewFile = !QFile::exists(path);
 
+    // Capture old content for diff display before writing
+    QString oldContent;
+    if (!isNewFile) {
+        if (m_documentProvider) {
+            KTextEditor::Document *doc = m_documentProvider(path);
+            if (doc) {
+                oldContent = doc->text();
+            }
+        }
+        if (oldContent.isEmpty()) {
+            QFile oldFile(path);
+            if (oldFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                oldContent = QString::fromUtf8(oldFile.readAll());
+            }
+        }
+    }
+
     // Try to write through Kate document if open
     if (m_documentProvider) {
         KTextEditor::Document *doc = m_documentProvider(path);
@@ -2600,6 +2617,11 @@ void ACPSession::handleFsWriteTextFile(const QJsonObject &params, int requestId)
             // Record as a full-file replacement
             m_editTracker->recordEdit(m_currentToolCallId, path, 0, -1, lineCount);
         }
+    }
+
+    // Emit for diff display (only meaningful if content actually changed)
+    if (!isNewFile && content != oldContent) {
+        Q_EMIT fsEditApplied(path, oldContent, content);
     }
 
     QJsonObject result;

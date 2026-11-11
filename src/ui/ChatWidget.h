@@ -72,6 +72,8 @@ public Q_SLOTS:
     // Called by KateCodePlugin::agentActivityChanged() to refresh connect/resume
     // button enabled-states when another window acquires or releases the slot.
     void refreshAgentAvailability();
+    // Capture edit data from EditorDBusService for diff display
+    void onEditApplied(const QString &filePath, const QString &oldText, const QString &newText);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -221,4 +223,8 @@ private:
 
     // Set to true by prepareForShutdown() so a second call is a no-op.
     bool m_shutdownDone = false;
+
+    // Recent edit data captured from EditorDBusService, consumed when tool_call_update arrives
+    struct RecentEditData { QString filePath, oldText, newText; };
+    QList<RecentEditData> m_recentEdits;
 };
