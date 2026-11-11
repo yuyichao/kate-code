@@ -141,9 +141,11 @@ void ACPSession::start(const QString &workingDir, const QString &permissionMode)
     Q_EMIT statusChanged(m_status);
 
     if (!m_service->start(workingDir)) {
+        // Report the error before the status, so the chat shows it above
+        // the Reconnect notice.
         m_status = ConnectionStatus::Error;
-        Q_EMIT statusChanged(m_status);
         Q_EMIT errorOccurred(QStringLiteral("Failed to start ACP service"));
+        Q_EMIT statusChanged(m_status);
     }
 }
 

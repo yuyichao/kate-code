@@ -488,7 +488,7 @@ void ChatWidget::stopSessionQuietly()
     m_quietStop = false;
 }
 
-void ChatWidget::startNewSession(bool resetView)
+void ChatWidget::startNewSession(bool resetView, const QString &root)
 {
     // Summarise BEFORE stopping so the current-agent option can ask the live
     // session; this can pump events. Resetting m_userSentMessage stops the
@@ -511,7 +511,8 @@ void ChatWidget::startNewSession(bool resetView)
         resetWebView();
     }
 
-    const QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
+    const QString projectRoot = !root.isEmpty() ? root
+        : m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
     m_pendingAction = PendingAction::CreateSession;
 
     Message sysMsg;
@@ -530,11 +531,13 @@ void ChatWidget::onReconnectRequested()
         return;  // a stale button; another attempt already started
     }
     // Pick up where the lost session left off; a chat that never connected
-    // just tries again.
+    // just tries again. Either way use the directory of the failed attempt,
+    // not whichever project the active editor view is in now.
+    const QString root = m_session->workingDir();
     if (!m_reconnectSessionId.isEmpty()) {
-        resumeSession(m_reconnectSessionId);
+        resumeSession(m_reconnectSessionId, root);
     } else {
-        startNewSession(false);
+        startNewSession(false, root);
     }
 }
 
@@ -564,7 +567,7 @@ void ChatWidget::onResumeSessionClicked()
     }
     switch (dialog.selectedResult()) {
     case SessionSelectionDialog::Result::Resume:
-        resumeSession(dialog.selectedSessionId());
+        resumeSession(dialog.selectedSessionId(), projectRoot);
         break;
     case SessionSelectionDialog::Result::NewSession:
         startNewSession(true);
@@ -574,10 +577,8 @@ void ChatWidget::onResumeSessionClicked()
     }
 }
 
-void ChatWidget::resumeSession(const QString &sessionId)
+void ChatWidget::resumeSession(const QString &sessionId, const QString &projectRoot)
 {
-    const QString projectRoot = m_projectRootProvider ? m_projectRootProvider() : QDir::homePath();
-
     // The same agent session must not be loaded into two chats (they would
     // write one transcript); switch to the chat that has it instead.
     if (m_openSessionLocator && !hasAgentSession(sessionId) && m_openSessionLocator(sessionId)) {

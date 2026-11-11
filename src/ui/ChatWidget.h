@@ -161,11 +161,12 @@ private Q_SLOTS:
 
 private:
     void updateWindowTitle();
-    // Stop any session (live, connecting or failed) and start a new one.
-    void startNewSession(bool resetView);
-    // Stop any session and resume the given one (true resume or context
-    // injection, depending on the provider).
-    void resumeSession(const QString &sessionId);
+    // Stop any session (live, connecting or failed) and start a new one in
+    // projectRoot (empty: the current project).
+    void startNewSession(bool resetView, const QString &projectRoot = QString());
+    // Stop any session and resume the given one of projectRoot (true resume
+    // or context injection, depending on the provider).
+    void resumeSession(const QString &sessionId, const QString &projectRoot);
     // Stop the agent without the "Disconnected" notice (the caller starts
     // another session right after).
     void stopSessionQuietly();

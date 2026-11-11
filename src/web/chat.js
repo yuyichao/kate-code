@@ -483,8 +483,8 @@ function addReconnectPrompt(base64Text) {
     const button = document.createElement('button');
     button.className = 'reconnect-button';
     button.textContent = 'Reconnect';
+    // Kate disables the buttons once the new attempt starts connecting.
     button.onclick = () => {
-        disableReconnectPrompts();
         if (window.bridge) {
             window.bridge.requestReconnect();
         }
