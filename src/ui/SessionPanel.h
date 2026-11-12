@@ -13,8 +13,9 @@ class QListWidgetItem;
  * Chats themselves live in the editor area (one tab each). The list shows
  * the open chats (title, connection state, cost; activating one switches to
  * it) and, below a heading, the saved sessions of the current project that
- * can be resumed (activating one opens it in a new chat). Buttons open a new
- * chat and the session browser with summaries.
+ * can be resumed (activating one opens it in a new chat) or deleted (context
+ * menu or Delete key). Buttons open a new chat and the session browser with
+ * summaries.
  */
 class SessionPanel : public QWidget
 {
@@ -33,6 +34,7 @@ public:
     struct ResumableEntry {
         QString sessionId;
         QString projectRoot; // directory the session ran in
+        QString transcriptPath;
         QString title;
         QString detail;  // e.g. last activity time
         QString toolTip;
@@ -54,13 +56,20 @@ Q_SIGNALS:
     void showAllDirectoriesChanged(bool showAll);
     void entryActivated(int index);
     void resumeRequested(const QString &sessionId, const QString &projectRoot);
+    void deleteRequested(const QString &sessionId, const QString &projectRoot, const QString &transcriptPath);
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
     enum ItemKind { OpenItem = 1, ResumableItem };
 
     void rebuild();
+    void addResumable();
     QListWidgetItem *addHeading(const QString &text, const QString &toolTip, bool divider);
     void addHint(const QString &text);
+    void showContextMenu(const QPoint &pos);
+    void requestDelete(QListWidgetItem *item);
     QIcon withStatusBadge(const QIcon &icon, const QColor &color) const;
 
     QListWidget *m_list;

@@ -55,6 +55,9 @@ public:
     // Whether this chat has the given agent session open (connected or
     // connecting to it).
     bool hasAgentSession(const QString &sessionId) const;
+    // A saved session was deleted: Reconnect no longer offers to resume it
+    // (a new session is started instead).
+    void forgetSavedSession(const QString &sessionId);
 
     // Resume a saved session in this chat with the provider it ran with
     // (the default provider if empty or no longer configured). Use instead

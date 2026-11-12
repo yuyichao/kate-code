@@ -28,6 +28,9 @@ struct SessionUsage {
     QString currency;
 };
 
+// A JSON-RPC error from the agent as text, with the agent's details if any.
+QString describeACPError(const QJsonObject &error);
+
 class ACPSession : public QObject
 {
     Q_OBJECT

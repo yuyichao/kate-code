@@ -968,7 +968,7 @@ void ACPSession::onNotification(const QString &method, const QJsonObject &params
 // The JSON-RPC message plus the agent's details when it gives any: agents
 // often answer with a generic "Internal error" and put the cause (e.g. the
 // Claude Code process' stderr) in error.data.
-static QString describeError(const QJsonObject &error)
+QString describeACPError(const QJsonObject &error)
 {
     QString text = error[QStringLiteral("message")].toString(QStringLiteral("Unknown error"));
     const QJsonValue data = error[QStringLiteral("data")];
@@ -1030,7 +1030,7 @@ void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject
     // chat state, and before the generic error handling below.
     if (m_setTitleRequestIds.remove(id)) {
         if (!error.isEmpty()) {
-            Q_EMIT errorOccurred(QStringLiteral("Could not rename the session: %1").arg(describeError(error)));
+            Q_EMIT errorOccurred(QStringLiteral("Could not rename the session: %1").arg(describeACPError(error)));
             return;
         }
         // The agent answers with the title as it stored it (sanitised).
@@ -1059,7 +1059,7 @@ void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject
 
     if (!error.isEmpty()) {
         qWarning() << "[ACPSession] Error response for id" << id << ":" << error;
-        Q_EMIT errorOccurred(describeError(error));
+        Q_EMIT errorOccurred(describeACPError(error));
 
         // A failed session/prompt must still finalise the turn, otherwise
         // isPromptRunning() stays true and every future prompt queues forever.

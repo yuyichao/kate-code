@@ -52,6 +52,11 @@ public Q_SLOTS:
     // Resume a saved session of the project in a new chat tab (or switch to
     // the chat that has it open).
     void resumeSavedSession(const QString &sessionId, const QString &projectRoot);
+    // Delete a saved session (after confirmation): its transcript, summary
+    // and stored entry, those of the sessions it was restored from, and
+    // optionally the agent's own copy.
+    void deleteSavedSession(const QString &sessionId, const QString &projectRoot,
+                            const QString &transcriptPath);
     // The session browser with summaries, for the current project.
     void browseSessions();
 

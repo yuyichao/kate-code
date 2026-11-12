@@ -153,6 +153,8 @@ The plugin will be installed to:
 
 Below the open chats, the side panel lists the previous sessions of the current project (the project of the active document), most recent first, with their title (or first prompt) and logo of the agent they ran with. Double-click one to resume it in a new chat tab, with the same agent. The folder button lists the sessions of all directories instead; the history button opens the session browser, which shows each session's summary.
 
+To delete a previous session, right-click it and choose **Delete Session…** (or select it and press **Delete**). This removes its transcript and summary from Kate Code, together with any earlier sessions it was restored from. If its agent supports deleting sessions (ACP `session/delete`, e.g. Claude Code), the confirmation also offers to delete it from the agent's own history, so it no longer shows up there (e.g. in `claude --resume`) either.
+
 ### Sending Messages
 
 - Type your message in the input field at the bottom

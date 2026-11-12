@@ -1,6 +1,7 @@
 #include "KateCodeView.h"
 #include "KateCodePlugin.h"
 #include "../acp/ACPModels.h"
+#include "../acp/ACPSessionDeleter.h"
 #include "../config/SettingsStore.h"
 #include "../mcp/EditorDBusService.h"
 #include "../mcp/EditorSession.h"
@@ -21,12 +22,16 @@
 #include <KXMLGUIFactory>
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QQuickWidget>
 #include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QMessageBox>
+#include <QPointer>
+#include <QProcess>
+#include <QPushButton>
 #include <QTextStream>
 #include <QVBoxLayout>
 #include <functional>
@@ -203,6 +208,7 @@ void KateCodeView::createToolView()
     connect(m_sessionPanel, &SessionPanel::newSessionRequested, this, &KateCodeView::newSession);
     connect(m_sessionPanel, &SessionPanel::browseRequested, this, &KateCodeView::browseSessions);
     connect(m_sessionPanel, &SessionPanel::resumeRequested, this, &KateCodeView::resumeSavedSession);
+    connect(m_sessionPanel, &SessionPanel::deleteRequested, this, &KateCodeView::deleteSavedSession);
     connect(m_sessionPanel, &SessionPanel::showAllDirectoriesChanged, this, [this](bool showAll) {
         m_showAllSessions = showAll;
         scheduleSessionPanelRefresh();
@@ -328,6 +334,167 @@ void KateCodeView::browseSessions()
         break;
     case SessionSelectionDialog::Result::Cancelled:
         break;
+    }
+}
+
+void KateCodeView::deleteSavedSession(const QString &sessionId, const QString &projectRoot,
+                                      const QString &transcriptPath)
+{
+    if (sessionId.isEmpty() || projectRoot.isEmpty()) {
+        return;
+    }
+    QWidget *parent = m_mainWindow->window();
+    if (isSessionOpen(sessionId)) {
+        QMessageBox::information(parent, QStringLiteral("Kate Code"),
+                                 QStringLiteral("This session is open in a chat. Close the chat to delete it."));
+        return;
+    }
+
+    // Sessions restored by context injection continue in a new agent
+    // session; the old ones are hidden from the list and go with it.
+    const QList<SessionEntry> stored = m_sessionStore->listSessions(projectRoot);
+    QStringList ids = {sessionId};
+    for (int i = 0; i < ids.size(); ++i) {
+        for (const SessionEntry &entry : stored) {
+            if (entry.replacedBy == ids.at(i) && !ids.contains(entry.id) && !isSessionOpen(entry.id)) {
+                ids << entry.id;
+            }
+        }
+    }
+    QHash<QString, SessionEntry> byId;
+    for (const SessionEntry &entry : stored) {
+        byId.insert(entry.id, entry);
+    }
+
+    // The agents that keep their own copy of these sessions.
+    SettingsStore *settings = m_plugin->settings();
+    QHash<QString, QStringList> idsByProvider;
+    QStringList agentNames;
+    for (const QString &id : std::as_const(ids)) {
+        const QString providerId = byId.value(id).providerId;
+        const ACPProvider provider = providerId.isEmpty() ? ACPProvider() : settings->providerById(providerId);
+        if (provider.executable.isEmpty() || !SettingsStore::isExecutableAvailable(provider.executable)) {
+            continue;
+        }
+        if (!idsByProvider.contains(providerId)) {
+            agentNames << provider.description;
+        }
+        idsByProvider[providerId] << id;
+    }
+
+    const SessionEntry session = byId.value(sessionId);
+    QString title = !session.title.isEmpty() ? session.title : session.firstPrompt;
+    if (title.isEmpty()) {
+        title = m_transcriptInfo.value(transcriptPath).firstPrompt;
+    }
+    if (title.size() > 80) {
+        title = title.left(79).trimmed() + QChar(0x2026);
+    }
+    QString text = title.isEmpty() ? QStringLiteral("Delete this session?")
+                                   : QStringLiteral("Delete the session \u201c%1\u201d?").arg(title);
+    QString info = QStringLiteral("Its transcript and summary are removed from Kate Code");
+    if (ids.size() > 1) {
+        info += QStringLiteral(", together with the %1 earlier session(s) it was restored from").arg(ids.size() - 1);
+    }
+    info += QStringLiteral(". This cannot be undone.");
+
+    QMessageBox box(QMessageBox::Question, QStringLiteral("Delete Session"), text,
+                    QMessageBox::Cancel, parent);
+    box.setTextFormat(Qt::PlainText);
+    box.setInformativeText(info);
+    QPushButton *deleteButton = box.addButton(QStringLiteral("Delete"), QMessageBox::DestructiveRole);
+    deleteButton->setIcon(QIcon::fromTheme(QStringLiteral("edit-delete")));
+    box.setDefaultButton(QMessageBox::Cancel);
+    QCheckBox *agentCheck = nullptr;
+    if (!agentNames.isEmpty()) {
+        agentCheck = new QCheckBox(QStringLiteral("Also delete it from %1's own session history")
+                                       .arg(agentNames.join(QStringLiteral(", "))),
+                                   &box);
+        agentCheck->setToolTip(QStringLiteral("Asks the agent to delete the session (ACP session/delete), "
+                                              "so it can no longer be resumed elsewhere either"));
+        agentCheck->setChecked(true);
+        box.setCheckBox(agentCheck);
+    }
+    box.exec();
+    if (box.clickedButton() != deleteButton) {
+        return;
+    }
+    const bool deleteFromAgent = agentCheck && agentCheck->isChecked();
+
+    // The panel may have been refreshed (or the session resumed elsewhere)
+    // while the box was open.
+    for (const QString &id : std::as_const(ids)) {
+        if (isSessionOpen(id)) {
+            QMessageBox::information(parent, QStringLiteral("Kate Code"),
+                                     QStringLiteral("This session has been opened in a chat meanwhile; it was not deleted."));
+            return;
+        }
+    }
+
+    QStringList failed;
+    auto removeFile = [&failed](const QString &path) {
+        if (!path.isEmpty() && QFileInfo::exists(path) && !QFile::remove(path)) {
+            failed << path;
+        }
+    };
+    for (const QString &id : std::as_const(ids)) {
+        // The listed transcript's own path: in the all-directories list the
+        // directory comes from its header and the folder name is lossy.
+        const QString path = id == sessionId && !transcriptPath.isEmpty()
+            ? transcriptPath
+            : m_summaryStore->transcriptPath(projectRoot, id);
+        removeFile(path);
+        removeFile(m_summaryStore->summaryPath(projectRoot, id));
+        m_sessionStore->removeSession(projectRoot, id);
+        m_transcriptInfo.remove(path);
+        for (KateCodeView *view : m_plugin->views()) {
+            for (ChatWidget *chat : view->liveChats()) {
+                chat->forgetSavedSession(id);
+            }
+        }
+    }
+    if (!failed.isEmpty()) {
+        QMessageBox::warning(parent, QStringLiteral("Kate Code"),
+                             QStringLiteral("Could not delete:\n%1").arg(failed.join(QLatin1Char('\n'))));
+    }
+
+    if (deleteFromAgent) {
+        for (auto it = idsByProvider.cbegin(); it != idsByProvider.cend(); ++it) {
+            const ACPProvider provider = settings->providerById(it.key());
+            const QStringList args = provider.options.isEmpty() ? QStringList()
+                                                                : QProcess::splitCommand(provider.options);
+            const QString workingDir = QFileInfo(projectRoot).isDir() ? projectRoot : QDir::homePath();
+            // Owned by the plugin, so it finishes even if this window closes.
+            auto *deleter = new ACPSessionDeleter(provider.executable, args, workingDir, it.value(), m_plugin);
+            QPointer<KateCodeView> self(this);
+            const QString agentName = provider.description;
+            const int count = it.value().size();
+            connect(deleter, &ACPSessionDeleter::finished, m_plugin,
+                    [self, agentName, count](int deleted, const QString &error) {
+                        if (!self) {
+                            return;
+                        }
+                        QVariantMap msg;
+                        msg[QStringLiteral("category")] = QStringLiteral("Kate Code");
+                        if (error.isEmpty()) {
+                            msg[QStringLiteral("type")] = QStringLiteral("Log");
+                            msg[QStringLiteral("text")] =
+                                QStringLiteral("Deleted %1 session(s) from %2.").arg(deleted).arg(agentName);
+                        } else {
+                            msg[QStringLiteral("type")] = QStringLiteral("Warning");
+                            msg[QStringLiteral("text")] =
+                                QStringLiteral("Could not delete %1 of %2 session(s) from %3: %4")
+                                    .arg(count - deleted).arg(count).arg(agentName, error);
+                        }
+                        qDebug() << "[KateCodeView]" << msg.value(QStringLiteral("text")).toString();
+                        self->m_mainWindow->showMessage(msg);
+                    });
+            deleter->start();
+        }
+    }
+
+    for (KateCodeView *view : m_plugin->views()) {
+        view->scheduleSessionPanelRefresh();
     }
 }
 
@@ -585,6 +752,7 @@ void KateCodeView::refreshResumableSessions()
         SessionPanel::ResumableEntry entry;
         entry.sessionId = sessionId;
         entry.projectRoot = root;
+        entry.transcriptPath = path;
         const QString fullTitle = !session.title.isEmpty() ? session.title : firstPrompt;
         entry.title = fullTitle.size() > maxTitleLength
             ? fullTitle.left(maxTitleLength - 1).trimmed() + QChar(0x2026)
@@ -601,7 +769,7 @@ void KateCodeView::refreshResumableSessions()
         }
         tip << QStringLiteral("Last active: %1").arg(when)
             << QStringLiteral("Session: %1").arg(sessionId)
-            << QStringLiteral("Double-click to resume it in a new chat.");
+            << QStringLiteral("Double-click to resume it in a new chat; right-click to delete it.");
         entry.toolTip = tip.join(QLatin1Char('\n'));
         entries.append(entry);
     }

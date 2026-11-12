@@ -2020,6 +2020,19 @@ ACPProvider ChatWidget::currentProvider() const
     return provider.executable.isEmpty() ? m_settingsStore->activeProvider() : provider;
 }
 
+void ChatWidget::forgetSavedSession(const QString &sessionId)
+{
+    if (sessionId.isEmpty() || hasAgentSession(sessionId)) {
+        return;
+    }
+    if (m_reconnectSessionId == sessionId) {
+        m_reconnectSessionId.clear();
+    }
+    if (m_lastSessionId == sessionId) {
+        m_lastSessionId.clear();
+    }
+}
+
 bool ChatWidget::hasAgentSession(const QString &sessionId) const
 {
     if (sessionId.isEmpty()) {

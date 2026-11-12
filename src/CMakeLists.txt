@@ -8,6 +8,7 @@ set(katecode_SRCS
     # ACP layer
     acp/ACPService.cpp
     acp/ACPSession.cpp
+    acp/ACPSessionDeleter.cpp
     acp/TerminalManager.cpp
 
     # UI layer

@@ -5,8 +5,10 @@
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QListWidget>
+#include <QMenu>
 #include <QPainter>
 #include <QPushButton>
+#include <QKeyEvent>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -16,6 +18,7 @@ namespace {
 constexpr int KindRole = Qt::UserRole;
 constexpr int KeyRole = Qt::UserRole + 1; // open: index, resumable: session id
 constexpr int RootRole = Qt::UserRole + 2; // resumable: project root
+constexpr int PathRole = Qt::UserRole + 3; // resumable: transcript path
 }
 
 SessionPanel::SessionPanel(QWidget *parent)
@@ -73,6 +76,10 @@ SessionPanel::SessionPanel(QWidget *parent)
             break;
         }
     });
+    m_list->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_list, &QWidget::customContextMenuRequested, this, &SessionPanel::showContextMenu);
+    // The Delete key deletes the current saved session (see eventFilter).
+    m_list->installEventFilter(this);
     layout->addWidget(m_list, 1);
 
     rebuild();
@@ -124,8 +131,66 @@ void SessionPanel::addHint(const QString &text)
     hint->setFlags(Qt::NoItemFlags);
 }
 
+void SessionPanel::showContextMenu(const QPoint &pos)
+{
+    QListWidgetItem *item = m_list->itemAt(pos);
+    if (!item || item->data(KindRole).toInt() != ResumableItem) {
+        return;
+    }
+    // The list is rebuilt whenever a chat's state changes, which can happen
+    // while the menu is open, so keep the values rather than the item.
+    const QString sessionId = item->data(KeyRole).toString();
+    const QString root = item->data(RootRole).toString();
+    const QString path = item->data(PathRole).toString();
+    QMenu menu(this);
+    QAction *resume = menu.addAction(QIcon::fromTheme(QStringLiteral("media-playback-start")),
+                                     QStringLiteral("Resume in New Chat"));
+    menu.addSeparator();
+    QAction *remove = menu.addAction(QIcon::fromTheme(QStringLiteral("edit-delete")),
+                                     QStringLiteral("Delete Session…"));
+    QAction *chosen = menu.exec(m_list->viewport()->mapToGlobal(pos));
+    if (chosen == resume) {
+        Q_EMIT resumeRequested(sessionId, root);
+    } else if (chosen == remove) {
+        Q_EMIT deleteRequested(sessionId, root, path);
+    }
+}
+
+bool SessionPanel::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_list && (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress)) {
+        auto *keyEvent = static_cast<QKeyEvent *>(event);
+        QListWidgetItem *item = m_list->currentItem();
+        if (keyEvent->matches(QKeySequence::Delete) && item && item->data(KindRole).toInt() == ResumableItem) {
+            // Claim the key before a window-wide shortcut takes it.
+            if (event->type() == QEvent::ShortcutOverride) {
+                event->accept();
+            } else {
+                requestDelete(item);
+            }
+            return true;
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+void SessionPanel::requestDelete(QListWidgetItem *item)
+{
+    if (item && item->data(KindRole).toInt() == ResumableItem) {
+        Q_EMIT deleteRequested(item->data(KeyRole).toString(), item->data(RootRole).toString(),
+                               item->data(PathRole).toString());
+    }
+}
+
 void SessionPanel::rebuild()
 {
+    // Keep the current item across the rebuild (it happens on every status
+    // or usage change), so keyboard navigation and the Delete key work.
+    QListWidgetItem *current = m_list->currentItem();
+    const int currentKind = current ? current->data(KindRole).toInt() : 0;
+    const QVariant currentKey = current ? current->data(KeyRole) : QVariant();
+    const bool hadSelection = current && current->isSelected();
+
     m_list->clear();
 
     addHeading(QStringLiteral("Open sessions"), QString(), false);
@@ -153,9 +218,21 @@ void SessionPanel::rebuild()
         addHint(QStringLiteral("No open sessions. Use \"New Session\" to start a chat."));
     }
 
-    if (m_resumableHeading.isEmpty()) {
-        return;
+    if (!m_resumableHeading.isEmpty()) {
+        addResumable();
     }
+    for (int i = 0; currentKind != 0 && i < m_list->count(); ++i) {
+        QListWidgetItem *item = m_list->item(i);
+        if (item->data(KindRole).toInt() == currentKind && item->data(KeyRole) == currentKey) {
+            m_list->setCurrentItem(item, hadSelection ? QItemSelectionModel::ClearAndSelect
+                                                      : QItemSelectionModel::NoUpdate);
+            break;
+        }
+    }
+}
+
+void SessionPanel::addResumable()
+{
     addHeading(m_resumableHeading, m_resumableHeadingToolTip, true);
     for (const ResumableEntry &entry : std::as_const(m_resumable)) {
         QString text = entry.title;
@@ -166,6 +243,7 @@ void SessionPanel::rebuild()
         item->setData(KindRole, ResumableItem);
         item->setData(KeyRole, entry.sessionId);
         item->setData(RootRole, entry.projectRoot);
+        item->setData(PathRole, entry.transcriptPath);
         item->setToolTip(entry.toolTip.isEmpty() ? text : entry.toolTip);
     }
     if (m_resumable.isEmpty()) {
