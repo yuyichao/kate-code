@@ -315,6 +315,11 @@ void SessionStore::writeAll(const QString &projectRoot, const QList<SessionEntry
     m_settings.sync();
 }
 
+void SessionStore::reload()
+{
+    m_settings.sync();
+}
+
 QStringList SessionStore::listAllProjectRoots() const
 {
     QSettings &settings = const_cast<QSettings &>(m_settings);

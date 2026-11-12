@@ -81,6 +81,9 @@ public:
     // List all project roots that have saved sessions
     QStringList listAllProjectRoots() const;
 
+    // Pick up changes written by other processes (e.g. another Kate).
+    void reload();
+
 private:
     QString normalizeKey(const QString &projectRoot) const;
     void writeAll(const QString &projectRoot, const QList<SessionEntry> &sessions);

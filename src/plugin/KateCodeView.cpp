@@ -59,6 +59,23 @@ KateCodeView::KateCodeView(KateCodePlugin *plugin, KTextEditor::MainWindow *main
         }
     });
 
+    // The current project also changes when the project plugin opens one
+    // (e.g. Kate started on a directory), possibly without a view change.
+    watchProjectPlugin(m_mainWindow->pluginView(QStringLiteral("kateprojectplugin")));
+    connect(m_mainWindow, &KTextEditor::MainWindow::pluginViewCreated, this,
+            [this](const QString &name, QObject *pluginView) {
+                if (name == QLatin1String("kateprojectplugin")) {
+                    watchProjectPlugin(pluginView);
+                    scheduleSessionPanelRefresh();
+                }
+            });
+    connect(m_mainWindow, &KTextEditor::MainWindow::pluginViewDeleted, this, [this](const QString &name) {
+        if (name == QLatin1String("kateprojectplugin")) {
+            scheduleSessionPanelRefresh();
+        }
+    });
+    scheduleSessionPanelRefresh();
+
     // Track the chat the user last worked in (for quick actions).
     connect(qApp, &QApplication::focusChanged, this, [this](QWidget *, QWidget *now) {
         if (!now) {
@@ -207,6 +224,7 @@ void KateCodeView::createToolView()
     layout->addWidget(m_sessionPanel);
     connect(m_sessionPanel, &SessionPanel::newSessionRequested, this, &KateCodeView::newSession);
     connect(m_sessionPanel, &SessionPanel::browseRequested, this, &KateCodeView::browseSessions);
+    connect(m_sessionPanel, &SessionPanel::refreshRequested, this, &KateCodeView::scheduleSessionPanelRefresh);
     connect(m_sessionPanel, &SessionPanel::resumeRequested, this, &KateCodeView::resumeSavedSession);
     connect(m_sessionPanel, &SessionPanel::deleteRequested, this, &KateCodeView::deleteSavedSession);
     connect(m_sessionPanel, &SessionPanel::showAllDirectoriesChanged, this, [this](bool showAll) {
@@ -628,6 +646,23 @@ KTextEditor::View *KateCodeView::editorView() const
     return m_lastEditorView;
 }
 
+void KateCodeView::watchProjectPlugin(QObject *pluginView)
+{
+    if (!pluginView) {
+        return;
+    }
+    // Kate's project plugin view has no public header; connect by name.
+    // projectFileNameChanged: another project became the current one;
+    // projectMapChanged: the current project was (re)loaded.
+    for (const char *signal : {SIGNAL(projectFileNameChanged()), SIGNAL(projectMapChanged()),
+                               SIGNAL(pluginProjectAdded(QString, QString)),
+                               SIGNAL(pluginProjectRemoved(QString, QString))}) {
+        if (pluginView->metaObject()->indexOfSignal(QMetaObject::normalizedSignature(signal + 1).constData()) >= 0) {
+            connect(pluginView, signal, this, SLOT(scheduleSessionPanelRefresh()), Qt::UniqueConnection);
+        }
+    }
+}
+
 void KateCodeView::scheduleSessionPanelRefresh()
 {
     if (m_panelRefreshPending) {
@@ -685,6 +720,8 @@ void KateCodeView::refreshSessionPanel()
 
 void KateCodeView::refreshResumableSessions()
 {
+    // Titles and "replaced" marks may have been written by another Kate.
+    m_sessionStore->reload();
     constexpr int maxEntries = 20;
     constexpr int maxTitleLength = 80;
 

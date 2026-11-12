@@ -52,6 +52,8 @@ public:
 Q_SIGNALS:
     void newSessionRequested();
     void browseRequested();
+    // Reload the saved sessions (e.g. changed by another Kate instance).
+    void refreshRequested();
     // The resumable list shows all directories instead of the current one.
     void showAllDirectoriesChanged(bool showAll);
     void entryActivated(int index);
@@ -60,6 +62,7 @@ Q_SIGNALS:
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
+    void showEvent(QShowEvent *event) override;
 
 private:
     enum ItemKind { OpenItem = 1, ResumableItem };

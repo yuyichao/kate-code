@@ -36,6 +36,13 @@ SessionPanel::SessionPanel(QWidget *parent)
     connect(newButton, &QPushButton::clicked, this, &SessionPanel::newSessionRequested);
     buttons->addWidget(newButton, 1);
 
+    auto *refreshButton = new QToolButton(this);
+    refreshButton->setObjectName(QStringLiteral("refreshSessionsButton"));
+    refreshButton->setIcon(QIcon::fromTheme(QStringLiteral("view-refresh")));
+    refreshButton->setToolTip(QStringLiteral("Reload the list of previous sessions"));
+    connect(refreshButton, &QToolButton::clicked, this, &SessionPanel::refreshRequested);
+    buttons->addWidget(refreshButton);
+
     auto *browseButton = new QToolButton(this);
     browseButton->setObjectName(QStringLiteral("browseSessionsButton"));
     browseButton->setIcon(QIcon::fromTheme(QStringLiteral("view-history")));
@@ -172,6 +179,14 @@ bool SessionPanel::eventFilter(QObject *watched, QEvent *event)
         }
     }
     return QWidget::eventFilter(watched, event);
+}
+
+void SessionPanel::showEvent(QShowEvent *event)
+{
+    QWidget::showEvent(event);
+    // Another Kate instance may have changed the saved sessions while the
+    // panel was hidden.
+    Q_EMIT refreshRequested();
 }
 
 void SessionPanel::requestDelete(QListWidgetItem *item)

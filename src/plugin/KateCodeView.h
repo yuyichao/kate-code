@@ -77,8 +77,15 @@ private Q_SLOTS:
     // Edit navigation
     void jumpToEdit(const QString &filePath, int startLine, int endLine);
 
+    // The session list follows the current directory; also reloads the
+    // saved sessions (other Kate instances may have changed them).
+    void scheduleSessionPanelRefresh();
+
 private:
     void sendQuickAction(const QString &prompt);
+    // Refresh the session list when the project plugin's current project
+    // changes (e.g. a directory is opened).
+    void watchProjectPlugin(QObject *pluginView);
     void createToolView();
     // startSession: connect right away (a new session); false when the
     // caller resumes one instead.
@@ -88,7 +95,6 @@ private:
     ChatWidget *targetChat();
     void activateChat(ChatWidget *chat);
     KTextEditor::View *editorView() const;
-    void scheduleSessionPanelRefresh();
     void refreshSessionPanel();
     void refreshResumableSessions();
     bool isSessionOpen(const QString &sessionId) const;
