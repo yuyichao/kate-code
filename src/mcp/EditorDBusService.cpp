@@ -16,14 +16,42 @@
 #include <QDBusConnection>
 #include <QDBusError>
 #include <QDebug>
+#include <QCryptographicHash>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
+#include <QStringDecoder>
+#include <QStringEncoder>
 #include <QTimer>
 #include <QUrl>
 #include <QWidget>
 
+namespace {
+// The plugin's instance, for documentChangedOnDisk().
+EditorDBusService *s_instance = nullptr;
+}
+
+EditorDBusService::~EditorDBusService()
+{
+    if (s_instance == this) {
+        s_instance = nullptr;
+    }
+}
+
 EditorDBusService::EditorDBusService(QObject *parent)
     : QObject(parent)
 {
+    s_instance = this;
+    // Follow which documents Kate has flagged as changed on disk (see
+    // changeDocument()).
+    if (KTextEditor::Application *app = KTextEditor::Editor::instance()->application()) {
+        const QList<KTextEditor::Document *> docs = app->documents();
+        for (KTextEditor::Document *doc : docs) {
+            trackDocument(doc);
+        }
+        connect(app, &KTextEditor::Application::documentCreated, this, &EditorDBusService::trackDocument);
+    }
 }
 
 bool EditorDBusService::registerOnBus()
@@ -79,23 +107,161 @@ QStringList EditorDBusService::listDocuments()
     return result;
 }
 
-QString EditorDBusService::readDocument(const QString &filePath)
+namespace {
+
+// The checksum KTextEditor keeps for a document (Document::checksum()): the
+// git blob hash of the file as last loaded or saved.
+QByteArray gitBlobDigest(const QByteArray &data)
+{
+    QCryptographicHash hash(QCryptographicHash::Sha1);
+    const QByteArray header = QByteArray("blob ") + QByteArray::number(data.size());
+    hash.addData(header);
+    hash.addData(QByteArrayView("\0", 1));
+    hash.addData(data);
+    return hash.result();
+}
+
+bool readFileBytes(const QString &path, QByteArray *bytes, QString *error)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        *error = QStringLiteral("ERROR: Cannot open file: %1").arg(file.errorString());
+        return false;
+    }
+    *bytes = file.readAll();
+    return true;
+}
+
+// Text of a file in the given encoding (UTF-8 if empty); a byte order mark
+// is dropped and reported in *bom so it can be written back.
+bool decodeText(const QByteArray &bytes, const QString &encoding, QString *text, bool *bom)
+{
+    QStringDecoder decoder(encoding.isEmpty() ? "UTF-8" : encoding.toUtf8().constData());
+    if (!decoder.isValid()) {
+        return false;
+    }
+    *bom = QStringConverter::encodingForData(bytes).has_value();
+    *text = decoder.decode(bytes);
+    return !decoder.hasError();
+}
+
+bool encodeText(const QString &text, const QString &encoding, bool bom, QByteArray *bytes)
+{
+    QStringEncoder encoder(encoding.isEmpty() ? "UTF-8" : encoding.toUtf8().constData(),
+                           bom ? QStringConverter::Flag::WriteBom : QStringConverter::Flag::Default);
+    if (!encoder.isValid()) {
+        return false;
+    }
+    *bytes = encoder.encode(text);
+    return !encoder.hasError();
+}
+
+// Atomically replace (or create) the file, creating missing directories.
+QString writeFileBytes(const QString &path, const QByteArray &bytes)
+{
+    const QFileInfo info(path);
+    if (!QDir().mkpath(info.absolutePath())) {
+        return QStringLiteral("ERROR: Cannot create directory: %1").arg(info.absolutePath());
+    }
+    QSaveFile file(path);
+    // A writable file in a directory we cannot create files in.
+    file.setDirectWriteFallback(true);
+    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit()) {
+        return QStringLiteral("ERROR: Cannot write file: %1").arg(file.errorString());
+    }
+    return QString();
+}
+
+// Replace the unique occurrence of oldText in text. Files with Windows line
+// endings are matched with the agent's "\n" line endings.
+QString replaceUnique(QString *text, QString oldText, QString newText)
+{
+    if (oldText.isEmpty()) {
+        return QStringLiteral("ERROR: old_text must not be empty");
+    }
+    if (text->contains(QLatin1String("\r\n")) && !oldText.contains(QLatin1Char('\r'))) {
+        oldText.replace(QLatin1Char('\n'), QLatin1String("\r\n"));
+        newText.replace(QLatin1Char('\n'), QLatin1String("\r\n"));
+    }
+    const qsizetype pos = text->indexOf(oldText);
+    if (pos < 0) {
+        return QStringLiteral("ERROR: old_text not found in document");
+    }
+    if (text->indexOf(oldText, pos + 1) >= 0) {
+        return QStringLiteral("ERROR: old_text is not unique in document (found at multiple positions)");
+    }
+    text->replace(pos, oldText.size(), newText);
+    return QString();
+}
+
+KTextEditor::Cursor cursorAt(const QString &text, qsizetype offset)
+{
+    const int line = int(text.left(offset).count(QLatin1Char('\n')));
+    // (lastIndexOf() with -1 would search from the end.)
+    const qsizetype lineStart = offset > 0 ? text.lastIndexOf(QLatin1Char('\n'), offset - 1) + 1 : 0;
+    return KTextEditor::Cursor(line, int(offset - lineStart));
+}
+
+} // namespace
+
+KTextEditor::Document *EditorDBusService::findDocument(const QString &filePath) const
 {
     KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
     if (!app) {
-        return QStringLiteral("ERROR: KTextEditor application not available");
+        return nullptr;
     }
+    if (KTextEditor::Document *doc = app->findUrl(QUrl::fromLocalFile(filePath))) {
+        return doc;
+    }
+    const QString canonical = QFileInfo(filePath).canonicalFilePath();
+    if (!canonical.isEmpty() && canonical != filePath) {
+        return app->findUrl(QUrl::fromLocalFile(canonical));
+    }
+    return nullptr;
+}
 
-    // Find existing document by URL
-    QUrl url = QUrl::fromLocalFile(filePath);
-    KTextEditor::Document *doc = app->findUrl(url);
+void EditorDBusService::trackDocument(KTextEditor::Document *doc)
+{
+    if (!doc || m_modifiedOnDisk.contains(doc)) {
+        return;
+    }
+    m_modifiedOnDisk.insert(doc, false);
+    connect(doc, &KTextEditor::Document::modifiedOnDisk, this,
+            [this](KTextEditor::Document *document, bool isModified) {
+                m_modifiedOnDisk.insert(document, isModified);
+            });
+    connect(doc, &QObject::destroyed, this, [this, doc]() {
+        m_modifiedOnDisk.remove(doc);
+    });
+}
 
-    if (doc) {
-        // Document is open — return its content
+bool EditorDBusService::flaggedModifiedOnDisk(KTextEditor::Document *doc) const
+{
+    return m_modifiedOnDisk.value(doc, false);
+}
+
+bool EditorDBusService::documentChangedOnDisk(KTextEditor::Document *doc, const QString &filePath)
+{
+    if (s_instance && s_instance->flaggedModifiedOnDisk(doc)) {
+        return true;
+    }
+    // Before Kate notices, its checksum is still the one of the old file.
+    QByteArray bytes;
+    QString error;
+    return !QFileInfo::exists(filePath) || !readFileBytes(filePath, &bytes, &error)
+        || gitBlobDigest(bytes) != doc->checksum();
+}
+
+QString EditorDBusService::readDocument(const QString &filePath)
+{
+    KTextEditor::Document *doc = findDocument(filePath);
+    // The buffer is what the user sees (with unsaved changes), unless the
+    // file changed on disk behind an unmodified buffer that Kate has not
+    // reloaded (or not even noticed) yet.
+    if (doc && (doc->isModified() || !documentChangedOnDisk(doc, filePath))) {
         return doc->text();
     }
 
-    // Document not open — read from disk
     QFile file(filePath);
     if (!file.exists()) {
         return QStringLiteral("ERROR: File not found: %1").arg(filePath);
@@ -108,121 +274,105 @@ QString EditorDBusService::readDocument(const QString &filePath)
 
 QString EditorDBusService::editDocument(const QString &filePath, const QString &oldText, const QString &newText)
 {
-    KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
-    if (!app) {
-        return QStringLiteral("ERROR: KTextEditor application not available");
-    }
-
-    QUrl url = QUrl::fromLocalFile(filePath);
-    KTextEditor::Document *doc = app->findUrl(url);
-
-    if (!doc) {
-        // Try to open the document
-        KTextEditor::MainWindow *mainWindow = app->activeMainWindow();
-        if (!mainWindow) {
-            return QStringLiteral("ERROR: No active main window");
-        }
-        KTextEditor::View *view = mainWindow->openUrl(url);
-        if (!view) {
-            return QStringLiteral("ERROR: Could not open document: %1").arg(filePath);
-        }
-        doc = view->document();
-    }
-
-    // Find and replace the text
-    QString content = doc->text();
-    int pos = content.indexOf(oldText);
-    if (pos < 0) {
-        return QStringLiteral("ERROR: old_text not found in document");
-    }
-
-    // Check for uniqueness
-    int secondPos = content.indexOf(oldText, pos + 1);
-    if (secondPos >= 0) {
-        return QStringLiteral("ERROR: old_text is not unique in document (found at multiple positions)");
-    }
-
-    // Calculate line/column for the replacement
-    int startLine = content.left(pos).count(QLatin1Char('\n'));
-    int startCol = pos - content.lastIndexOf(QLatin1Char('\n'), pos) - 1;
-    if (startCol < 0) {
-        startCol = pos;
-    }
-
-    int endPos = pos + oldText.length();
-    int endLine = content.left(endPos).count(QLatin1Char('\n'));
-    int endCol = endPos - content.lastIndexOf(QLatin1Char('\n'), endPos - 1) - 1;
-    if (endCol < 0) {
-        endCol = endPos;
-    }
-
-    // Perform the replacement
-    KTextEditor::Range range(startLine, startCol, endLine, endCol);
-    bool success = doc->replaceText(range, newText);
-
-    if (!success) {
-        return QStringLiteral("ERROR: Failed to replace text");
-    }
-
-    // Auto-save the document
-    if (!doc->save()) {
-        return QStringLiteral("ERROR: Edit succeeded but failed to save document");
-    }
-
-    return QStringLiteral("OK");
+    return changeDocument(filePath, oldText, newText, false);
 }
 
 QString EditorDBusService::writeDocument(const QString &filePath, const QString &content)
 {
-    KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
-    if (!app) {
-        return QStringLiteral("ERROR: KTextEditor application not available");
+    return changeDocument(filePath, QString(), content, true);
+}
+
+QString EditorDBusService::changeDocument(const QString &filePath, const QString &oldText, const QString &newText, bool whole)
+{
+    if (!QFileInfo(filePath).isAbsolute()) {
+        return QStringLiteral("ERROR: file_path must be absolute: %1").arg(filePath);
     }
+    const bool exists = QFileInfo::exists(filePath);
+    if (!whole && !exists) {
+        return QStringLiteral("ERROR: File not found: %1").arg(filePath);
+    }
+    KTextEditor::Document *doc = findDocument(filePath);
 
-    QUrl url = QUrl::fromLocalFile(filePath);
-    KTextEditor::Document *doc = app->findUrl(url);
+    // Read the file on disk; for an open document also decide whether it
+    // still has the content the buffer was loaded from or last saved as.
+    QByteArray bytes;
+    QString error;
+    if (exists && !readFileBytes(filePath, &bytes, &error)) {
+        return error;
+    }
+    const bool changedOnDisk = doc && (!exists || flaggedModifiedOnDisk(doc) || gitBlobDigest(bytes) != doc->checksum());
 
-    if (doc) {
-        // Document is open — replace its content and save
-        doc->setText(content);
+    if (doc && !changedOnDisk) {
+        // Edit the buffer (the change can be undone there) and save it. The
+        // checks avoid every dialog KTextEditor would show while saving.
+        if (!QFileInfo(filePath).isWritable()) {
+            return QStringLiteral("ERROR: File is not writable: %1").arg(filePath);
+        }
+        QByteArray encoded;
+        if (!encodeText(newText, doc->encoding(), false, &encoded)) {
+            return QStringLiteral("ERROR: The new text cannot be saved in the file's encoding (%1)").arg(doc->encoding());
+        }
+        if (whole) {
+            if (!doc->setText(newText)) {
+                return QStringLiteral("ERROR: Failed to replace text");
+            }
+        } else {
+            const QString content = doc->text();
+            const qsizetype pos = content.indexOf(oldText);
+            if (oldText.isEmpty() || pos < 0) {
+                return QStringLiteral("ERROR: old_text not found in document");
+            }
+            if (content.indexOf(oldText, pos + 1) >= 0) {
+                return QStringLiteral("ERROR: old_text is not unique in document (found at multiple positions)");
+            }
+            const KTextEditor::Range range(cursorAt(content, pos), cursorAt(content, pos + oldText.size()));
+            if (!doc->replaceText(range, newText)) {
+                return QStringLiteral("ERROR: Failed to replace text");
+            }
+        }
         if (!doc->save()) {
-            return QStringLiteral("ERROR: Write succeeded but failed to save document");
+            return QStringLiteral("ERROR: The change was made in Kate's buffer but saving the file failed");
         }
         return QStringLiteral("OK");
     }
 
-    // Document not open — create new or open and set content
-    KTextEditor::MainWindow *mainWindow = app->activeMainWindow();
-    if (!mainWindow) {
-        return QStringLiteral("ERROR: No active main window");
+    if (doc && doc->isModified()) {
+        return QStringLiteral(
+                   "ERROR: %1 has unsaved changes in Kate and was also changed on disk. "
+                   "Ask the user to save or reload it in Kate first.")
+            .arg(filePath);
     }
 
-    // Check if file exists
-    QFile file(filePath);
-    bool fileExists = file.exists();
-
-    if (fileExists) {
-        // Open existing file
-        KTextEditor::View *view = mainWindow->openUrl(url);
-        if (!view) {
-            return QStringLiteral("ERROR: Could not open document: %1").arg(filePath);
+    // Change the file on disk: it is not open, or its buffer is unmodified
+    // and out of date (it is reloaded afterwards).
+    const QString encoding = doc ? doc->encoding() : QString();
+    QString text;
+    bool bom = false;
+    if (exists && !decodeText(bytes, encoding, &text, &bom)) {
+        if (!whole) {
+            return QStringLiteral("ERROR: %1 is not valid %2 text").arg(filePath, encoding.isEmpty() ? QStringLiteral("UTF-8") : encoding);
         }
-        view->document()->setText(content);
-        if (!view->document()->save()) {
-            return QStringLiteral("ERROR: Write succeeded but failed to save document");
-        }
+        bom = false;
+    }
+    if (whole) {
+        text = newText;
     } else {
-        // Create new document with content, then save to path
-        KTextEditor::View *view = mainWindow->openUrl(QUrl());
-        if (!view) {
-            return QStringLiteral("ERROR: Could not create new document");
-        }
-        view->document()->setText(content);
-        if (!view->document()->saveAs(url)) {
-            return QStringLiteral("ERROR: Could not save document to: %1").arg(filePath);
+        error = replaceUnique(&text, oldText, newText);
+        if (!error.isEmpty()) {
+            return error;
         }
     }
-
+    QByteArray encoded;
+    if (!encodeText(text, encoding, bom, &encoded)) {
+        return QStringLiteral("ERROR: The new text cannot be saved in the file's encoding (%1)").arg(encoding);
+    }
+    error = writeFileBytes(filePath, encoded);
+    if (!error.isEmpty()) {
+        return error;
+    }
+    if (doc) {
+        doc->documentReload();
+    }
     return QStringLiteral("OK");
 }
 

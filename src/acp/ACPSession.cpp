@@ -1,6 +1,7 @@
 #include "ACPSession.h"
 #include "ACPService.h"
 #include "TerminalManager.h"
+#include "../mcp/EditorDBusService.h"
 #include "../util/EditTracker.h"
 #include "../util/TranscriptWriter.h"
 
@@ -2461,7 +2462,8 @@ void ACPSession::handleFsReadTextFile(const QJsonObject &params, int requestId)
     // Try to get content from Kate document first (may have unsaved changes)
     if (m_documentProvider) {
         KTextEditor::Document *doc = m_documentProvider(path);
-        if (doc) {
+        // Not a stale unmodified buffer whose file changed on disk.
+        if (doc && (doc->isModified() || !EditorDBusService::documentChangedOnDisk(doc, path))) {
             content = doc->text();
             fromKate = true;
             qDebug() << "[ACPSession] Reading from Kate document:" << path;
@@ -2724,7 +2726,7 @@ void ACPSession::handleFsWriteTextFile(const QJsonObject &params, int requestId)
     if (!isNewFile) {
         if (m_documentProvider) {
             KTextEditor::Document *doc = m_documentProvider(path);
-            if (doc) {
+            if (doc && (doc->isModified() || !EditorDBusService::documentChangedOnDisk(doc, path))) {
                 oldContent = doc->text();
             }
         }
@@ -2736,9 +2738,33 @@ void ACPSession::handleFsWriteTextFile(const QJsonObject &params, int requestId)
         }
     }
 
-    // Try to write through Kate document if open
+    // Try to write through Kate document if open. Saving a buffer whose
+    // file changed on disk would make KTextEditor ask with a modal dialog:
+    // an unmodified (stale) buffer is written on disk and reloaded instead,
+    // and a buffer with unsaved changes is refused.
+    KTextEditor::Document *reloadDoc = nullptr;
     if (m_documentProvider) {
         KTextEditor::Document *doc = m_documentProvider(path);
+        if (doc && EditorDBusService::documentChangedOnDisk(doc, path)) {
+            if (doc->isModified()) {
+                QJsonObject error;
+                error[QStringLiteral("code")] = -32001;
+                error[QStringLiteral("message")] = QStringLiteral(
+                    "%1 has unsaved changes in Kate and was also changed on disk. "
+                    "Ask the user to save or reload it in Kate first.").arg(path);
+                m_service->sendResponse(requestId, QJsonObject(), error);
+                return;
+            }
+            reloadDoc = doc;
+            doc = nullptr;
+        }
+        if (doc && !QFileInfo(path).isWritable()) {
+            QJsonObject error;
+            error[QStringLiteral("code")] = -32001;
+            error[QStringLiteral("message")] = QStringLiteral("File is not writable: %1").arg(path);
+            m_service->sendResponse(requestId, QJsonObject(), error);
+            return;
+        }
         if (doc) {
             qDebug() << "[ACPSession] Writing through Kate document:" << path;
 
@@ -2803,6 +2829,10 @@ void ACPSession::handleFsWriteTextFile(const QJsonObject &params, int requestId)
             // Record as a full-file replacement
             m_editTracker->recordEdit(m_currentToolCallId, path, 0, -1, lineCount);
         }
+    }
+
+    if (reloadDoc) {
+        reloadDoc->documentReload();
     }
 
     // Emit for diff display (only meaningful if content actually changed)

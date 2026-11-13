@@ -169,7 +169,7 @@ QJsonObject MCPServer::handleToolsList(int id, const QJsonObject &params)
     QJsonObject editTool;
     editTool[QStringLiteral("name")] = QStringLiteral("katecode_edit");
     editTool[QStringLiteral("description")] =
-        QStringLiteral("Edits a file by replacing old_string with new_string. The old_string must be unique in the file. Opens the file in Kate if not already open.\n\nIn sessions with mcp__kate__katecode_edit always use it instead of Edit or mcp__acp__Edit, as it will update the editor buffer directly.");
+        QStringLiteral("Edits a file by replacing old_string with new_string, and saves it. The old_string must be unique in the file. If the file is open in Kate, the change is made in its buffer (where the user can review and undo it); otherwise the file is changed on disk without opening it.\n\nIn sessions with mcp__kate__katecode_edit always use it instead of Edit or mcp__acp__Edit, as it will update the editor buffer directly.");
 
     QJsonObject editPathProp;
     editPathProp[QStringLiteral("type")] = QStringLiteral("string");
@@ -205,7 +205,7 @@ QJsonObject MCPServer::handleToolsList(int id, const QJsonObject &params)
     QJsonObject writeTool;
     writeTool[QStringLiteral("name")] = QStringLiteral("katecode_write");
     writeTool[QStringLiteral("description")] =
-        QStringLiteral("Writes content to a file. If the file is open in Kate, updates the buffer. Otherwise creates or overwrites the file.\n\nIn sessions with mcp__kate__katecode_write always use it instead of Write or mcp__acp__Write, as it will update the editor buffer directly.");
+        QStringLiteral("Writes content to a file and saves it. If the file is open in Kate, its buffer is updated (where the user can review and undo the change); otherwise the file is created or overwritten on disk without opening it.\n\nIn sessions with mcp__kate__katecode_write always use it instead of Write or mcp__acp__Write, as it will update the editor buffer directly.");
 
     QJsonObject writePathProp;
     writePathProp[QStringLiteral("type")] = QStringLiteral("string");
