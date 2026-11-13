@@ -207,6 +207,7 @@ void ACPSession::resetSessionState()
     m_supportsEmbeddedContext = false;
     m_supportsPromptQueueing = false;
     m_supportsSetTitle = false;
+    m_midTurnPromptIds.clear();
     m_editorReminderPending = false;
     // Not announced: the chat keeps showing the last title until the next
     // session reports its own.
@@ -259,6 +260,11 @@ void ACPSession::cancelPrompt()
     QJsonObject params;
     params[QStringLiteral("id")] = m_promptRequestId;
     m_service->sendNotification(QStringLiteral("$/cancel_request"), params);
+    for (const int id : std::as_const(m_midTurnPromptIds)) {
+        QJsonObject midTurn;
+        midTurn[QStringLiteral("id")] = id;
+        m_service->sendNotification(QStringLiteral("$/cancel_request"), midTurn);
+    }
 
     // Finish any streaming message
     if (!m_currentMessageId.isEmpty()) {
@@ -274,6 +280,7 @@ void ACPSession::cancelPrompt()
         qDebug() << "[ACPSession] Discarding" << m_promptQueue.size() << "queued prompt(s) on cancel";
         m_promptQueue.clear();
     }
+    m_midTurnPromptIds.clear();
     Q_EMIT promptCancelled();
 }
 
@@ -741,9 +748,18 @@ void ACPSession::sendMessage(const QString &content, const QString &filePath, co
         : QueuedPrompt{content, filePath, selection, contextChunks, images};
 
     if (isPromptRunning()) {
-        // Queue it instead of sending a concurrent request (which agents may
-        // mishandle). The assistant placeholder is created only when the
-        // prompt is dispatched.
+        // An agent that queues prompts itself (Claude Code) gets them right
+        // away, as Claude Code's own clients send them: it takes them into the
+        // running turn at its next step. Commands wait for the turn to end
+        // (Claude Code refuses or ignores them mid-turn), and so does
+        // everything behind a waiting prompt, to keep the order.
+        if (m_supportsPromptQueueing && !command && m_promptQueue.isEmpty()) {
+            sendPromptMidTurn(prompt);
+            return;
+        }
+        // Otherwise queue it instead of sending a concurrent request (which
+        // agents may mishandle). The assistant placeholder is created only
+        // when the prompt is dispatched.
         m_promptQueue.append(prompt);
         qDebug() << "[ACPSession] Prompt busy; queued follow-up (" << m_promptQueue.size() << " queued)";
         return;
@@ -788,6 +804,21 @@ void ACPSession::dispatchPrompt(const QueuedPrompt &prompt)
 
     m_promptRequestId = m_service->sendRequest(QStringLiteral("session/prompt"), params);
     qDebug() << "[ACPSession] Sent session/prompt request, id:" << m_promptRequestId;
+}
+
+void ACPSession::sendPromptMidTurn(const QueuedPrompt &prompt)
+{
+    QJsonObject params;
+    params[QStringLiteral("sessionId")] = m_sessionId;
+    params[QStringLiteral("prompt")] = buildPromptBlocks(prompt);
+    const int id = m_service->sendRequest(QStringLiteral("session/prompt"), params);
+    if (id < 0) {
+        return;
+    }
+    qDebug() << "[ACPSession] Sent session/prompt during a running turn, id:" << id;
+    m_midTurnPromptIds.append(id);
+    // What the agent says from here on shows below the message.
+    startAssistantMessage();
 }
 
 QJsonArray ACPSession::buildPromptBlocks(const QueuedPrompt &prompt)
@@ -1043,6 +1074,24 @@ QString describeACPError(const QJsonObject &error)
 
 void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject &error)
 {
+    // A prompt sent during a running turn: its turn is the running one (or
+    // the next), which ends with the last of them.
+    if (m_midTurnPromptIds.removeOne(id)) {
+        if (!error.isEmpty()) {
+            Q_EMIT errorOccurred(describeACPError(error));
+        }
+        return;
+    }
+    if (id == m_promptRequestId && !m_midTurnPromptIds.isEmpty()) {
+        if (!error.isEmpty()) {
+            Q_EMIT errorOccurred(describeACPError(error));
+        }
+        // The turn goes on for the prompts sent meanwhile; keep streaming
+        // into the current message.
+        m_promptRequestId = m_midTurnPromptIds.takeFirst();
+        return;
+    }
+
     if (!error.isEmpty()) {
         qWarning() << "[ACPSession] Error response for id" << id << ":" << error;
         Q_EMIT errorOccurred(describeACPError(error));

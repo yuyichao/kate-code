@@ -160,6 +160,7 @@ To delete a previous session, right-click it and choose **Delete Session…** (o
 - Type your message in the input field at the bottom
 - Press **Enter** to send (Shift+Enter for newline)
 - The agent's response will stream in real time with markdown formatting
+- Messages sent while the agent is working are sent right away when the agent queues prompts itself (Claude Code takes them into the running turn at its next step, without interrupting it); otherwise they are sent when the turn ends
 - Slash commands (e.g. `/advisor`, `/remote-control`) are sent exactly as typed, without the current file or added context (which stay for the next message), and wait for a running turn to end
 - When the agent edits files through Kate, it never opens, closes or switches tabs: a file that is open is changed in its buffer (so the change can be undone there) and saved, other files are changed on disk. A file with unsaved changes in Kate that was also changed on disk is left alone and the agent is told to ask you
 

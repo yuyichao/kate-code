@@ -176,7 +176,12 @@ private:
     // The content blocks of a prompt. Takes the pending editor reminder
     // (unless the prompt is a slash command).
     QJsonArray buildPromptBlocks(const QueuedPrompt &prompt);
-    // Finish the streaming assistant message (if any) and start a new one.
+    // Send a prompt while a turn runs, to an agent that takes them
+    // (promptQueueing): Claude Code folds it into the running turn at its next
+    // step, or runs it next.
+    void sendPromptMidTurn(const QueuedPrompt &prompt);
+    // Finish the streaming assistant message and start a new one (output
+    // after a message sent mid-turn shows below it).
     void startAssistantMessage();
 
     // Send the silent summary session/prompt now (requestSummary defers this
@@ -297,6 +302,9 @@ private:
     // The editor <system-reminder> goes with the first ordinary prompt (not
     // with a slash command, which must be sent alone).
     bool m_editorReminderPending = false;
+    // session/prompt requests sent while m_promptRequestId's turn runs. The
+    // turn ends (and the next queued prompt goes out) once all have answered.
+    QList<int> m_midTurnPromptIds;
     QString m_title;
     // In-flight session/set_title requests.
     QSet<int> m_setTitleRequestIds;
