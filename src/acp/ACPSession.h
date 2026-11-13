@@ -90,7 +90,10 @@ public:
     bool supportsPromptQueueing() const { return m_supportsPromptQueueing; }
     // A slash command ("/name" or "/name args"): sent alone, exactly as
     // typed, since agents only recognise a command that is the whole prompt.
-    static bool isSlashCommand(const QString &text);
+    // Once the agent has listed its commands (available_commands_update),
+    // only those count, so a message starting with a path such as "/tmp" is
+    // not taken for one; before that, any "/name" first word does.
+    bool isSlashCommand(const QString &text) const;
 
     void cancelPrompt();
 
@@ -169,6 +172,8 @@ private:
         QString selection;
         QList<ContextChunk> contextChunks;
         QList<ImageAttachment> images;
+        // A slash command (decided when it was sent): sent alone.
+        bool command = false;
     };
 
     // Send the assistant placeholder and session/prompt request.

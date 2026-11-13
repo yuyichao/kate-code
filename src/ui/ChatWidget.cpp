@@ -736,7 +736,7 @@ void ChatWidget::onMessageSubmitted(const QString &message)
 
     // A slash command is sent alone; added context chunks and images stay
     // for the next message.
-    if (ACPSession::isSlashCommand(message)) {
+    if (m_session->isSlashCommand(message)) {
         m_session->sendMessage(message);
         return;
     }

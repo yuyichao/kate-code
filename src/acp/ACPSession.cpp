@@ -11,6 +11,7 @@
 #include <KTextEditor/View>
 
 #include <QCoreApplication>
+#include <algorithm>
 #include <QDebug>
 #include <QDir>
 #include <QFile>
@@ -208,6 +209,11 @@ void ACPSession::resetSessionState()
     m_supportsPromptQueueing = false;
     m_supportsSetTitle = false;
     m_midTurnPromptIds.clear();
+    // The next session (possibly another agent) lists its own commands.
+    if (!m_availableCommands.isEmpty()) {
+        m_availableCommands.clear();
+        Q_EMIT commandsAvailable(m_availableCommands);
+    }
     m_editorReminderPending = false;
     // Not announced: the chat keeps showing the last title until the next
     // session reports its own.
@@ -709,12 +715,23 @@ void ACPSession::loadSession(const QString &sessionId)
     qDebug() << "[ACPSession] Sent session/load request, id:" << m_sessionLoadRequestId;
 }
 
-bool ACPSession::isSlashCommand(const QString &text)
+bool ACPSession::isSlashCommand(const QString &text) const
 {
-    // "/name" followed by nothing or whitespace; a path such as "/usr/bin"
-    // or "/tmp/x is broken" is not a command.
-    static const QRegularExpression command(QStringLiteral("^/[A-Za-z0-9][A-Za-z0-9_:.\\-]*(\\s|$)"));
-    return command.match(text).hasMatch();
+    // "/name" followed by nothing or whitespace; "/usr/bin/foo" or
+    // "/tmp/x is broken" is never a command.
+    static const QRegularExpression command(QStringLiteral("^/([A-Za-z0-9][A-Za-z0-9_:.\\-]*)(\\s|$)"));
+    const QRegularExpressionMatch match = command.match(text);
+    if (!match.hasMatch()) {
+        return false;
+    }
+    if (m_availableCommands.isEmpty()) {
+        return true;
+    }
+    const QString name = match.captured(1);
+    return std::any_of(m_availableCommands.cbegin(), m_availableCommands.cend(), [&name](const SlashCommand &cmd) {
+        // Names come without the slash; tolerate agents that include it.
+        return cmd.name == name || (cmd.name.startsWith(QLatin1Char('/')) && QStringView(cmd.name).mid(1) == name);
+    });
 }
 
 void ACPSession::sendMessage(const QString &content, const QString &filePath, const QString &selection, const QList<ContextChunk> &contextChunks, const QList<ImageAttachment> &images)
@@ -744,7 +761,7 @@ void ACPSession::sendMessage(const QString &content, const QString &filePath, co
     // A slash command is the whole prompt; editor context would hide it.
     const bool command = isSlashCommand(content);
     const QueuedPrompt prompt = command
-        ? QueuedPrompt{content, QString(), QString(), {}, {}}
+        ? QueuedPrompt{content, QString(), QString(), {}, {}, true}
         : QueuedPrompt{content, filePath, selection, contextChunks, images};
 
     if (isPromptRunning()) {
@@ -929,7 +946,7 @@ QJsonArray ACPSession::buildPromptBlocks(const QueuedPrompt &prompt)
     // Inject editor context and tool preferences once, with the first
     // ordinary prompt (a slash command must be sent alone).
     QString messageText = content;
-    if (m_editorReminderPending && !isSlashCommand(content)) {
+    if (m_editorReminderPending && !prompt.command) {
         m_editorReminderPending = false;
         messageText += QStringLiteral("\n\n<system-reminder>"
             "You are running inside the KDE Kate text editor via the Kate Code plugin. "
