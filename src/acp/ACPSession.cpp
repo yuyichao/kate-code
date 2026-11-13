@@ -207,6 +207,7 @@ void ACPSession::resetSessionState()
     m_supportsEmbeddedContext = false;
     m_supportsPromptQueueing = false;
     m_supportsSetTitle = false;
+    m_editorReminderPending = false;
     // Not announced: the chat keeps showing the last title until the next
     // session reports its own.
     m_title.clear();
@@ -701,6 +702,14 @@ void ACPSession::loadSession(const QString &sessionId)
     qDebug() << "[ACPSession] Sent session/load request, id:" << m_sessionLoadRequestId;
 }
 
+bool ACPSession::isSlashCommand(const QString &text)
+{
+    // "/name" followed by nothing or whitespace; a path such as "/usr/bin"
+    // or "/tmp/x is broken" is not a command.
+    static const QRegularExpression command(QStringLiteral("^/[A-Za-z0-9][A-Za-z0-9_:.\\-]*(\\s|$)"));
+    return command.match(text).hasMatch();
+}
+
 void ACPSession::sendMessage(const QString &content, const QString &filePath, const QString &selection, const QList<ContextChunk> &contextChunks, const QList<ImageAttachment> &images)
 {
     if (m_status != ConnectionStatus::Connected) {
@@ -708,7 +717,11 @@ void ACPSession::sendMessage(const QString &content, const QString &filePath, co
         return;
     }
 
-    const bool isFirstMessage = (m_messageCounter == 0);
+    // The editor context reminder goes with the session's first ordinary
+    // prompt.
+    if (m_messageCounter == 0) {
+        m_editorReminderPending = true;
+    }
 
     // Emit the user message immediately so the UI updates regardless of
     // whether the prompt can be dispatched now or must be queued.
@@ -721,21 +734,38 @@ void ACPSession::sendMessage(const QString &content, const QString &filePath, co
     Q_EMIT messageAdded(userMsg);
     m_transcript->recordMessage(userMsg);
 
-    // If a session/prompt round-trip is already in flight, queue this prompt
-    // instead of sending a concurrent request (which agents may mishandle).
-    // The assistant placeholder is created only when the prompt is dispatched.
+    // A slash command is the whole prompt; editor context would hide it.
+    const bool command = isSlashCommand(content);
+    const QueuedPrompt prompt = command
+        ? QueuedPrompt{content, QString(), QString(), {}, {}}
+        : QueuedPrompt{content, filePath, selection, contextChunks, images};
+
     if (isPromptRunning()) {
-        m_promptQueue.append(QueuedPrompt{content, filePath, selection, contextChunks, images});
+        // Queue it instead of sending a concurrent request (which agents may
+        // mishandle). The assistant placeholder is created only when the
+        // prompt is dispatched.
+        m_promptQueue.append(prompt);
         qDebug() << "[ACPSession] Prompt busy; queued follow-up (" << m_promptQueue.size() << " queued)";
         return;
     }
 
-    dispatchPrompt(content, filePath, selection, contextChunks, images, isFirstMessage);
+    dispatchPrompt(prompt);
 }
 
-void ACPSession::dispatchPrompt(const QString &content, const QString &filePath, const QString &selection, const QList<ContextChunk> &contextChunks, const QList<ImageAttachment> &images, bool isFirstMessage)
+void ACPSession::startAssistantMessage()
 {
-    // Create assistant placeholder for streaming — exactly one per dispatched turn.
+    if (!m_currentMessageId.isEmpty()) {
+        if (!m_currentMessageContent.isEmpty() && m_transcript) {
+            Message assistantMsg;
+            assistantMsg.id = m_currentMessageId;
+            assistantMsg.role = QStringLiteral("assistant");
+            assistantMsg.content = m_currentMessageContent;
+            assistantMsg.timestamp = m_currentMessageTimestamp;
+            m_transcript->recordMessage(assistantMsg);
+        }
+        Q_EMIT messageFinished(m_currentMessageId);
+    }
+    // Create assistant placeholder for streaming.
     Message assistantMsg;
     assistantMsg.id = QStringLiteral("msg_%1").arg(++m_messageCounter);
     assistantMsg.role = QStringLiteral("assistant");
@@ -745,8 +775,29 @@ void ACPSession::dispatchPrompt(const QString &content, const QString &filePath,
     m_currentMessageContent.clear();
     m_currentMessageTimestamp = assistantMsg.timestamp;
     Q_EMIT messageAdded(assistantMsg);
+}
 
-    // Build prompt blocks for ACP using proper resource blocks
+void ACPSession::dispatchPrompt(const QueuedPrompt &prompt)
+{
+    // Exactly one assistant placeholder per dispatched turn.
+    startAssistantMessage();
+
+    QJsonObject params;
+    params[QStringLiteral("sessionId")] = m_sessionId;
+    params[QStringLiteral("prompt")] = buildPromptBlocks(prompt);
+
+    m_promptRequestId = m_service->sendRequest(QStringLiteral("session/prompt"), params);
+    qDebug() << "[ACPSession] Sent session/prompt request, id:" << m_promptRequestId;
+}
+
+QJsonArray ACPSession::buildPromptBlocks(const QueuedPrompt &prompt)
+{
+    const QString &content = prompt.content;
+    const QString &filePath = prompt.filePath;
+    const QString &selection = prompt.selection;
+    const QList<ContextChunk> &contextChunks = prompt.contextChunks;
+    const QList<ImageAttachment> &images = prompt.images;
+
     QJsonArray promptBlocks;
 
     // Add file context as embedded resource if available.
@@ -844,9 +895,11 @@ void ACPSession::dispatchPrompt(const QString &content, const QString &filePath,
     QJsonObject textBlock;
     textBlock[QStringLiteral("type")] = QStringLiteral("text");
 
-    // On the first message, inject editor context and tool preferences.
+    // Inject editor context and tool preferences once, with the first
+    // ordinary prompt (a slash command must be sent alone).
     QString messageText = content;
-    if (isFirstMessage) {
+    if (m_editorReminderPending && !isSlashCommand(content)) {
+        m_editorReminderPending = false;
         messageText += QStringLiteral("\n\n<system-reminder>"
             "You are running inside the KDE Kate text editor via the Kate Code plugin. "
             "The files the user has open in Kate are your working context. "
@@ -868,8 +921,7 @@ void ACPSession::dispatchPrompt(const QString &content, const QString &filePath,
     params[QStringLiteral("sessionId")] = m_sessionId;
     params[QStringLiteral("prompt")] = promptBlocks;
 
-    m_promptRequestId = m_service->sendRequest(QStringLiteral("session/prompt"), params);
-    qDebug() << "[ACPSession] Sent session/prompt request, id:" << m_promptRequestId;
+    return promptBlocks;
 }
 
 void ACPSession::onConnected()
@@ -991,73 +1043,6 @@ QString describeACPError(const QJsonObject &error)
 
 void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject &error)
 {
-    // Handle session/load errors specially - we want to fall back to new session
-    if (id == m_sessionLoadRequestId) {
-        handleSessionLoadResponse(id, result, error);
-        return;
-    }
-
-    // Configuration errors are non-fatal: report the failed option and keep
-    // applying any remaining per-provider session settings.
-    if (id == m_sessionConfigRequestId) {
-        handleSessionConfigResponse(result, error);
-        return;
-    }
-
-    // Interactive mode-change response (distinct from the startup config flow).
-    if (id == m_interactiveModeRequestId) {
-        handleInteractiveModeResponse(result, error);
-        return;
-    }
-
-    // Interactive change of another config option (model, effort, ...).
-    if (m_configRequestOption.contains(id)) {
-        handleInteractiveConfigResponse(id, result, error);
-        return;
-    }
-
-    // A prompt cancelled on behalf of requestSummary() has now fully finished
-    // (this is its response), so no further chunks from the old turn can
-    // arrive: it is safe to send the parked summary prompt.
-    if (id == m_summaryAfterPromptId) {
-        m_summaryAfterPromptId = -1;
-        const QString prompt = m_pendingSummaryPrompt;
-        m_pendingSummaryPrompt.clear();
-        sendSummaryPrompt(prompt);
-        return;
-    }
-
-    // Silent summary prompt (requestSummary): resolve it without touching the
-    // chat state, and before the generic error handling below.
-    if (m_setTitleRequestIds.remove(id)) {
-        if (!error.isEmpty()) {
-            Q_EMIT errorOccurred(QStringLiteral("Could not rename the session: %1").arg(describeACPError(error)));
-            return;
-        }
-        // The agent answers with the title as it stored it (sanitised).
-        const QString stored = result[QStringLiteral("title")].toString();
-        if (!stored.isEmpty() && stored != m_title) {
-            m_title = stored;
-            Q_EMIT titleChanged(m_title);
-        }
-        return;
-    }
-
-    if (id == m_summaryRequestId) {
-        const QString collected = m_summaryCollected.trimmed();
-        m_summaryRequestId = -1;
-        m_summaryCollected.clear();
-        if (!error.isEmpty()) {
-            Q_EMIT summaryResult(QString(),
-                                 error[QStringLiteral("message")].toString(QStringLiteral("agent error")));
-        } else if (collected.isEmpty()) {
-            Q_EMIT summaryResult(QString(), QStringLiteral("Agent returned an empty summary"));
-        } else {
-            Q_EMIT summaryResult(collected, QString());
-        }
-        return;
-    }
-
     if (!error.isEmpty()) {
         qWarning() << "[ACPSession] Error response for id" << id << ":" << error;
         Q_EMIT errorOccurred(describeACPError(error));
@@ -1073,7 +1058,7 @@ void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject
             m_promptRequestId = -1;
             if (!m_promptQueue.isEmpty()) {
                 const QueuedPrompt next = m_promptQueue.takeFirst();
-                dispatchPrompt(next.content, next.filePath, next.selection, next.contextChunks, next.images, false);
+                dispatchPrompt(next);
             }
         } else if (id == m_initializeRequestId || id == m_sessionNewRequestId) {
             // Failed session setup would otherwise leave the UI stuck on
@@ -1118,7 +1103,7 @@ void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject
         if (!m_promptQueue.isEmpty()) {
             const QueuedPrompt next = m_promptQueue.takeFirst();
             // Not the first message; the session is already established.
-            dispatchPrompt(next.content, next.filePath, next.selection, next.contextChunks, next.images, false);
+            dispatchPrompt(next);
         }
     }
 }
@@ -1150,6 +1135,7 @@ void ACPSession::handleInitializeResponse(int id, const QJsonObject &result)
              << "image=" << m_supportsImage
              << "embeddedContext=" << m_supportsEmbeddedContext
              << "promptQueueing=" << m_supportsPromptQueueing
+
              << "setTitle=" << m_supportsSetTitle;
 
     // Don't automatically create session - let ChatWidget decide

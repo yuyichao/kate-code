@@ -88,6 +88,9 @@ public:
     bool supportsImage() const { return m_supportsImage; }
     bool supportsEmbeddedContext() const { return m_supportsEmbeddedContext; }
     bool supportsPromptQueueing() const { return m_supportsPromptQueueing; }
+    // A slash command ("/name" or "/name args"): sent alone, exactly as
+    // typed, since agents only recognise a command that is the whole prompt.
+    static bool isSlashCommand(const QString &text);
 
     void cancelPrompt();
 
@@ -169,13 +172,12 @@ private:
     };
 
     // Send the assistant placeholder and session/prompt request.
-    // isFirstMessage controls whether the <system-reminder> is injected.
-    void dispatchPrompt(const QString &content,
-                        const QString &filePath,
-                        const QString &selection,
-                        const QList<ContextChunk> &contextChunks,
-                        const QList<ImageAttachment> &images,
-                        bool isFirstMessage);
+    void dispatchPrompt(const QueuedPrompt &prompt);
+    // The content blocks of a prompt. Takes the pending editor reminder
+    // (unless the prompt is a slash command).
+    QJsonArray buildPromptBlocks(const QueuedPrompt &prompt);
+    // Finish the streaming assistant message (if any) and start a new one.
+    void startAssistantMessage();
 
     // Send the silent summary session/prompt now (requestSummary defers this
     // while a cancelled prompt's response is outstanding).
@@ -292,6 +294,9 @@ private:
     bool m_supportsEmbeddedContext = false;
     bool m_supportsPromptQueueing = false;
     bool m_supportsSetTitle = false;
+    // The editor <system-reminder> goes with the first ordinary prompt (not
+    // with a slash command, which must be sent alone).
+    bool m_editorReminderPending = false;
     QString m_title;
     // In-flight session/set_title requests.
     QSet<int> m_setTitleRequestIds;

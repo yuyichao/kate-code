@@ -734,6 +734,13 @@ void ChatWidget::onMessageSubmitted(const QString &message)
     QString filePath = m_filePathProvider ? m_filePathProvider() : QString();
     QString selection = m_selectionProvider ? m_selectionProvider() : QString();
 
+    // A slash command is sent alone; added context chunks and images stay
+    // for the next message.
+    if (ACPSession::isSlashCommand(message)) {
+        m_session->sendMessage(message);
+        return;
+    }
+
     // Send message with context (including added context chunks and images)
     m_session->sendMessage(message, filePath, selection, m_contextChunks, m_imageAttachments);
 
