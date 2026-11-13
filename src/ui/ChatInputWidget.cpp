@@ -24,10 +24,14 @@
 #include <QMimeDatabase>
 #include <QMimeType>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScrollBar>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QStringListModel>
 #include <QTextCursor>
+
+#include <algorithm>
 #include <QVBoxLayout>
 
 // ============================================================================
@@ -59,9 +63,10 @@ void CommandTextEdit::setCompleter(QCompleter *completer)
             this, &CommandTextEdit::insertCompletion);
 }
 
-void CommandTextEdit::setModels(QAbstractItemModel *commandModel, QAbstractItemModel *fileModel)
+void CommandTextEdit::setModels(QAbstractItemModel *commandModel, QAbstractItemModel *usageModel, QAbstractItemModel *fileModel)
 {
     m_commandModel = commandModel;
+    m_usageModel = usageModel;
     m_fileModel = fileModel;
 }
 
@@ -120,11 +125,26 @@ void CommandTextEdit::keyPressEvent(QKeyEvent *e)
 
     if (ctx.type != None) {
         // Switch completer model based on context type
-        if (ctx.type == Command && m_commandModel) {
-            m_completer->setModel(m_commandModel);
+        // The model sorting must describe the model: with a sorted model
+        // QCompleter finds the matches by binary search.
+        if (ctx.type == Command && ctx.filterText.isEmpty() && m_usageModel) {
+            // A bare "/": most used commands first.
+            if (m_completer->model() != m_usageModel) {
+                m_completer->setModel(m_usageModel);
+            }
+            m_completer->setModelSorting(QCompleter::UnsortedModel);
+            m_completer->setFilterMode(Qt::MatchStartsWith);
+        } else if (ctx.type == Command && m_commandModel) {
+            if (m_completer->model() != m_commandModel) {
+                m_completer->setModel(m_commandModel);
+            }
+            m_completer->setModelSorting(QCompleter::CaseInsensitivelySortedModel);
             m_completer->setFilterMode(Qt::MatchStartsWith);  // Commands match at start
         } else if (ctx.type == File && m_fileModel) {
-            m_completer->setModel(m_fileModel);
+            if (m_completer->model() != m_fileModel) {
+                m_completer->setModel(m_fileModel);
+            }
+            m_completer->setModelSorting(QCompleter::UnsortedModel);
             m_completer->setFilterMode(Qt::MatchContains);  // Files match anywhere (contains)
         } else {
             // No model available for this context
@@ -353,7 +373,7 @@ ChatInputWidget::ChatInputWidget(QWidget *parent)
 
     // Create completer
     m_completer = new QCompleter(this);
-    m_completer->setModelSorting(QCompleter::CaseInsensitivelySortedModel);
+    m_completer->setModelSorting(QCompleter::UnsortedModel);
     m_completer->setCaseSensitivity(Qt::CaseInsensitive);
     m_completer->setFilterMode(Qt::MatchStartsWith);  // Match at start of string
     m_completer->setWrapAround(false);
@@ -476,6 +496,7 @@ void ChatInputWidget::onSendClicked()
 {
     QString message = m_textEdit->toPlainText().trimmed();
     if (!message.isEmpty()) {
+        recordCommandUse(message);
         Q_EMIT messageSubmitted(message);
         m_textEdit->clear();
     }
@@ -557,32 +578,95 @@ void ChatInputWidget::setCurrentMode(const QString &modeId)
     m_modeComboBox->blockSignals(false);
 }
 
+namespace {
+// Use counts of slash commands by name, shared by all chats and agents.
+const QString kCommandUsageGroup = QStringLiteral("CommandUsage");
+
+QSettings commandUsageSettings()
+{
+    return QSettings(QStringLiteral("kate-code"), QStringLiteral("kate-code"));
+}
+}
+
 void ChatInputWidget::setAvailableCommands(const QList<SlashCommand> &commands)
 {
     m_availableCommands = commands;
+    updateCommandModels();
+    qDebug() << "[ChatInputWidget] Loaded" << commands.size() << "slash commands for QCompleter";
+}
 
-    // Build string list with descriptions for display
-    QStringList displayList;
-    for (const SlashCommand &cmd : commands) {
-        // Truncate long descriptions to keep popup compact
+void ChatInputWidget::updateCommandModels()
+{
+    // "commandname - description", description truncated to keep the popup
+    // compact.
+    auto display = [](const SlashCommand &cmd) {
         QString desc = cmd.description;
         if (desc.length() > 50) {
             desc = desc.left(47) + QStringLiteral("...");
         }
-        // Format: "commandname - description"
-        displayList << QStringLiteral("%1 - %2").arg(cmd.name, desc);
+        return QStringLiteral("%1 - %2").arg(cmd.name, desc);
+    };
+
+    // Sorted the way QCompleter compares (case-insensitive), so its binary
+    // search finds every match.
+    QList<SlashCommand> sorted = m_availableCommands;
+    std::sort(sorted.begin(), sorted.end(), [&display](const SlashCommand &a, const SlashCommand &b) {
+        return QString::compare(display(a), display(b), Qt::CaseInsensitive) < 0;
+    });
+    QStringList sortedList;
+    for (const SlashCommand &cmd : std::as_const(sorted)) {
+        sortedList << display(cmd);
     }
 
-    // Create/update command model
-    if (m_commandModel) {
-        delete m_commandModel;
+    // For a bare "/": the most used first, then the rest alphabetically.
+    QSettings settings = commandUsageSettings();
+    settings.beginGroup(kCommandUsageGroup);
+    QHash<QString, int> uses;
+    for (const SlashCommand &cmd : std::as_const(sorted)) {
+        uses.insert(cmd.name, settings.value(cmd.name, 0).toInt());
     }
-    m_commandModel = new QStringListModel(displayList, this);
+    settings.endGroup();
+    QList<SlashCommand> byUse = sorted;
+    std::stable_sort(byUse.begin(), byUse.end(), [&uses](const SlashCommand &a, const SlashCommand &b) {
+        return uses.value(a.name) > uses.value(b.name);
+    });
+    QStringList usageList;
+    for (const SlashCommand &cmd : std::as_const(byUse)) {
+        usageList << display(cmd);
+    }
 
-    // Update models in text edit
-    m_textEdit->setModels(m_commandModel, m_fileModel);
+    // The completer may show one of the old models: point it at the new ones
+    // before they go.
+    QAbstractItemModel *oldCommandModel = m_commandModel;
+    QAbstractItemModel *oldUsageModel = m_usageModel;
+    m_commandModel = new QStringListModel(sortedList, this);
+    m_usageModel = new QStringListModel(usageList, this);
+    m_textEdit->setModels(m_commandModel, m_usageModel, m_fileModel);
+    if (m_completer->model() == oldCommandModel || m_completer->model() == oldUsageModel) {
+        m_completer->popup()->hide();
+        m_completer->setModel(m_commandModel);
+        m_completer->setModelSorting(QCompleter::CaseInsensitivelySortedModel);
+    }
+    delete oldCommandModel;
+    delete oldUsageModel;
+}
 
-    qDebug() << "[ChatInputWidget] Loaded" << commands.size() << "slash commands for QCompleter";
+void ChatInputWidget::recordCommandUse(const QString &message)
+{
+    if (!message.startsWith(QLatin1Char('/'))) {
+        return;
+    }
+    const QString name = message.mid(1).section(QRegularExpression(QStringLiteral("\\s")), 0, 0);
+    const bool known = std::any_of(m_availableCommands.cbegin(), m_availableCommands.cend(),
+                                   [&name](const SlashCommand &cmd) { return cmd.name == name; });
+    if (!known) {
+        return;
+    }
+    QSettings settings = commandUsageSettings();
+    settings.beginGroup(kCommandUsageGroup);
+    settings.setValue(name, settings.value(name, 0).toInt() + 1);
+    settings.endGroup();
+    updateCommandModels();
 }
 
 void ChatInputWidget::setAvailableFiles(const QStringList &files)
@@ -596,7 +680,7 @@ void ChatInputWidget::setAvailableFiles(const QStringList &files)
     m_fileModel = new QStringListModel(files, this);
 
     // Update models in text edit
-    m_textEdit->setModels(m_commandModel, m_fileModel);
+    m_textEdit->setModels(m_commandModel, m_usageModel, m_fileModel);
 
     qDebug() << "[ChatInputWidget] Loaded" << files.size() << "files for @-completion";
 }

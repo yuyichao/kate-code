@@ -25,7 +25,9 @@ class CommandTextEdit : public QTextEdit
 public:
     explicit CommandTextEdit(QWidget *parent = nullptr);
     void setCompleter(QCompleter *completer);
-    void setModels(QAbstractItemModel *commandModel, QAbstractItemModel *fileModel);
+    // commandModel: the commands sorted case-insensitively (for a typed
+    // filter); usageModel: the order shown for a bare "/" (most used first).
+    void setModels(QAbstractItemModel *commandModel, QAbstractItemModel *usageModel, QAbstractItemModel *fileModel);
     QCompleter *completer() const { return m_completer; }
 
 Q_SIGNALS:
@@ -56,6 +58,7 @@ private:
     CompletionContext completionUnderCursor() const;
     QCompleter *m_completer = nullptr;
     QAbstractItemModel *m_commandModel = nullptr;
+    QAbstractItemModel *m_usageModel = nullptr;
     QAbstractItemModel *m_fileModel = nullptr;
 };
 
@@ -124,7 +127,12 @@ private:
 
     // Models for completer (switched based on context)
     QAbstractItemModel *m_commandModel = nullptr;
+    QAbstractItemModel *m_usageModel = nullptr;
     QAbstractItemModel *m_fileModel = nullptr;
+    // Rebuild the command models (after the list or the usage counts change).
+    void updateCommandModels();
+    // Count a use of the slash command the message starts with, if any.
+    void recordCommandUse(const QString &message);
 
     // Session option controls. Buttons are kept per option id and only
     // hidden when the agent stops advertising an option, so a button whose
