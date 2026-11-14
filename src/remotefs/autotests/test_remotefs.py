@@ -12,6 +12,7 @@ nothing below it is mounted any more (the mounts expose files).
 
 import errno
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -301,6 +302,7 @@ def test_listing_and_read():
     check({"sftp", "fish", "smb"} <= set(os.listdir(ROOT)), "root lists the schemes")
     check(os.listdir(os.path.join(ROOT, "sftp")) == [], "no hosts listed before use")
     check(dbus("mountRoot") == ROOT, "DBus mountRoot")
+    check(re.fullmatch(r"\d+\.\d+\.\d+(-[0-9a-f]+)?", dbus("version")) is not None, "DBus version")
     host = os.path.join(ROOT, "sftp", "goodhost")
     with open(os.path.join(host, "data", "sub", "f.txt")) as f:
         check(f.read() == "hello\n", "file read through the mount")

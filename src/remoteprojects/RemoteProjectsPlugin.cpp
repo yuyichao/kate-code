@@ -1,6 +1,7 @@
 #include "RemoteProjectsPlugin.h"
 #include "RemoteProjectsView.h"
 
+#include "BuildVersion.h"
 #include "RemoteLocation.h"
 
 #include <KConfigGroup>
@@ -16,10 +17,15 @@
 #include <QDBusMessage>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
+#include <QDBusReply>
 #include <QDir>
 #include <QFileInfo>
 #include <QPointer>
 #include <QThread>
+#include <QTimer>
+
+#include <climits>
+#include <unistd.h>
 
 #include <memory>
 
@@ -72,7 +78,22 @@ RemoteProjectsPlugin::RemoteProjectsPlugin(QObject *parent, const QVariantList &
 
 QObject *RemoteProjectsPlugin::createView(KTextEditor::MainWindow *mainWindow)
 {
-    return new RemoteProjectsView(this, mainWindow);
+    auto *view = new RemoteProjectsView(this, mainWindow);
+    if (!m_versionWarning.isEmpty()) {
+        // Once per Kate instance, in the first window.
+        QVariantMap message;
+        message[QStringLiteral("text")] = m_versionWarning;
+        message[QStringLiteral("type")] = QStringLiteral("Warning");
+        message[QStringLiteral("category")] = i18n("Remote Projects");
+        m_versionWarning.clear();
+        QPointer<KTextEditor::MainWindow> window(mainWindow);
+        QTimer::singleShot(0, view, [window, message] {
+            if (window) {
+                window->showMessage(message);
+            }
+        });
+    }
+    return view;
 }
 
 void RemoteProjectsPlugin::startDaemon()
@@ -94,8 +115,44 @@ void RemoteProjectsPlugin::startDaemon()
     if (reply.type() == QDBusMessage::ReplyMessage && !reply.arguments().isEmpty()) {
         m_mountRoot = reply.arguments().constFirst().toString();
         m_daemonAvailable = true;
+        checkDaemonVersion();
     } else {
         qWarning() << "[RemoteProjects] kate-remote-fs did not answer:" << reply.errorMessage();
+    }
+}
+
+void RemoteProjectsPlugin::checkDaemonVersion()
+{
+    // A running daemon is not restarted when its package is upgraded: the
+    // old one keeps serving (without newer fixes, e.g. password reuse).
+    auto bus = QDBusConnection::sessionBus();
+    const QString restart = i18n("Restart it with remote projects closed (remote folders are disconnected meanwhile): systemctl --user restart kate-remote-fs");
+    const QDBusReply<uint> pid = bus.interface()->servicePid(DaemonService);
+    if (pid.isValid() && pid.value() > 0) {
+        char target[PATH_MAX];
+        const ssize_t length = readlink(QStringLiteral("/proc/%1/exe").arg(pid.value()).toLocal8Bit().constData(), target, sizeof(target) - 1);
+        if (length > 0 && QByteArray(target, length).endsWith(" (deleted)")) {
+            m_versionWarning = i18n("kate-remote-fs (remote folders) was updated while it was running and still runs the old version. %1", restart);
+            qWarning() << "[RemoteProjects] kate-remote-fs runs a replaced executable:" << QByteArray(target, length);
+            return;
+        }
+    }
+    const QString mine = KateRemote::buildVersion();
+    const QDBusMessage reply = bus.call(daemonCall(QStringLiteral("version")), QDBus::Block, 5000);
+    const QString theirs = reply.type() == QDBusMessage::ReplyMessage && !reply.arguments().isEmpty() ? reply.arguments().constFirst().toString() : QString();
+    if (theirs.isEmpty()) {
+        // No version() yet: from before this check.
+        m_versionWarning = i18n("kate-remote-fs (remote folders) is older than Kate's Remote Projects plugin (version %1): it was left running across an update. %2",
+                                mine,
+                                restart);
+    } else if (theirs != mine) {
+        m_versionWarning = i18n("kate-remote-fs (remote folders) is version %1, but Kate's Remote Projects plugin is version %2: one of them was updated without a restart. %3 Restart Kate too if it was running before the update.",
+                                theirs,
+                                mine,
+                                restart);
+    }
+    if (!m_versionWarning.isEmpty()) {
+        qWarning() << "[RemoteProjects] kate-remote-fs version" << theirs << "differs from" << mine;
     }
 }
 

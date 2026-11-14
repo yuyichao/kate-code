@@ -22,6 +22,10 @@ public:
 
 public Q_SLOTS:
     QString mountRoot() const;
+    // The daemon's build (KateRemote::buildVersion()): the Remote Projects
+    // plugin warns when it differs from its own (left running across an
+    // upgrade).
+    QString version() const;
     // Connected hosts as "<scheme>/<authority>".
     QStringList mounts() const;
     // Why the last connection attempt to the host failed (empty if it did not).

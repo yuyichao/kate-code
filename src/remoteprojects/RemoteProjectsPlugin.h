@@ -66,11 +66,15 @@ Q_SIGNALS:
 
 private:
     void startDaemon();
+    // Sets m_versionWarning when the running daemon is not this build.
+    void checkDaemonVersion();
     void loadRecent();
     void saveRecent();
 
     bool m_daemonAvailable = false;
     QString m_mountRoot;
+    // Shown once, in the first window.
+    QString m_versionWarning;
     QList<QUrl> m_recent;
     // Remote projects of the session (as last read) and those of them not
     // reopened yet (host unreachable at startup): kept in the session so

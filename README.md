@@ -310,6 +310,12 @@ Start it with the user service (or let DBus start it on first use):
 systemctl --user enable --now kate-remote-fs
 ```
 
+Upgrading the package does not restart a running service, which then keeps
+the old version: restart it (`systemctl --user restart kate-remote-fs`, with
+remote projects closed; remote folders are disconnected meanwhile). The
+Remote Projects plugin warns at Kate's start when the running service is not
+the plugin's version (DBus `version`) or runs a replaced executable.
+
 Settings live in `~/.config/kate-remoterc` (restart the service after
 changing them):
 ```ini

@@ -1,5 +1,7 @@
 #include "RemoteFsService.h"
 
+#include "BuildVersion.h"
+
 #include "RemoteFs.h"
 
 RemoteFsService::RemoteFsService(RemoteFs *fs, QObject *parent)
@@ -21,6 +23,11 @@ QString RemoteFsService::objectPath()
 QString RemoteFsService::mountRoot() const
 {
     return m_fs->config().mountRoot;
+}
+
+QString RemoteFsService::version() const
+{
+    return KateRemote::buildVersion();
 }
 
 QStringList RemoteFsService::mounts() const
