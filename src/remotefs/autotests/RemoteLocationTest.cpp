@@ -1,7 +1,9 @@
 #include "RemoteLocation.h"
 
 #include <QDir>
+#include <QProcess>
 #include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QTest>
 
 using namespace KateRemote;
@@ -195,6 +197,80 @@ private Q_SLOTS:
         QCOMPARE(parsed.has_value(), url.length() > 0);
         if (parsed) {
             QCOMPARE(*parsed, QUrl(url));
+        }
+    }
+
+    void sshTerminal_data()
+    {
+        QTest::addColumn<QString>("scheme");
+        QTest::addColumn<QString>("authority");
+        QTest::addColumn<QString>("path");
+        QTest::addColumn<QStringList>("expected"); // after "ssh -t", empty: refused
+
+        const auto l = [](std::initializer_list<const char *> items) {
+            QStringList list;
+            for (const char *item : items) {
+                list << QString::fromUtf8(item);
+            }
+            return list;
+        };
+        const char *cd = "cd '/home/u/proj'; exec \"$SHELL\" -l";
+        QTest::newRow("sftp") << "sftp" << "host" << "/home/u/proj" << l({"--", "host", cd});
+        QTest::newRow("fish") << "fish" << "host" << "/home/u/proj" << l({"--", "host", cd});
+        QTest::newRow("user and port") << "sftp" << "alice@host:2222" << "/home/u/proj" << l({"-l", "alice", "-p", "2222", "--", "host", cd});
+        QTest::newRow("ipv6") << "sftp" << "bob@[::1]:22" << "/home/u/proj" << l({"-l", "bob", "-p", "22", "--", "::1", cd});
+        QTest::newRow("quoting") << "sftp" << "host" << "/a b/it's/$x`y`"
+                                 << l({"--", "host", "cd '/a b/it'\\''s/$x`y`'; exec \"$SHELL\" -l"});
+        QTest::newRow("smb") << "smb" << "host" << "/share" << QStringList{};
+        QTest::newRow("fish domain user") << "fish" << "DOM;alice@host" << "/x" << QStringList{};
+        QTest::newRow("option-like host") << "sftp" << "-oProxyCommand=x" << "/x" << QStringList{};
+        QTest::newRow("relative path") << "sftp" << "host" << "x" << QStringList{};
+    }
+
+    void sshTerminal()
+    {
+        QFETCH(QString, scheme);
+        QFETCH(QString, authority);
+        QFETCH(QString, path);
+        QFETCH(QStringList, expected);
+        const QStringList ssh{QStringLiteral("ssh"), QStringLiteral("-F"), QStringLiteral("/cfg")};
+        const QStringList command = sshTerminalCommand(Location{scheme, authority, path}, ssh);
+        if (expected.isEmpty()) {
+            QVERIFY(command.isEmpty());
+        } else {
+            QCOMPARE(command, ssh + QStringList{QStringLiteral("-t")} + expected);
+        }
+    }
+
+    // The remote command as the remote login shell would run it: it reaches
+    // the directory (whatever its name) and execs $SHELL.
+    void sshTerminalRemoteCommand()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString target = dir.path() + QStringLiteral("/a b/it's $HOME `x` \\n");
+        QVERIFY(QDir().mkpath(target));
+        const QString shell = dir.path() + QStringLiteral("/shell");
+        {
+            QFile script(shell);
+            QVERIFY(script.open(QIODevice::WriteOnly));
+            script.write("#!/bin/sh\necho \"$1\"; pwd\n");
+            script.setPermissions(script.permissions() | QFile::ExeOwner);
+        }
+        const QString remote = sshTerminalCommand(Location{QStringLiteral("sftp"), QStringLiteral("h"), target}, {QStringLiteral("ssh")}).last();
+        // ssh runs it as "<login shell> -c <command>".
+        for (const QString &loginShell : {QStringLiteral("sh"), QStringLiteral("bash"), QStringLiteral("zsh")}) {
+            const QString program = QStandardPaths::findExecutable(loginShell);
+            if (program.isEmpty()) {
+                continue;
+            }
+            QProcess process;
+            QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+            env.insert(QStringLiteral("SHELL"), shell);
+            process.setProcessEnvironment(env);
+            process.start(program, {QStringLiteral("-c"), remote});
+            QVERIFY(process.waitForFinished());
+            QCOMPARE(QString::fromLocal8Bit(process.readAllStandardOutput()), QStringLiteral("-l\n") + target + QLatin1Char('\n'));
         }
     }
 

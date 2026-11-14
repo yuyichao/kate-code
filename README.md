@@ -268,6 +268,19 @@ username typed into KIO's login dialog becomes the user of the opened folder
 KWallet disabled; not yet with the installed systemd unit at login, KWallet,
 or a real password-only host.)
 
+**Remote Terminal** (a tab in the bottom panel, next to Kate's **Terminal**,
+appearing once a remote folder on an ssh host, `sftp://` or `fish://`, has
+been active in the window): showing the tab opens a shell on that computer, in the folder (`ssh -t host 'cd <path>; exec
+"$SHELL" -l'`, with `SshCommand`, see below), in Konsole's terminal part
+(needs Konsole installed). The folder is the active project's, or the active
+document's when the project is not remote. Each remote folder keeps its own
+shell; switching projects shows the current one's (and starts it while the
+tab is shown). When the connection fails or drops, ssh's message stays and
+Enter reconnects (Ctrl+D closes); when the remote shell exits, the tab hides,
+and showing it again starts a new shell. The shell has its own ssh login:
+password-only hosts ask for the password in the terminal. Windows hosts are
+not supported yet (the command needs a POSIX-like login shell).
+
 ### kate-remote-fs
 
 `kate-remote-fs` is a small FUSE daemon (built when libfuse 3.12+ is found)

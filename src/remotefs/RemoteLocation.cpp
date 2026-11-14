@@ -4,6 +4,7 @@
 #include <KConfigGroup>
 
 #include <QDir>
+#include <QProcess>
 #include <QRegularExpression>
 
 #include <vector>
@@ -255,6 +256,49 @@ std::optional<Location> locationForUrl(const QUrl &url)
         location.path.prepend(QLatin1Char('/'));
     }
     return location;
+}
+
+bool isSshScheme(const QString &scheme)
+{
+    return scheme == QLatin1String("sftp") || (scheme == QLatin1String("fish") && isKioScheme(scheme));
+}
+
+QStringList configuredSshCommand()
+{
+    KConfig config(configFileName(), KConfig::SimpleConfig);
+    const QStringList command = QProcess::splitCommand(KConfigGroup(&config, QStringLiteral("General")).readEntry("SshCommand", QStringLiteral("ssh")));
+    return command.isEmpty() ? QStringList{QStringLiteral("ssh")} : command;
+}
+
+QString shellQuote(const QString &text)
+{
+    QString quoted = text;
+    quoted.replace(QLatin1Char('\''), QLatin1String("'\\''"));
+    return QLatin1Char('\'') + quoted + QLatin1Char('\'');
+}
+
+QStringList sshTerminalCommand(const Location &location, const QStringList &ssh)
+{
+    if (!isSshScheme(location.scheme) || ssh.isEmpty() || !location.path.startsWith(QLatin1Char('/'))) {
+        return {};
+    }
+    // Strict: a fish "DOMAIN;user" is no ssh user.
+    const auto target = parseSshAuthority(location.authority);
+    if (!target) {
+        return {};
+    }
+    QStringList command = ssh;
+    command << QStringLiteral("-t");
+    if (!target->user.isEmpty()) {
+        command << QStringLiteral("-l") << target->user;
+    }
+    if (target->port > 0) {
+        command << QStringLiteral("-p") << QString::number(target->port);
+    }
+    // ssh joins the remote command and hands it to the user's login shell;
+    // ';' (not '&&') so a missing directory still gives a shell.
+    command << QStringLiteral("--") << target->host << QStringLiteral("cd %1; exec \"$SHELL\" -l").arg(shellQuote(location.path));
+    return command;
 }
 
 std::optional<QUrl> urlForInput(const QString &text, const QString &mountRoot, InputError *error)

@@ -1,5 +1,6 @@
 #include "RemoteProjectsView.h"
 #include "RemoteProjectsPlugin.h"
+#include "RemoteTerminal.h"
 
 #include "RemoteLocation.h"
 
@@ -9,14 +10,18 @@
 #include <KActionCollection>
 #include <KActionMenu>
 #include <KLocalizedString>
+#include <KTextEditor/Document>
 #include <KTextEditor/MainWindow>
+#include <KTextEditor/View>
 #include <KXMLGUIFactory>
 
 #include <QDir>
+#include <QFileInfo>
 #include <QFileDialog>
 #include <QMenu>
 #include <QMessageBox>
 #include <QThread>
+#include <QVBoxLayout>
 
 #include <memory>
 
@@ -39,10 +44,104 @@ RemoteProjectsView::RemoteProjectsView(RemoteProjectsPlugin *plugin, KTextEditor
     rebuildRecentMenu();
 
     m_mainWindow->guiFactory()->addClient(this);
+
+    // The Remote Terminal tab appears once a remote folder on an ssh host
+    // is active in this window.
+    connect(m_mainWindow, &KTextEditor::MainWindow::viewChanged, this, &RemoteProjectsView::updateTerminalLocation);
+    connect(m_mainWindow, &KTextEditor::MainWindow::pluginViewCreated, this, [this](const QString &name, QObject *view) {
+        if (name == QLatin1String("kateprojectplugin")) {
+            watchProjectView(view);
+            updateTerminalLocation();
+        }
+    });
+    watchProjectView(m_mainWindow->pluginView(QStringLiteral("kateprojectplugin")));
+    updateTerminalLocation();
+}
+
+void RemoteProjectsView::createTerminalToolView()
+{
+    // Next to Kate's terminal: a shell on the current remote folder's host.
+    m_terminalToolView = m_mainWindow->createToolView(m_plugin,
+                                                      QStringLiteral("kateremoteterminal"),
+                                                      KTextEditor::MainWindow::Bottom,
+                                                      QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+                                                      i18n("Remote Terminal"));
+    if (!m_terminalToolView) {
+        return;
+    }
+    m_terminalPanel = new RemoteTerminalPanel(m_terminalToolView);
+    auto *layout = qobject_cast<QBoxLayout *>(m_terminalToolView->layout());
+    if (!layout) {
+        layout = new QVBoxLayout(m_terminalToolView);
+        layout->setContentsMargins(0, 0, 0, 0);
+    }
+    if (layout->indexOf(m_terminalPanel) < 0) {
+        layout->addWidget(m_terminalPanel);
+    }
+    m_terminalToolView->setFocusProxy(m_terminalPanel);
+    // Like Kate's terminal: the panel hides when its shell ends.
+    connect(m_terminalPanel, &RemoteTerminalPanel::currentEnded, this, [this] {
+        if (m_mainWindow && m_terminalToolView) {
+            m_mainWindow->hideToolView(m_terminalToolView);
+        }
+    });
+}
+
+void RemoteProjectsView::watchProjectView(QObject *projectView)
+{
+    if (!projectView) {
+        return;
+    }
+    // The project plugin's view has no public header: by name.
+    // projectFileNameChanged: another project became the current one.
+    for (const char *signal : {SIGNAL(projectFileNameChanged()), SIGNAL(projectMapChanged())}) {
+        if (projectView->metaObject()->indexOfSignal(QMetaObject::normalizedSignature(signal + 1).constData()) >= 0) {
+            connect(projectView, signal, this, SLOT(updateTerminalLocation()), Qt::UniqueConnection);
+        }
+    }
+}
+
+std::optional<KateRemote::Location> RemoteProjectsView::currentSshLocation() const
+{
+    if (!m_mainWindow) {
+        return std::nullopt;
+    }
+    const QString mountRoot = m_plugin->mountRoot();
+    const auto sshLocation = [&mountRoot](const QString &path) -> std::optional<KateRemote::Location> {
+        if (path.isEmpty()) {
+            return std::nullopt;
+        }
+        auto location = KateRemote::locationForPath(path, mountRoot);
+        if (!location || !KateRemote::isSshScheme(location->scheme)) {
+            return std::nullopt;
+        }
+        return location;
+    };
+    QObject *projectView = m_mainWindow->pluginView(QStringLiteral("kateprojectplugin"));
+    if (auto location = sshLocation(projectView ? projectView->property("projectBaseDir").toString() : QString())) {
+        return location;
+    }
+    KTextEditor::View *view = m_mainWindow->activeView();
+    const QUrl url = view ? view->document()->url() : QUrl();
+    return url.isLocalFile() ? sshLocation(QFileInfo(url.toLocalFile()).absolutePath()) : std::nullopt;
+}
+
+void RemoteProjectsView::updateTerminalLocation()
+{
+    const auto location = currentSshLocation();
+    if (!m_terminalToolView && location) {
+        createTerminalToolView();
+    }
+    if (m_terminalPanel) {
+        m_terminalPanel->setLocation(location);
+    }
 }
 
 RemoteProjectsView::~RemoteProjectsView()
 {
+    // Tool views belong to the main window: unloading the plugin ends the
+    // terminals too.
+    delete m_terminalToolView.data();
     if (m_mainWindow && m_mainWindow->guiFactory()) {
         m_mainWindow->guiFactory()->removeClient(this);
     }

@@ -4,6 +4,7 @@ qt_add_resources(kateremoteprojects_RESOURCES kateremoteprojects.qrc)
 add_library(kateremoteprojects MODULE
     RemoteProjectsPlugin.cpp
     RemoteProjectsView.cpp
+    RemoteTerminal.cpp
     ${kateremoteprojects_RESOURCES}
 )
 
@@ -15,6 +16,7 @@ target_link_libraries(kateremoteprojects
     KF6::XmlGui
     KF6::ConfigCore
     KF6::KIOCore
+    KF6::Parts
     Qt6::Widgets
     Qt6::DBus
 )

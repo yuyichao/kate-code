@@ -92,6 +92,24 @@ QString pathForLocation(const Location &location, const QString &mountRoot);
 // authority valid.
 std::optional<Location> locationForUrl(const QUrl &url);
 
+// Schemes whose hosts are ssh servers: sftp and fish (KIO's shell over ssh).
+bool isSshScheme(const QString &scheme);
+
+// The ssh command: [General] SshCommand in kate-remoterc (default "ssh";
+// split like a shell command line, may hold options).
+QStringList configuredSshCommand();
+
+// The command line (program first) of an interactive login shell in
+// location's directory on its host, through `ssh`: for sftp and fish
+// locations whose host ssh accepts (parseSshAuthority()), else empty.
+// The remote command is for a POSIX-like login shell (tested with sh, bash
+// and zsh): it changes to the directory (a missing one leaves the home
+// directory) and execs "$SHELL" -l.
+QStringList sshTerminalCommand(const Location &location, const QStringList &ssh);
+
+// 'text' quoted for a POSIX shell.
+QString shellQuote(const QString &text);
+
 enum class InputError {
     None,
     Empty,
