@@ -2,6 +2,7 @@
 
 #include <QDir>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTest>
@@ -239,6 +240,60 @@ private Q_SLOTS:
             QVERIFY(command.isEmpty());
         } else {
             QCOMPARE(command, ssh + QStringList{QStringLiteral("-t")} + expected);
+        }
+    }
+
+    void windowsPaths_data()
+    {
+        QTest::addColumn<QString>("path");
+        QTest::addColumn<QString>("expected");
+        QTest::newRow("folder") << "/C:/Users/me/proj" << "C:\\Users\\me\\proj";
+        QTest::newRow("drive root") << "/d:" << "D:\\";
+        QTest::newRow("posix") << "/home/me" << "";
+        QTest::newRow("no drive") << "/C/Users" << "";
+        QTest::newRow("long name") << "/CD:/x" << "";
+    }
+
+    void windowsPaths()
+    {
+        QFETCH(QString, path);
+        QFETCH(QString, expected);
+        QCOMPARE(windowsPathForSftpPath(path), expected);
+    }
+
+    void windowsTerminal_data()
+    {
+        QTest::addColumn<QString>("path");
+        QTest::addColumn<QString>("script"); // PowerShell, before encoding
+        QTest::newRow("folder") << "/C:/Users/me/proj" << "Set-Location -LiteralPath 'C:\\Users\\me\\proj'";
+        QTest::newRow("quote, dollar, non-ASCII") << "/E:/it's $x/\u00e9t\u00e9" << "Set-Location -LiteralPath 'E:\\it''s $x\\\u00e9t\u00e9'";
+    }
+
+    // Windows hosts: PowerShell in the folder, the script base64-encoded
+    // (UTF-16LE) so that neither cmd nor PowerShell (the server's default
+    // shell) changes it.
+    void windowsTerminal()
+    {
+        QFETCH(QString, path);
+        QFETCH(QString, script);
+        const QStringList command = sshTerminalCommand(Location{QStringLiteral("sftp"), QStringLiteral("me@win"), path}, {QStringLiteral("ssh")});
+        QCOMPARE(command.mid(0, 5), (QStringList{QStringLiteral("ssh"), QStringLiteral("-t"), QStringLiteral("-l"), QStringLiteral("me"), QStringLiteral("--")}));
+        QCOMPARE(command.size(), 7);
+        QCOMPARE(command.at(5), QStringLiteral("win"));
+        const QString prefix = QStringLiteral("powershell -NoLogo -NoExit -EncodedCommand ");
+        QVERIFY(command.at(6).startsWith(prefix));
+        const QString encoded = command.at(6).mid(prefix.size());
+        QVERIFY(QRegularExpression(QStringLiteral("^[A-Za-z0-9+/=]+$")).match(encoded).hasMatch());
+        const QByteArray utf16 = QByteArray::fromBase64(encoded.toLatin1());
+        QCOMPARE(utf16.size() % 2, 0);
+        QString decoded;
+        for (qsizetype i = 0; i < utf16.size(); i += 2) {
+            decoded += QChar(char16_t(uchar(utf16.at(i)) | (uchar(utf16.at(i + 1)) << 8)));
+        }
+        QCOMPARE(decoded, script);
+        if (path == QLatin1String("/C:/Users/me/proj")) {
+            // Python: base64.b64encode(script.encode("utf-16-le"))
+            QCOMPARE(encoded, QStringLiteral("UwBlAHQALQBMAG8AYwBhAHQAaQBvAG4AIAAtAEwAaQB0AGUAcgBhAGwAUABhAHQAaAAgACcAQwA6AFwAVQBzAGUAcgBzAFwAbQBlAFwAcAByAG8AagAnAA=="));
         }
     }
 

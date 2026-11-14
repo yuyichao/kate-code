@@ -104,8 +104,15 @@ QStringList configuredSshCommand();
 // locations whose host ssh accepts (parseSshAuthority()), else empty.
 // The remote command is for a POSIX-like login shell (tested with sh, bash
 // and zsh): it changes to the directory (a missing one leaves the home
-// directory) and execs "$SHELL" -l.
+// directory) and execs "$SHELL" -l. On a Windows host (a drive path, see
+// windowsPathForSftpPath()) it starts PowerShell in the folder instead,
+// whether the server's default shell is cmd or PowerShell.
 QStringList sshTerminalCommand(const Location &location, const QStringList &ssh);
+
+// Windows' OpenSSH sftp server shows drives as "/C:/...": the Windows path
+// of such a path ("/C:/Users/me" -> "C:\Users\me", "/d:" -> "D:\"), empty
+// for any other path.
+QString windowsPathForSftpPath(const QString &path);
 
 // 'text' quoted for a POSIX shell.
 QString shellQuote(const QString &text);

@@ -295,10 +295,38 @@ QStringList sshTerminalCommand(const Location &location, const QStringList &ssh)
     if (target->port > 0) {
         command << QStringLiteral("-p") << QString::number(target->port);
     }
+    command << QStringLiteral("--") << target->host;
+    const QString windowsPath = windowsPathForSftpPath(location.path);
+    if (!windowsPath.isEmpty()) {
+        // Windows' sshd runs the command with its default shell, cmd or
+        // PowerShell (cmd /c ..., powershell -c ...): start PowerShell in
+        // the folder. The script is base64 (UTF-16LE), which neither shell
+        // changes; -NoExit keeps the session after it.
+        const QString script = QStringLiteral("Set-Location -LiteralPath '%1'").arg(QString(windowsPath).replace(QLatin1Char('\''), QLatin1String("''")));
+        QByteArray utf16;
+        for (const QChar c : script) {
+            utf16.append(char(c.unicode() & 0xff));
+            utf16.append(char(c.unicode() >> 8));
+        }
+        command << QStringLiteral("powershell -NoLogo -NoExit -EncodedCommand %1").arg(QString::fromLatin1(utf16.toBase64()));
+        return command;
+    }
     // ssh joins the remote command and hands it to the user's login shell;
     // ';' (not '&&') so a missing directory still gives a shell.
-    command << QStringLiteral("--") << target->host << QStringLiteral("cd %1; exec \"$SHELL\" -l").arg(shellQuote(location.path));
+    command << QStringLiteral("cd %1; exec \"$SHELL\" -l").arg(shellQuote(location.path));
     return command;
+}
+
+QString windowsPathForSftpPath(const QString &path)
+{
+    static const QRegularExpression drive(QStringLiteral("^/([A-Za-z]:)(/.*)?$"));
+    const auto match = drive.match(path);
+    if (!match.hasMatch()) {
+        return {};
+    }
+    QString rest = match.captured(2);
+    rest.replace(QLatin1Char('/'), QLatin1Char('\\'));
+    return match.captured(1).toUpper() + (rest.isEmpty() ? QStringLiteral("\\") : rest);
 }
 
 std::optional<QUrl> urlForInput(const QString &text, const QString &mountRoot, InputError *error)

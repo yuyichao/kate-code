@@ -278,8 +278,10 @@ shell; switching projects shows the current one's (and starts it while the
 tab is shown). When the connection fails or drops, ssh's message stays and
 Enter reconnects (Ctrl+D closes); when the remote shell exits, the tab hides,
 and showing it again starts a new shell. The shell has its own ssh login:
-password-only hosts ask for the password in the terminal. Windows hosts are
-not supported yet (the command needs a POSIX-like login shell).
+password-only hosts ask for the password in the terminal. On Windows hosts
+(OpenSSH for Windows; recognised by their sftp paths, `sftp://host/C:/…`)
+the tab starts PowerShell in the folder, whichever shell (cmd or PowerShell)
+the server runs commands with.
 
 ### kate-remote-fs
 
