@@ -102,6 +102,47 @@ private Q_SLOTS:
         QCOMPARE(locationForUrl(QUrl(QStringLiteral("sftp://[fe80::1]:22/x")))->authority, QStringLiteral("[fe80::1]:22"));
     }
 
+    void userInput_data()
+    {
+        QTest::addColumn<QString>("input");
+        QTest::addColumn<QString>("url");
+        QTest::addColumn<int>("error");
+        using E = InputError;
+        const QString root = QDir::homePath() + QStringLiteral("/.kate-remote");
+        QTest::newRow("url") << "sftp://host/srv/app" << "sftp://host/srv/app" << int(E::None);
+        QTest::newRow("url user port") << " sftp://me@host:2222/a/ " << "sftp://me@host:2222/a" << int(E::None);
+        QTest::newRow("scp") << "host:/srv/app" << "sftp://host/srv/app" << int(E::None);
+        QTest::newRow("scp user") << "me@host:/a/b" << "sftp://me@host/a/b" << int(E::None);
+        QTest::newRow("mount path") << QString(root + QStringLiteral("/sftp/host/srv")) << "sftp://host/srv" << int(E::None);
+        QTest::newRow("mount path tilde") << "~/.kate-remote/sftp/host/srv" << "sftp://host/srv" << int(E::None);
+        QTest::newRow("empty") << "  " << "" << int(E::Empty);
+        QTest::newRow("local") << "/etc" << "" << int(E::LocalPath);
+        QTest::newRow("no colon") << "host" << "" << int(E::Syntax);
+        QTest::newRow("relative") << "host:proj" << "" << int(E::RelativePath);
+        QTest::newRow("smb") << "smb://host/share" << "" << int(E::Unsupported);
+        QTest::newRow("bad host") << "-oProxyCommand=x:/a" << "" << int(E::Unsupported);
+        QTest::newRow("url root") << "sftp://host" << "" << int(E::RemoteRoot);
+        QTest::newRow("url slash") << "sftp://host/" << "" << int(E::RemoteRoot);
+        QTest::newRow("scp empty") << "host:" << "" << int(E::RemoteRoot);
+        QTest::newRow("scp root") << "host:/" << "" << int(E::RemoteRoot);
+        QTest::newRow("scp dotdot") << "host:/a/.." << "" << int(E::RemoteRoot);
+        QTest::newRow("mount host dir") << QString(root + QStringLiteral("/sftp/host")) << "" << int(E::RemoteRoot);
+    }
+
+    void userInput()
+    {
+        QFETCH(QString, input);
+        QFETCH(QString, url);
+        QFETCH(int, error);
+        InputError result;
+        const auto parsed = urlForInput(input, QDir::homePath() + QStringLiteral("/.kate-remote"), &result);
+        QCOMPARE(int(result), error);
+        QCOMPARE(parsed.has_value(), url.length() > 0);
+        if (parsed) {
+            QCOMPARE(*parsed, QUrl(url));
+        }
+    }
+
     void symlinkTargets_data()
     {
         QTest::addColumn<QString>("linkDir");

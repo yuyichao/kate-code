@@ -1,0 +1,9 @@
+<!DOCTYPE gui SYSTEM "kpartgui.dtd">
+<gui name="kateremoteprojects" library="kateremoteprojects" version="1">
+  <MenuBar>
+    <Menu name="file">
+      <Action name="remote_projects_open" group="open_merge"/>
+      <Action name="remote_projects_open_recent" group="open_merge"/>
+    </Menu>
+  </MenuBar>
+</gui>

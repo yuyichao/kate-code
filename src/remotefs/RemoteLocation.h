@@ -74,6 +74,20 @@ QString pathForLocation(const Location &location, const QString &mountRoot);
 // authority valid.
 std::optional<Location> locationForUrl(const QUrl &url);
 
+enum class InputError {
+    None,
+    Empty,
+    LocalPath, // a local path that is not below the mount root
+    Syntax,
+    RelativePath, // host:path without a leading '/'
+    Unsupported, // not sftp, or an invalid host
+    RemoteRoot, // the remote "/": as a project it would index the whole file system
+};
+
+// A remote folder as typed by the user: "sftp://host/path",
+// "[user@]host:/path" or a local path below the mount root.
+std::optional<QUrl> urlForInput(const QString &text, const QString &mountRoot, InputError *error);
+
 /**
  * The target to report for a remote symlink so that following it under the
  * host directory reaches what it reaches on the remote, and never anything

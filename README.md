@@ -139,7 +139,7 @@ The plugin will be installed to:
 1. Restart Kate completely (close all windows)
 2. Open Kate
 3. Go to **Settings** → **Configure Kate** → **Plugins**
-4. Find and enable **Kate Code**
+4. Find and enable **Kate Code** (and **Remote Projects** for remote folders, see below)
 5. Click **OK**
 
 ## Usage
@@ -239,6 +239,33 @@ Each provider's logo is shown on its chat tabs, in the provider dropdown and in 
 The plugin automatically adapts to your KDE color scheme by reading `~/.config/kdeglobals`. If you change your KDE theme, restart Kate to pick up the new colors.
 
 ## Remote Folders (kate-remote-fs, experimental)
+
+### Remote Projects plugin
+
+Enable **Remote Projects** (and Kate's **Project** plugin) in Kate's plugin
+settings. **File → Open Remote Folder…** shows KDE's folder dialog in its
+Network view (`remote:/`): open a network folder (add one there for hosts
+you use often) or type `sftp://host/` in the location bar, and browse to the
+folder (the dialog browses through KIO; the chosen folder is then opened
+through `kate-remote-fs`, as a project). **File → Open Recent Remote Folder** lists
+the folders opened before. The folder is opened through
+`kate-remote-fs` below, at its local path (e.g.
+`~/.kate-remote/sftp/host/path`), so Kate's own features (search, git,
+terminal, Kate Code) work on it. The whole remote file system (`host:/`)
+cannot be opened as a project: Kate would list every file on it.
+
+Kate's session restore brings remote projects and files back: the plugin
+starts `kate-remote-fs` before Kate restores the session's files and reopens
+remote projects that could not be restored before it ran. If a host cannot
+be reached when Kate starts, its projects stay in the session and come back
+at the next start where it is reachable (its files open empty meanwhile), and
+the start may wait once for the ssh connect timeout. A host that could not be
+connected to when opening a folder is not remembered. Browsing in the dialog
+uses KIO's own sftp connection, so a host that asks for a password asks
+again when the folder is opened. (Tested with the daemon started through
+DBus activation; not yet with the installed systemd unit at login.)
+
+### kate-remote-fs
 
 `kate-remote-fs` is a small FUSE daemon (built when libfuse 3.12+ is found)
 that makes remote folders available at stable local paths that mirror their

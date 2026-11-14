@@ -1,6 +1,7 @@
 add_definitions(-DTRANSLATION_DOMAIN=\"katecode\")
 
 add_subdirectory(remotefs)
+add_subdirectory(remoteprojects)
 
 set(katecode_SRCS
     # Plugin layer

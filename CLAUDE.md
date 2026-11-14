@@ -38,6 +38,7 @@ Settings > Configure Kate > Plugins > Enable "Kate Code"
 - `src/remotefs/RemoteLocation.{h,cpp}` - Static lib `kateremotelocation`: remote URL <-> `<MountRoot>/<scheme>/<authority>/<path>` mapping, ssh authority validation, symlink target rewriting; shared by kate-remote-fs and the plugins
 - `src/remotefs/daemon/` - `kate-remote-fs` FUSE daemon (libfuse3 high-level API) with DBus interface `org.kde.KateRemoteFS`; systemd user unit + DBus activation file
 - `src/remotefs/autotests/` - QtTest unit test and `test_remotefs.py` integration test (ctest; runs under `dbus-run-session`, sandboxed `sftp-server` via bwrap as the remote)
+- `src/remoteprojects/` - "Remote Projects" Kate plugin (`kateremoteprojects`): File > Open Remote Folder… (KDE's folder dialog via `QFileDialog::getExistingDirectoryUrl`, starting at `remote:/` (network folders), schemes sftp/remote/file; KIO browses, the result is handled here: a `remote:` link is resolved with `KIO::stat` → `UDS_TARGET_URL`) / Open Recent Remote Folder, opens `<MountRoot>/<scheme>/<authority>/<path>` as a project via the project plugin view's `openDirectoryOrProject(QDir)` slot
 - `src/mcp/MCPServer.{h,cpp}` - MCP protocol handler (initialize, tools/list, tools/call)
 - `src/mcp/main.cpp` - MCP server entry point (stdio JSON-RPC loop)
 - `src/ui/ChatWidget.{h,cpp}` - Main chat interface with ACP integration (one per editor tab)
@@ -87,6 +88,14 @@ Settings > Configure Kate > Plugins > Enable "Kate Code"
 - Helpers run without our fds (FUSE device, root fds: `CloseFileDescriptors`), with signals unblocked (the daemon blocks SIGTERM/INT/HUP for its signalfd) and in a new session (ssh asks through `SSH_ASKPASS`)
 - Only ever unmount (`fusermount3 -u`) and `rmdir` backend dirs, never delete recursively: the mounts expose remote (and in tests local) files
 - Qt logs to journald when stderr is not a terminal; tests set `QT_FORCE_STDERR_LOGGING=1`
+
+### Remote Projects plugin
+- Kate loads plugins (constructor, then `readSessionConfig`) before restoring the session's documents (`KateSessionManager::loadSession`), so the plugin's constructor makes sure kate-remote-fs runs (blocking DBus call, which activates it; the daemon takes its name only once mounted). It only blocks when the daemon is running or activatable
+- The project plugin (load order −800) restores session projects before this plugin loads and drops those whose directory does not exist yet. The plugin saves the open remote projects (project view property `allProjects`) in its own session group and reopens them with the project plugin's invokable `projectForDir(QDir, bool)` (checking the path in a background thread)
+- Session projects whose host is unreachable at startup stay pending (`m_pendingProjects`) and are written to the session again, so an offline start does not forget them; with no project view at save time the last read list is kept
+- Opening: the dialog's URL (sftp://, or a local path below the mount root) → `KateRemote::urlForInput()` (unit-tested; refuses the remote root, which Kate would index recursively as a non-VCS project; on refusal a warning box and the dialog again) → `hosts` → `addHost` → background `QFileInfo::isDir()` (connects) → `openDirectoryOrProject(QDir)`; on failure `lastError` is shown (Output view) and a host registered only for that attempt is removed again
+- Recent remote folders are URLs in `katerc` `[Remote Projects] Recent` (Kate's own recents hold the local paths)
+- Testing in a real Kate: KTextEditor does not save documents below `QDir::tempPath()` in sessions, so a harness in /tmp must set `TMPDIR` elsewhere; `Application::openUrl()` opens a document without a view (not saved in the session), use `MainWindow::openUrl()`. Offscreen Kate shows Qt's own file dialog; `QT_QPA_PLATFORMTHEME=kde` gives KDE's (`KDEPlatformFileDialog`, drive its `KFileWidget`: `setUrl()`, `slotOk()`), with a hidden `QFileDialog` behind it
 
 ### ACP Protocol
 - JSON-RPC 2.0 over stdin/stdout with newline-delimited JSON

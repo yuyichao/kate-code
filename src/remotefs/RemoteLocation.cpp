@@ -176,6 +176,54 @@ std::optional<Location> locationForUrl(const QUrl &url)
     return location;
 }
 
+std::optional<QUrl> urlForInput(const QString &text, const QString &mountRoot, InputError *error)
+{
+    const auto fail = [error](InputError e) -> std::optional<QUrl> {
+        *error = e;
+        return std::nullopt;
+    };
+    *error = InputError::None;
+    const QString input = text.trimmed();
+    if (input.isEmpty()) {
+        return fail(InputError::Empty);
+    }
+
+    std::optional<Location> location;
+    if (input.startsWith(QLatin1Char('/')) || input.startsWith(QLatin1Char('~'))) {
+        const QString path = input.startsWith(QLatin1Char('~')) ? QDir::homePath() + input.mid(1) : input;
+        location = locationForPath(path, mountRoot);
+        if (!location) {
+            return fail(InputError::LocalPath);
+        }
+    } else if (input.contains(QLatin1String("://"))) {
+        location = locationForUrl(QUrl(input));
+        if (!location) {
+            return fail(InputError::Unsupported);
+        }
+    } else {
+        // scp style: [user@]host:/path
+        static const QRegularExpression scpStyle(QStringLiteral("^([^/:]+):(.*)$"));
+        const auto match = scpStyle.match(input);
+        if (!match.hasMatch()) {
+            return fail(InputError::Syntax);
+        }
+        const QString path = match.captured(2);
+        if (!path.isEmpty() && !path.startsWith(QLatin1Char('/'))) {
+            return fail(InputError::RelativePath);
+        }
+        QUrl url(QStringLiteral("sftp://") + match.captured(1));
+        url.setPath(path.isEmpty() ? QStringLiteral("/") : path);
+        location = locationForUrl(url);
+        if (!location) {
+            return fail(InputError::Unsupported);
+        }
+    }
+    if (location->path == QLatin1String("/")) {
+        return fail(InputError::RemoteRoot);
+    }
+    return location->url();
+}
+
 static std::vector<std::string> splitPath(const std::string &path)
 {
     std::vector<std::string> parts;

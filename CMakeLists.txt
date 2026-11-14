@@ -22,6 +22,7 @@ find_package(KF6 ${REQUIRED_KF_VERSION} REQUIRED COMPONENTS
     Pty
     Parts
     Config
+    KIO
 )
 
 find_package(Qt6 REQUIRED COMPONENTS
