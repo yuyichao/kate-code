@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <thread>
 #include <cstring>
 #include <vector>
 
@@ -1093,6 +1094,11 @@ bool RemoteFs::unmountHost(const QString &scheme, const QString &authority)
         return mount->state == Mount::State::Unmounted;
     }
     std::unique_lock opLock(mount->opLock);
+    // close() returns before the kernel sends us the release: give files
+    // closed just now a moment to be released.
+    for (int i = 0; i < 20 && mount->openHandles > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (mount->openHandles > 0 || !unmountLocked(mount, false)) {
         return false;
     }
