@@ -104,6 +104,11 @@ public:
     bool unmountHost(const QString &scheme, const QString &authority);
 
     QStringList mountedHosts(); // "sftp/<authority>"
+    // kate-remote-fs-askpass, if found and KdePasswords is on.
+    QString askpassProgram() const
+    {
+        return m_config.kdePasswords ? m_askpassProgram : QString();
+    }
     QString lastError(const QString &scheme, const QString &authority);
 
     // Hosts the daemon connects to; other names do not exist (tools stat

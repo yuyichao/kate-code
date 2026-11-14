@@ -15,6 +15,12 @@
 //                                answered already: asked again means the
 //                                password was wrong, so the cache is skipped
 //   KATE_REMOTE_ASKPASS_NO_DIALOG  never show the dialog (tests, headless)
+//
+// Terminal mode (KATE_REMOTE_ASKPASS_TTY set, by the Remote Terminal, whose
+// ssh runs in a terminal): the login password still comes from the cache,
+// silently; everything else (no cached password, a refused one, host keys,
+// passphrases, one-time codes) is asked on the terminal (/dev/tty), as ssh
+// itself would, and the cache is left alone.
 
 #include "RemoteLocation.h"
 
@@ -25,8 +31,11 @@
 #include <QCoreApplication>
 #include <QFile>
 
+#include <fcntl.h>
+#include <termios.h>
 #include <unistd.h>
 
+#include <csignal>
 #include <cstdio>
 
 namespace
@@ -41,6 +50,66 @@ int runFallback(const QString &prompt)
     execl(fallback.constData(), fallback.constData(), promptBytes.constData(), static_cast<char *>(nullptr));
     perror("kate-remote-fs-askpass: cannot run the fallback askpass");
     return 1;
+}
+
+// The terminal while its echo is off, restored when interrupted.
+int ttyFd = -1;
+termios ttySaved;
+
+void restoreTty(int)
+{
+    tcsetattr(ttyFd, TCSAFLUSH, &ttySaved);
+    _exit(1);
+}
+
+// Asks on the controlling terminal, like ssh: without echo, except for
+// yes/no questions (host keys).
+int askOnTerminal(const QString &prompt, const QString &note = {})
+{
+    const int fd = open("/dev/tty", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        return 1;
+    }
+    if (!note.isEmpty()) {
+        const QByteArray text = note.toLocal8Bit() + '\n';
+        (void)!write(fd, text.constData(), text.size());
+    }
+    const bool echo = prompt.contains(QLatin1String("yes/no"));
+    bool restore = false;
+    if (!echo && tcgetattr(fd, &ttySaved) == 0) {
+        ttyFd = fd;
+        struct sigaction action = {};
+        action.sa_handler = restoreTty;
+        for (int signal : {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP}) {
+            sigaction(signal, &action, nullptr);
+        }
+        termios silent = ttySaved;
+        silent.c_lflag &= ~ECHO;
+        restore = tcsetattr(fd, TCSAFLUSH, &silent) == 0;
+    }
+    const QByteArray promptBytes = prompt.toLocal8Bit();
+    (void)!write(fd, promptBytes.constData(), promptBytes.size());
+    QByteArray line;
+    char c;
+    bool complete = false;
+    while (read(fd, &c, 1) == 1) {
+        if (c == '\n' || c == '\r') {
+            complete = true;
+            break;
+        }
+        line.append(c);
+    }
+    if (restore) {
+        tcsetattr(fd, TCSAFLUSH, &ttySaved);
+        (void)!write(fd, "\n", 1);
+    }
+    close(fd);
+    if (!complete && line.isEmpty()) {
+        return 1; // end of input
+    }
+    line.append('\n');
+    fwrite(line.constData(), 1, line.size(), stdout);
+    return 0;
 }
 
 // KIO's entry for the host, if it is for the user ssh logs in as.
@@ -73,9 +142,10 @@ int main(int argc, char **argv)
     KLocalizedString::setApplicationDomain("katecode");
     const QString prompt = argc > 1 ? QString::fromLocal8Bit(argv[1]) : QString();
 
+    const bool terminal = qEnvironmentVariableIsSet("KATE_REMOTE_ASKPASS_TTY");
     const auto target = KateRemote::parseSshAuthority(QString::fromLocal8Bit(qgetenv("KATE_REMOTE_AUTHORITY")));
     if (!target || !KateRemote::isLoginPasswordPrompt(prompt)) {
-        return runFallback(prompt);
+        return terminal ? askOnTerminal(prompt) : runFallback(prompt);
     }
     // The user ssh logs in as: from the host as mounted, else from the prompt.
     QString user = target->user;
@@ -89,6 +159,10 @@ int main(int argc, char **argv)
     KPasswdServerClient client;
     QString password;
     if (retry || !cachedPassword(client, *target, user, &password)) {
+        if (terminal) {
+            // The mounts' login (KIO's cache) is not changed from here.
+            return askOnTerminal(prompt, retry ? i18n("[The password saved in KDE's password cache was not accepted.]") : QString());
+        }
         if (retry) {
             // The cached password was wrong (for KIO as well). Drop it: with
             // an entry cached, kpasswdserver answers a query from a new

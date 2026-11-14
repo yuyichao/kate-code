@@ -27,7 +27,9 @@ class RemoteTerminal : public QWidget
     Q_OBJECT
 
 public:
-    explicit RemoteTerminal(const QStringList &command, QWidget *parent = nullptr);
+    // askpass: kate-remote-fs-askpass for login passwords from KDE's
+    // password cache (other prompts on the terminal), or empty.
+    RemoteTerminal(const QStringList &command, const QString &authority, const QString &askpass, QWidget *parent = nullptr);
     ~RemoteTerminal() override;
 
     // Loads Konsole's part and starts the command; false (with *error) if
@@ -45,6 +47,8 @@ private Q_SLOTS:
 
 private:
     QStringList m_command;
+    QString m_authority;
+    QString m_askpass;
     QPointer<KParts::ReadOnlyPart> m_part;
 };
 

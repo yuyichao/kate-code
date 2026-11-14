@@ -26,6 +26,10 @@ public Q_SLOTS:
     // plugin warns when it differs from its own (left running across an
     // upgrade).
     QString version() const;
+    // kate-remote-fs-askpass if login passwords come from KDE's password
+    // cache (KdePasswords), else empty: for other ssh clients (the Remote
+    // Terminal, with KATE_REMOTE_ASKPASS_TTY).
+    QString askpassProgram() const;
     // Connected hosts as "<scheme>/<authority>".
     QStringList mounts() const;
     // Why the last connection attempt to the host failed (empty if it did not).

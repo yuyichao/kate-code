@@ -12,7 +12,9 @@ nothing below it is mounted any more (the mounts expose files).
 
 import errno
 import os
+import pty
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -511,6 +513,78 @@ def test_kde_passwords():
           "passphrase prompt passed to the fallback")
 
 
+def on_terminal(argv, env, typed=None, timeout=20):
+    """Runs argv on a new terminal; types `typed` (a line) once the prompt
+    (argv[1]) shows. Returns (exit code, terminal output)."""
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.execve(argv[0], argv, env)
+        finally:
+            os._exit(127)
+    out = b""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.2)
+        if not ready:
+            continue
+        try:
+            data = os.read(fd, 1024)
+        except OSError:
+            break
+        if not data:
+            break
+        out += data
+        if typed is not None and argv[1].encode() in out:
+            os.write(fd, typed.encode() + b"\n")
+            typed = None
+    else:
+        os.kill(pid, signal.SIGKILL)
+    os.close(fd)
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
+
+
+def test_terminal_askpass():
+    print("askpass for the Remote Terminal (KATE_REMOTE_ASKPASS_TTY)")
+    helper = os.path.join(os.path.dirname(DAEMON), "kate-remote-fs-askpass")
+    state = os.path.join(TMP, "terminal-askpass-state")
+    e = env()
+    del e["KATE_REMOTE_ASKPASS_NO_DIALOG"]  # never a dialog in this mode
+    e.update(KATE_REMOTE_ASKPASS_TTY="1", KATE_REMOTE_ASKPASS_STATE=state, KATE_REMOTE_FALLBACK_ASKPASS="")
+
+    # Cached: answered without a prompt.
+    check(kpasswd("add", "sftp://alice@termhost", "alice", "cached-pw") == 0, "password cached")
+    e["KATE_REMOTE_AUTHORITY"] = "alice@termhost"
+    code, out = on_terminal([helper, "alice@termhost's password: "], e)
+    check(code == 0 and out.strip() == "cached-pw", f"cached password answered silently ({code} {out!r})")
+    check(os.path.exists(state), "cached answer marked for this attempt")
+
+    # Asked again in the same attempt (refused): asked on the terminal,
+    # without echo; the cache is left alone.
+    code, out = on_terminal([helper, "alice@termhost's password: "], e, typed="typed-pw")
+    check(code == 0, f"refused password: asked on the terminal ({code} {out!r})")
+    check("not accepted" in out, "says the saved password was refused")
+    check(out.count("typed-pw") == 1 and out.rstrip().endswith("typed-pw"), f"typed password not echoed, then answered ({out!r})")
+    check(kpasswd("check", "sftp://alice@termhost", "alice") == 0, "cache left alone")
+    os.remove(state)
+
+    # Nothing cached: asked on the terminal, no dialog.
+    e["KATE_REMOTE_AUTHORITY"] = "alice@termhost2"
+    code, out = on_terminal([helper, "alice@termhost2's password: "], e, typed="typed2", timeout=10)
+    check(code == 0 and out.count("typed2") == 1 and "not accepted" not in out, f"no cached password: asked on the terminal ({code} {out!r})")
+    check(not os.path.exists(state), "typed answers are not marked")
+
+    # Host keys: on the terminal, echoed like ssh's own question.
+    code, out = on_terminal([helper, "Are you sure you want to continue connecting (yes/no/[fingerprint])? "], e, typed="yes")
+    check(code == 0 and out.count("yes\r\n") == 2, f"yes/no asked with echo ({code} {out!r})")
+    # Passphrases: without echo; end of input fails.
+    code, out = on_terminal([helper, "Enter passphrase for key '/home/alice/.ssh/id_ed25519': "], e, typed="phrase")
+    check(code == 0 and out.count("phrase\r\n") == 1, f"passphrase asked without echo ({code} {out!r})")
+    code, out = on_terminal([helper, "Verification code: "], e, typed="\x04")
+    check(code == 1, f"end of input: no answer ({code} {out!r})")
+
+
 def kio_fuse_pids():
     pids = []
     for pid in os.listdir("/proc"):
@@ -737,7 +811,7 @@ def main():
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_kde_passwords, test_kio_backend, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_terminal_askpass, test_kio_backend, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_shutdown_and_restart):
             try:
                 test()

@@ -30,6 +30,11 @@ QString RemoteFsService::version() const
     return KateRemote::buildVersion();
 }
 
+QString RemoteFsService::askpassProgram() const
+{
+    return m_fs->askpassProgram();
+}
+
 QStringList RemoteFsService::mounts() const
 {
     return m_fs->mountedHosts();

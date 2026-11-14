@@ -6,6 +6,8 @@
 #include <KPluginMetaData>
 #include <kde_terminal_interface.h>
 
+#include <QDBusConnection>
+#include <QDBusMessage>
 #include <QLabel>
 #include <QStandardPaths>
 #include <QTemporaryFile>
@@ -13,9 +15,11 @@
 #include <QStackedWidget>
 #include <QVBoxLayout>
 
-RemoteTerminal::RemoteTerminal(const QStringList &command, QWidget *parent)
+RemoteTerminal::RemoteTerminal(const QStringList &command, const QString &authority, const QString &askpass, QWidget *parent)
     : QWidget(parent)
     , m_command(command)
+    , m_authority(authority)
+    , m_askpass(askpass)
 {
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -56,9 +60,25 @@ bool RemoteTerminal::start(QString *error)
     for (const QString &arg : std::as_const(m_command)) {
         quoted << KateRemote::shellQuote(arg);
     }
+    // Login passwords from KDE's password cache, like the mounts (the
+    // helper's terminal mode asks everything else here); the state file
+    // marks a cached answer within one connection attempt.
+    QString askpass;
+    if (!m_askpass.isEmpty()) {
+        askpass = QStringLiteral(
+                      "state=\"$0.askpass\"\n"
+                      "trap 'rm -f -- \"$state\"' EXIT\n"
+                      "trap 'exit 129' HUP\n"
+                      "trap 'exit 143' TERM\n"
+                      "export SSH_ASKPASS=%1 SSH_ASKPASS_REQUIRE=force KATE_REMOTE_ASKPASS_TTY=1\n"
+                      "export KATE_REMOTE_AUTHORITY=%2 KATE_REMOTE_ASKPASS_STATE=\"$state\"\n")
+                      .arg(KateRemote::shellQuote(m_askpass), KateRemote::shellQuote(m_authority));
+    }
     const QString script = QStringLiteral(
                                "rm -f -- \"$0\"\n"
+                               "%3"
                                "while :; do\n"
+                               "    [ -z \"$state\" ] || rm -f -- \"$state\"\n"
                                "    start=$(date +%s)\n"
                                "    %1; status=$?\n"
                                "    if [ \"$status\" -ne 255 ]; then\n"
@@ -68,7 +88,8 @@ bool RemoteTerminal::start(QString *error)
                                "    read -r _ || exit \"$status\"\n"
                                "done\n")
                                .arg(quoted.join(QLatin1Char(' ')),
-                                    KateRemote::shellQuote(i18n("[Connection closed. Press Enter to reconnect, Ctrl+D to close.]")));
+                                    KateRemote::shellQuote(i18n("[Connection closed. Press Enter to reconnect, Ctrl+D to close.]")),
+                                    askpass);
     QTemporaryFile file(QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/kate-remote-terminal-XXXXXX.sh"));
     file.setAutoRemove(false);
     if (!file.open() || file.write(script.toLocal8Bit()) < 0 || !file.flush()) {
@@ -84,6 +105,18 @@ bool RemoteTerminal::start(QString *error)
 void RemoteTerminal::overrideShortcut(QKeyEvent *, bool &override)
 {
     override = true;
+}
+
+// kate-remote-fs-askpass, as the daemon uses it (empty when KdePasswords
+// is off or the daemon is too old to say).
+static QString askpassProgram()
+{
+    QDBusMessage call = QDBusMessage::createMethodCall(QStringLiteral("org.kde.KateRemoteFS"),
+                                                       QStringLiteral("/org/kde/KateRemoteFS"),
+                                                       QStringLiteral("org.kde.KateRemoteFS"),
+                                                       QStringLiteral("askpassProgram"));
+    const QDBusMessage reply = QDBusConnection::sessionBus().call(call, QDBus::Block, 3000);
+    return reply.type() == QDBusMessage::ReplyMessage && !reply.arguments().isEmpty() ? reply.arguments().constFirst().toString() : QString();
 }
 
 static QString locationKey(const KateRemote::Location &location)
@@ -143,7 +176,7 @@ void RemoteTerminalPanel::startTerminal()
         m_error = i18n("ssh cannot log in to %1.", m_location->authority);
         return;
     }
-    auto *terminal = new RemoteTerminal(command, m_stack);
+    auto *terminal = new RemoteTerminal(command, m_location->authority, askpassProgram(), m_stack);
     if (!terminal->start(&m_error)) {
         delete terminal;
         return;
