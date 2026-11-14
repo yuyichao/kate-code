@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.kde.KateRemoteFS
+Exec=@KDE_INSTALL_FULL_LIBEXECDIR@/kate-remote-fs
+SystemdService=kate-remote-fs.service

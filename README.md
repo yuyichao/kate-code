@@ -57,6 +57,7 @@ See what the active agent is doing with inline tool call displays:
   - Pty
 - CMake 3.16 or higher
 - C++17 compatible compiler
+- Optional, for remote folders (`kate-remote-fs`): libfuse 3.12 or newer (`fuse3`), and `sshfs` at runtime
 
 ### Runtime Dependencies
 - At least one ACP-compatible agent executable installed and available in `PATH`
@@ -236,6 +237,73 @@ Each provider's logo is shown on its chat tabs, in the provider dropdown and in 
 ### Color Scheme
 
 The plugin automatically adapts to your KDE color scheme by reading `~/.config/kdeglobals`. If you change your KDE theme, restart Kate to pick up the new colors.
+
+## Remote Folders (kate-remote-fs, experimental)
+
+`kate-remote-fs` is a small FUSE daemon (built when libfuse 3.12+ is found)
+that makes remote folders available at stable local paths that mirror their
+URL:
+
+```
+~/.kate-remote/sftp/myhost/home/me/project   <->   sftp://myhost/home/me/project
+~/.kate-remote/sftp/me@host:2222/srv         <->   sftp://me@host:2222/srv
+```
+
+Only registered hosts exist under `~/.kate-remote/sftp/` (host names and
+`user@host:port` as for `ssh`, including `~/.ssh/config` aliases). The first
+access below a registered host connects to it with `sshfs`; idle hosts are
+disconnected and reconnect on the next access, and a host that cannot be
+reached fails fast for a while instead of every access waiting for a
+timeout. Because the paths stay the same across reboots, Kate's recent files,
+session restore and projects are meant to work with remote folders as with
+local ones (not yet tried with Kate itself). Listing
+`~/.kate-remote/sftp` shows only connected hosts, so tools walking your home
+directory do not connect anywhere.
+
+Hosts are registered over DBus (the upcoming Remote Projects plugin does this
+when you open a remote folder); the daemon keeps the list in
+`~/.local/state/kate-remote-fs/hosts` and is the only one writing it:
+```bash
+busctl --user call org.kde.KateRemoteFS /org/kde/KateRemoteFS org.kde.KateRemoteFS addHost ss sftp myhost
+busctl --user call org.kde.KateRemoteFS /org/kde/KateRemoteFS org.kde.KateRemoteFS hosts
+busctl --user call org.kde.KateRemoteFS /org/kde/KateRemoteFS org.kde.KateRemoteFS removeHost ss sftp myhost
+```
+Unregistered names do not exist on purpose: tools look for files such as
+`HEAD` (git) or `Cargo.toml` in every parent directory, and those are valid
+host names.
+
+Start it with the user service (or let DBus start it on first use):
+```bash
+systemctl --user enable --now kate-remote-fs
+```
+
+Settings live in `~/.config/kate-remoterc` (restart the service after
+changing them):
+```ini
+[General]
+# Must be an empty directory owned by you
+MountRoot=~/.kate-remote
+# Seconds before an idle host is disconnected (0: never)
+IdleTimeout=900
+# Seconds before a failed host is tried again
+RetryAfterFailure=30
+# Seconds to connect (includes waiting for a password prompt)
+MountTimeout=120
+SshCommand=ssh
+# Extra sshfs -o options, comma separated (e.g. ro)
+SshfsOptions=
+```
+
+Changing `MountRoot` changes every remote path, so Kate's history of the old
+paths no longer works. sshfs caches directory contents for 20 seconds, so a
+change made on the remote by something else can take that long to show.
+Commands that look at every file (`git status` on a large tree) are slow over
+any network file system: about 15 s for 600 files with a cold cache, 1.5 s
+warm. Passwords and unknown host keys are asked through
+`SSH_ASKPASS` (`ksshaskpass` if installed); keys from your ssh agent work
+without prompts. Connection errors are available over DBus
+(`org.kde.KateRemoteFS`, `lastError`), and the daemon logs to the journal
+(`journalctl --user -u kate-remote-fs`).
 
 ## Troubleshooting
 

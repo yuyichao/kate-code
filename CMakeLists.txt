@@ -21,10 +21,12 @@ find_package(KF6 ${REQUIRED_KF_VERSION} REQUIRED COMPONENTS
     SyntaxHighlighting
     Pty
     Parts
+    Config
 )
 
 find_package(Qt6 REQUIRED COMPONENTS
     Core
+    DBus
     Widgets
     WebEngineWidgets
     QuickWidgets
@@ -32,6 +34,20 @@ find_package(Qt6 REQUIRED COMPONENTS
     Network
     Svg
 )
+
+# kate-remote-fs (remote folders under ~/.kate-remote) needs libfuse 3.12+
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+    pkg_check_modules(FUSE3 IMPORTED_TARGET fuse3>=3.12)
+endif()
+include(CMakeDependentOption)
+cmake_dependent_option(BUILD_REMOTE_FS "Build the kate-remote-fs daemon" ON "FUSE3_FOUND" OFF)
+add_feature_info(kate-remote-fs BUILD_REMOTE_FS "remote folders (needs fuse3 >= 3.12)")
+
+if(BUILD_TESTING)
+    find_package(Qt6 REQUIRED COMPONENTS Test)
+    include(ECMAddTests)
+endif()
 
 add_subdirectory(src)
 

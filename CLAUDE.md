@@ -35,6 +35,9 @@ Settings > Configure Kate > Plugins > Enable "Kate Code"
 - `src/acp/ACPSession.{h,cpp}` - Protocol flow and session state management
 - `src/acp/ACPSessionDeleter.{h,cpp}` - Deletes saved sessions on the agent's side (one-shot agent process)
 - `src/acp/ACPModels.h` - Data structures (Message, ToolCall, TodoItem, etc.)
+- `src/remotefs/RemoteLocation.{h,cpp}` - Static lib `kateremotelocation`: remote URL <-> `<MountRoot>/<scheme>/<authority>/<path>` mapping, ssh authority validation, symlink target rewriting; shared by kate-remote-fs and the plugins
+- `src/remotefs/daemon/` - `kate-remote-fs` FUSE daemon (libfuse3 high-level API) with DBus interface `org.kde.KateRemoteFS`; systemd user unit + DBus activation file
+- `src/remotefs/autotests/` - QtTest unit test and `test_remotefs.py` integration test (ctest; runs under `dbus-run-session`, sandboxed `sftp-server` via bwrap as the remote)
 - `src/mcp/MCPServer.{h,cpp}` - MCP protocol handler (initialize, tools/list, tools/call)
 - `src/mcp/main.cpp` - MCP server entry point (stdio JSON-RPC loop)
 - `src/ui/ChatWidget.{h,cpp}` - Main chat interface with ACP integration (one per editor tab)
@@ -71,6 +74,19 @@ Settings > Configure Kate > Plugins > Enable "Kate Code"
 - Kate keeps the enabled-plugin list in the session file (`kate/anonymous.katesession`, `[Kate Plugins]`), not in `katerc`
 - K_PLUGIN_CLASS_WITH_JSON macro requires katecode.json in same directory
 - Plugin views are children of MainWindow and cleaned up automatically
+
+### kate-remote-fs
+- Paths mirror URLs under a stable, configurable root (`kate-remoterc` `[General] MountRoot`, default `~/.kate-remote`), so Kate's history (recents, session restore, projects; Kate resolves symlinks, so these must be real paths, not symlinks to the per-host mounts) survives reboots. kio-fuse's mount directory is random per run
+- Each host is an `sshfs host:/` mount in `$XDG_RUNTIME_DIR/kate-remote-fs/<scheme>/<authority>`, mounted on first access (per-host state machine, waiters share one attempt, failures cached for `RetryAfterFailure`) and unmounted when idle with no open files. Operations use `*at()` calls on a held root fd of the live mount (checked `FUSE_SUPER_MAGIC`), never the plain directory; `ENOTCONN` (sshfs died) remounts and retries once (mount generation counter, not `fstat`, which may answer from cache)
+- Only registered hosts exist (DBus `addHost`/`removeHost`/`hosts`, signal `hostsChanged`; kept in `~/.local/state/kate-remote-fs/hosts`, read at startup and written only by the daemon, so there is a single writer; `kate-remoterc` is user settings the daemon never writes): tools stat `HEAD` (git), `Cargo.toml`, `setup.py`... in every parent directory, and these are valid host names. Names are also validated strictly (`parseSshAuthority()`: no leading `-`/`.`); listing `sftp/` shows only connected hosts; creating/removing a host directory itself is refused without connecting
+- sshfs runs without `reconnect`: it then exits when the connection drops, the next access gets `ENOTCONN` and remounts here, with failures cached (with `reconnect` every access to a vanished host waits for the connect timeout). Directory cache stays at sshfs's default 20 s (a cold cache is a round trip per file)
+- Single instance via a lock file (`$XDG_RUNTIME_DIR/kate-remote-fs/lock`); the DBus name is taken only after mounting, so DBus activation / systemd `Type=dbus` readiness means the paths work
+- Lookups in one directory must not wait for a connecting host: request `FUSE_CAP_PARALLEL_DIROPS`, raise the worker thread cap (libfuse default 10)
+- Symlinks: sshfs runs with `no_contain_symlinks` when supported (Arch patches sshfs to reject absolute/`..` links); `hostSymlinkTarget()` rewrites absolute targets and `..` above the remote root relative to the host directory, so links never resolve to local files
+- sshfs drops ssh's stderr when daemonizing: the daemon passes `ssh_command=<SshCommand> -E <backend>/logs/<scheme>_<authority>.log` and reports that log; sshfs (without `-f`) exits only once mounted
+- Helpers run without our fds (FUSE device, root fds: `CloseFileDescriptors`), with signals unblocked (the daemon blocks SIGTERM/INT/HUP for its signalfd) and in a new session (ssh asks through `SSH_ASKPASS`)
+- Only ever unmount (`fusermount3 -u`) and `rmdir` backend dirs, never delete recursively: the mounts expose remote (and in tests local) files
+- Qt logs to journald when stderr is not a terminal; tests set `QT_FORCE_STDERR_LOGGING=1`
 
 ### ACP Protocol
 - JSON-RPC 2.0 over stdin/stdout with newline-delimited JSON

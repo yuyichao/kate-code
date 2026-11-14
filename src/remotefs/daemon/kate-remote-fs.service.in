@@ -1,0 +1,13 @@
+[Unit]
+Description=Remote folders for Kate (kate-remote-fs)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.kde.KateRemoteFS
+ExecStart=@KDE_INSTALL_FULL_LIBEXECDIR@/kate-remote-fs
+Slice=background.slice
+
+[Install]
+WantedBy=graphical-session.target
