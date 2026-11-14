@@ -1,6 +1,7 @@
 #include "RemoteLocation.h"
 
 #include <QDir>
+#include <QStandardPaths>
 #include <QTest>
 
 using namespace KateRemote;
@@ -10,6 +11,12 @@ class RemoteLocationTest : public QObject
     Q_OBJECT
 
 private Q_SLOTS:
+    void initTestCase()
+    {
+        // Defaults, not the user's kate-remoterc (KioSchemes).
+        QStandardPaths::setTestModeEnabled(true);
+    }
+
     void mountRoot()
     {
         const QString home = QDir::homePath();
@@ -67,6 +74,27 @@ private Q_SLOTS:
         QTEST(target->destination(), "destination");
     }
 
+    void kioSchemesAndAuthorities()
+    {
+        QVERIFY(isKioScheme(QStringLiteral("smb")));
+        QVERIFY(isKioScheme(QStringLiteral("fish")));
+        QVERIFY(!isKioScheme(QStringLiteral("sftp")));
+        QVERIFY(isSupportedScheme(QStringLiteral("sftp")));
+        QVERIFY(isSupportedScheme(QStringLiteral("webdavs")));
+        QVERIFY(!isSupportedScheme(QStringLiteral("file")));
+        QVERIFY(!isSupportedScheme(QStringLiteral("trash")));
+        QVERIFY(isValidAuthority(QStringLiteral("smb"), QStringLiteral("WORK;bob@nas")));
+        QVERIFY(!isValidAuthority(QStringLiteral("sftp"), QStringLiteral("WORK;bob@nas")));
+        QVERIFY(!isValidAuthority(QStringLiteral("smb"), QStringLiteral(".git")));
+        QVERIFY(!isValidAuthority(QStringLiteral("smb"), QStringLiteral("-x")));
+        QVERIFY(!isValidAuthority(QStringLiteral("smb"), QStringLiteral("a b")));
+        const QString root = QStringLiteral("/r");
+        const Location smb{QStringLiteral("smb"), QStringLiteral("nas:445"), QStringLiteral("/share/dir")};
+        QCOMPARE(pathForLocation(smb, root), QStringLiteral("/r/smb/nas:445/share/dir"));
+        QCOMPARE(locationForPath(QStringLiteral("/r/smb/nas:445/share/dir"), root).value_or(Location()), smb);
+        QCOMPARE(smb.url(), QUrl(QStringLiteral("smb://nas:445/share/dir")));
+    }
+
     void kioPasswordCache()
     {
         QCOMPARE(kioAuthUrl(*parseSshAuthority(QStringLiteral("host"))), QUrl(QStringLiteral("sftp://host")));
@@ -112,7 +140,7 @@ private Q_SLOTS:
         QVERIFY(!locationForPath(root + QStringLiteral("/sftp"), root));
         QVERIFY(!locationForPath(root + QStringLiteral("x/sftp/host/a"), root));
         QVERIFY(!locationForPath(QStringLiteral("/home/u/other"), root));
-        QVERIFY(!locationForPath(root + QStringLiteral("/smb/host/a"), root));
+        QVERIFY(!locationForPath(root + QStringLiteral("/gopher/host/a"), root));
         QVERIFY(!locationForPath(root + QStringLiteral("/sftp/.git"), root));
         QVERIFY(!locationForPath(QStringLiteral("relative/sftp/host"), root));
         // Cleaned before mapping.
@@ -120,7 +148,8 @@ private Q_SLOTS:
 
         // URLs: passwords dropped, unsupported schemes rejected, IPv6 kept.
         QCOMPARE(locationForUrl(QUrl(QStringLiteral("sftp://me:secret@host/x")))->authority, QStringLiteral("me@host"));
-        QVERIFY(!locationForUrl(QUrl(QStringLiteral("smb://host/x"))));
+        QVERIFY(!locationForUrl(QUrl(QStringLiteral("gopher://host/x"))));
+        QVERIFY(!locationForUrl(QUrl(QStringLiteral("trash:/x"))));
         QVERIFY(!locationForUrl(QUrl(QStringLiteral("file:///x"))));
         QCOMPARE(locationForUrl(QUrl(QStringLiteral("sftp://[fe80::1]:22/x")))->authority, QStringLiteral("[fe80::1]:22"));
     }
@@ -142,7 +171,10 @@ private Q_SLOTS:
         QTest::newRow("local") << "/etc" << "" << int(E::LocalPath);
         QTest::newRow("no colon") << "host" << "" << int(E::Syntax);
         QTest::newRow("relative") << "host:proj" << "" << int(E::RelativePath);
-        QTest::newRow("smb") << "smb://host/share" << "" << int(E::Unsupported);
+        QTest::newRow("gopher") << "gopher://host/share" << "" << int(E::Unsupported);
+        QTest::newRow("smb") << "smb://host/share" << "smb://host/share" << int(E::None);
+        QTest::newRow("smb domain user") << "smb://WORK;bob@nas/share" << "smb://WORK;bob@nas/share" << int(E::None);
+        QTest::newRow("smb root") << "smb://nas" << "" << int(E::RemoteRoot);
         QTest::newRow("bad host") << "-oProxyCommand=x:/a" << "" << int(E::Unsupported);
         QTest::newRow("url root") << "sftp://host" << "" << int(E::RemoteRoot);
         QTest::newRow("url slash") << "sftp://host/" << "" << int(E::RemoteRoot);

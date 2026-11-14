@@ -156,7 +156,7 @@ void RemoteProjectsPlugin::prepareUrl(const QUrl &url, QObject *context, std::fu
 {
     const auto location = KateRemote::locationForUrl(url);
     if (!location) {
-        done({}, i18n("%1 is not a remote folder that can be opened (only sftp:// is supported).", url.toDisplayString()));
+        done({}, i18n("%1 is not a remote folder that can be opened.", url.toDisplayString()));
         return;
     }
     if (!m_daemonAvailable) {

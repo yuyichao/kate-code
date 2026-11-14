@@ -46,9 +46,46 @@ QString configuredMountRoot()
     return cleanMountRoot(KConfigGroup(&config, QStringLiteral("General")).readEntry("MountRoot", QString()));
 }
 
+QStringList kioSchemes()
+{
+    static const QStringList schemes = [] {
+        KConfig config(configFileName(), KConfig::SimpleConfig);
+        const QStringList defaults{QStringLiteral("smb"),
+                                   QStringLiteral("webdav"),
+                                   QStringLiteral("webdavs"),
+                                   QStringLiteral("ftp"),
+                                   QStringLiteral("fish"),
+                                   QStringLiteral("nfs")};
+        static const QRegularExpression name(QStringLiteral("^[a-z][a-z0-9+.-]*$"));
+        // sftp is mounted with sshfs; local and virtual KIO schemes are not
+        // remote folders.
+        static const QStringList excluded{QStringLiteral("sftp"),
+                                          QStringLiteral("file"),
+                                          QStringLiteral("remote"),
+                                          QStringLiteral("trash"),
+                                          QStringLiteral("desktop"),
+                                          QStringLiteral("recentlyused"),
+                                          QStringLiteral("kateexec")};
+        QStringList result;
+        for (const QString &scheme : KConfigGroup(&config, QStringLiteral("General")).readEntry("KioSchemes", defaults)) {
+            const QString clean = scheme.trimmed().toLower();
+            if (name.match(clean).hasMatch() && !excluded.contains(clean) && !result.contains(clean)) {
+                result << clean;
+            }
+        }
+        return result;
+    }();
+    return schemes;
+}
+
+bool isKioScheme(const QString &scheme)
+{
+    return kioSchemes().contains(scheme);
+}
+
 bool isSupportedScheme(const QString &scheme)
 {
-    return scheme == QLatin1String("sftp");
+    return scheme == QLatin1String("sftp") || isKioScheme(scheme);
 }
 
 QString SshTarget::destination() const
@@ -65,17 +102,20 @@ QString SshTarget::destination() const
     return result;
 }
 
-std::optional<SshTarget> parseSshAuthority(const QString &authority)
+static std::optional<SshTarget> parseAuthority(const QString &authority, bool allowDomainUser)
 {
     // user: no leading '-' (it would read as an option)
     // host: name/alias with no leading '-' or '.', or a bracketed IPv6 address
-    static const QRegularExpression re(QStringLiteral("^(?:([A-Za-z0-9_][A-Za-z0-9._-]*)@)?"
-                                                      "(?:([A-Za-z0-9_][A-Za-z0-9._-]*)|\\[([0-9A-Fa-f:.]+)\\])"
-                                                      "(?::([0-9]{1,5}))?$"));
+    static const QRegularExpression sshRe(QStringLiteral("^(?:([A-Za-z0-9_][A-Za-z0-9._-]*)@)?"
+                                                         "(?:([A-Za-z0-9_][A-Za-z0-9._-]*)|\\[([0-9A-Fa-f:.]+)\\])"
+                                                         "(?::([0-9]{1,5}))?$"));
+    static const QRegularExpression kioRe(QStringLiteral("^(?:([A-Za-z0-9_][A-Za-z0-9._;-]*)@)?"
+                                                         "(?:([A-Za-z0-9_][A-Za-z0-9._-]*)|\\[([0-9A-Fa-f:.]+)\\])"
+                                                         "(?::([0-9]{1,5}))?$"));
     if (authority.isEmpty() || authority.size() > 255) {
         return std::nullopt;
     }
-    const auto match = re.match(authority);
+    const auto match = (allowDomainUser ? kioRe : sshRe).match(authority);
     if (!match.hasMatch()) {
         return std::nullopt;
     }
@@ -93,6 +133,11 @@ std::optional<SshTarget> parseSshAuthority(const QString &authority)
         target.port = port;
     }
     return target;
+}
+
+std::optional<SshTarget> parseSshAuthority(const QString &authority)
+{
+    return parseAuthority(authority, false);
 }
 
 QUrl kioAuthUrl(const SshTarget &target)
@@ -132,6 +177,9 @@ bool isValidAuthority(const QString &scheme, const QString &authority)
 {
     if (scheme == QLatin1String("sftp")) {
         return parseSshAuthority(authority).has_value();
+    }
+    if (isKioScheme(scheme)) {
+        return parseAuthority(authority, true).has_value();
     }
     return false;
 }

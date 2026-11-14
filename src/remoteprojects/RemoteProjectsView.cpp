@@ -87,7 +87,9 @@ std::optional<QUrl> RemoteProjectsView::parseInput(const QString &text, const QS
         *error = i18n("Use an absolute path on the remote computer (host:/path).");
         break;
     case KateRemote::InputError::Unsupported:
-        *error = i18n("%1 cannot be opened: only sftp:// folders on a valid host are supported.", text.trimmed());
+        *error = i18n("%1 cannot be opened: not a remote folder on a valid host (supported: %2).",
+                      text.trimmed(),
+                      QStringList(QStringList{QStringLiteral("sftp")} + KateRemote::kioSchemes()).join(QStringLiteral(", ")));
         break;
     case KateRemote::InputError::RemoteRoot:
         *error = i18n("Choose a folder (host:/path): a project of the whole remote file system would list every file on it.");
@@ -124,12 +126,13 @@ void RemoteProjectsView::askRemoteFolder()
     // Start in KIO's Network view (remote:/, network folders); recent remote
     // folders are in Open Recent Remote Folder.
     QUrl start(QStringLiteral("remote:/"));
+    const QStringList schemes = QStringList{QStringLiteral("sftp"), QStringLiteral("remote"), QStringLiteral("file")} + KateRemote::kioSchemes();
     while (true) {
         const QUrl chosen = QFileDialog::getExistingDirectoryUrl(m_mainWindow->window(),
                                                                  i18n("Open Remote Folder (sftp://host/path)"),
                                                                  start,
                                                                  QFileDialog::ShowDirsOnly,
-                                                                 {QStringLiteral("sftp"), QStringLiteral("remote"), QStringLiteral("file")});
+                                                                 schemes);
         if (chosen.isEmpty() || !m_mainWindow) {
             return;
         }
@@ -156,7 +159,9 @@ void RemoteProjectsView::openUrl(const QUrl &requested, bool userFromKio)
         return;
     }
     const auto location = KateRemote::locationForUrl(requested);
-    const auto target = location ? KateRemote::parseSshAuthority(location->authority) : std::nullopt;
+    // Only sftp: sshfs (ssh) chooses the user itself; KIO's workers (the
+    // other schemes, through kio-fuse) find the user in the cache as well.
+    const auto target = location && location->scheme == QLatin1String("sftp") ? KateRemote::parseSshAuthority(location->authority) : std::nullopt;
     if (!userFromKio || !target || !target->user.isEmpty()) {
         openUrlAs(requested);
         return;

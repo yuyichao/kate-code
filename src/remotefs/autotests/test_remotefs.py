@@ -45,6 +45,8 @@ CONFIG = os.path.join(TMP, "config")      # XDG_CONFIG_HOME
 STATE = os.path.join(TMP, "state")        # XDG_STATE_HOME
 DATA = os.path.join(TMP, "data")          # XDG_DATA_HOME
 FALLBACK_ASKPASS = os.path.join(TMP, "fallback-askpass")
+KIO_BIN = os.path.join(TMP, "kio-bin")    # fake ssh for KIO's fish worker (through kio-fuse)
+KIO_SSH_LOG = os.path.join(TMP, "kio-ssh.log")
 FALLBACK_LOG = os.path.join(TMP, "fallback.log")
 HOSTS_FILE = os.path.join(STATE, "kate-remote-fs", "hosts")
 SSH_LOG = os.path.join(TMP, "ssh.log")
@@ -145,7 +147,7 @@ def start_daemon():
     def ready():
         # A crashed instance leaves a dead mount behind; wait for a live one.
         try:
-            return os.listdir(ROOT) == ["sftp"]
+            return "sftp" in os.listdir(ROOT)
         except OSError:
             return False
     if not wait_for(lambda: ready() or daemon.poll() is not None):
@@ -263,6 +265,20 @@ exec bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 -
 """)
     os.chmod(FAKE_SSH, 0o755)
 
+    # KIO's fish worker runs "ssh ... host <command>": run the command in the
+    # same sandbox (the tree as /data).
+    os.makedirs(KIO_BIN)
+    with open(os.path.join(KIO_BIN, "ssh"), "w") as f:
+        f.write(f"""#!/bin/sh
+echo "$*" >> {KIO_SSH_LOG}
+case " $* " in *" badfish "*) echo "ssh: connect to host badfish port 22: Connection refused" >&2; exit 255;; esac
+for arg in "$@"; do last=$arg; done
+exec bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 --symlink usr/bin /bin \\
+    --ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group \\
+    --bind {TREE} /data --dev /dev --proc /proc --tmpfs /tmp --chdir / --die-with-parent /bin/sh -c "$last"
+""")
+    os.chmod(os.path.join(KIO_BIN, "ssh"), 0o755)
+
     with open(os.path.join(CONFIG, "kate-remoterc"), "w") as f:
         f.write(f"""[General]
 MountRoot={ROOT}
@@ -282,7 +298,7 @@ def register_hosts():
 
 def test_listing_and_read():
     print("listing and reading")
-    check(sorted(os.listdir(ROOT)) == ["sftp"], "root lists sftp")
+    check({"sftp", "fish", "smb"} <= set(os.listdir(ROOT)), "root lists the schemes")
     check(os.listdir(os.path.join(ROOT, "sftp")) == [], "no hosts listed before use")
     check(dbus("mountRoot") == ROOT, "DBus mountRoot")
     host = os.path.join(ROOT, "sftp", "goodhost")
@@ -373,7 +389,7 @@ def test_symlinks():
 
 def test_invalid_names():
     print("invalid names")
-    for path in (os.path.join(ROOT, ".git"), os.path.join(ROOT, ".kateproject"), os.path.join(ROOT, "smb"),
+    for path in (os.path.join(ROOT, ".git"), os.path.join(ROOT, ".kateproject"), os.path.join(ROOT, "gopher"),
                  os.path.join(ROOT, "sftp", ".git"), os.path.join(ROOT, "sftp", "-oProxyCommand=true"),
                  os.path.join(ROOT, "sftp", "a b"), os.path.join(ROOT, "sftp", "host;true")):
         try:
@@ -491,6 +507,69 @@ def test_kde_passwords():
     check(read_host("keyhost") == "hello\n", "key passphrase from the fallback askpass")
     check("Enter passphrase" in (open(FALLBACK_LOG).read() if os.path.exists(FALLBACK_LOG) else ""),
           "passphrase prompt passed to the fallback")
+
+
+def kio_fuse_pids():
+    pids = []
+    for pid in os.listdir("/proc"):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read()
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                environ = f.read().split(b"\0")
+        except OSError:
+            continue
+        if b"kio-fuse" in cmd and f"XDG_RUNTIME_DIR={RUNTIME}".encode() in environ:
+            pids.append(int(pid))
+    return pids
+
+
+def test_kio_backend():
+    print("KIO schemes through kio-fuse (fish)")
+    check(dbus("addHost", "sftp", "-x") is False, "still validated")
+    for host in ("fakehost", "badfish"):
+        check(dbus("addHost", "fish", host) is True, f"addHost fish {host}")
+    host = os.path.join(ROOT, "fish", "fakehost")
+    data = os.path.join(host, "data")
+    check(read_host_path(os.path.join(data, "sub", "f.txt")) == "hello\n", "file read through kio-fuse")
+    check("fish/fakehost" in dbus("mounts"), "fish host connected")
+    check(os.listdir(os.path.join(ROOT, "fish")) == ["fakehost"], "fish/ lists the connected host")
+    with open(os.path.join(data, "kio-new.txt"), "w") as f:
+        f.write("via kio")
+    check(wait_for(lambda: os.path.exists(os.path.join(TREE, "kio-new.txt"))
+                   and open(os.path.join(TREE, "kio-new.txt")).read() == "via kio"), "write reaches the remote")
+    os.mkdir(os.path.join(data, "kio-dir"))
+    check(os.path.isdir(os.path.join(TREE, "kio-dir")), "mkdir")
+    os.rename(os.path.join(data, "kio-new.txt"), os.path.join(data, "kio-dir", "moved.txt"))
+    check(os.path.exists(os.path.join(TREE, "kio-dir", "moved.txt")), "rename")
+    os.unlink(os.path.join(data, "kio-dir", "moved.txt"))
+    os.rmdir(os.path.join(data, "kio-dir"))
+    check(not os.path.exists(os.path.join(TREE, "kio-dir")), "unlink and rmdir")
+    check(read_host_path(os.path.join(ROOT, "fish", "other", "data")) == "ENOENT", "unregistered fish host does not exist")
+
+    check(read_host_path(os.path.join(ROOT, "fish", "badfish", "data")) == "EHOSTUNREACH", "unreachable fish host fails")
+    check(dbus("lastError", "fish", "badfish") != "", "lastError explains")
+
+    check(dbus("unmount", "fish", "fakehost") is True, "unmount (releases kio-fuse)")
+    check(read_host_path(os.path.join(data, "sub", "f.txt")) == "hello\n", "mounted again on access")
+
+    pids = kio_fuse_pids()
+    check(len(pids) == 1, "kio-fuse runs (started over DBus)")
+    for pid in pids:
+        os.kill(pid, signal.SIGKILL)
+    time.sleep(0.5)
+    check(read_host_path(os.path.join(data, "sub", "f.txt")) == "hello\n", "kio-fuse restarted, host remounted")
+
+
+def read_host_path(path):
+    try:
+        if os.path.isdir(path):
+            os.listdir(path)
+            return "dir"
+        with open(path) as f:
+            return f.read()
+    except OSError as e:
+        return errno.errorcode.get(e.errno, str(e.errno))
 
 
 def test_network_drop():
@@ -622,7 +701,8 @@ def test_shutdown_and_restart():
     print("shutdown and restart")
     open(os.path.join(ROOT, "sftp", "goodhost", "data", "sub", "f.txt")).read()
     check(stop_daemon() == 0, "SIGTERM exits cleanly")
-    check(mounts_under(TMP) == [], "everything unmounted on exit")
+    # (kio-fuse keeps its own mount; it is not the daemon's)
+    check(mounts_under(ROOT) == [] and mounts_under(BACKEND) == [], "everything unmounted on exit")
 
     start_daemon()
     open(os.path.join(ROOT, "sftp", "goodhost", "data", "sub", "f.txt")).read()
@@ -640,7 +720,8 @@ def isolate_bus_services():
     # environment, i.e. the user's real config: give them the test's.
     e = env()
     names = ("XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "QT_QPA_PLATFORM")
-    subprocess.run(["dbus-update-activation-environment"] + [f"{n}={e[n]}" for n in names] + ["DISPLAY=", "WAYLAND_DISPLAY="],
+    subprocess.run(["dbus-update-activation-environment"] + [f"{n}={e[n]}" for n in names]
+                   + ["DISPLAY=", "WAYLAND_DISPLAY=", f"PATH={KIO_BIN}:/usr/bin:/bin"],
                    check=True, env=e, timeout=30)
 
 
@@ -654,7 +735,7 @@ def main():
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_kde_passwords, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_kio_backend, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_shutdown_and_restart):
             try:
                 test()

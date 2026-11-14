@@ -57,7 +57,7 @@ See what the active agent is doing with inline tool call displays:
   - Pty
 - CMake 3.16 or higher
 - C++17 compatible compiler
-- Optional, for remote folders (`kate-remote-fs`): libfuse 3.12 or newer (`fuse3`), and `sshfs` at runtime
+- Optional, for remote folders (`kate-remote-fs`): libfuse 3.12 or newer (`fuse3`), and at runtime `sshfs` (sftp) and `kio-fuse` (other KIO protocols)
 
 ### Runtime Dependencies
 - At least one ACP-compatible agent executable installed and available in `PATH`
@@ -277,18 +277,21 @@ URL:
 ```
 ~/.kate-remote/sftp/myhost/home/me/project   <->   sftp://myhost/home/me/project
 ~/.kate-remote/sftp/me@host:2222/srv         <->   sftp://me@host:2222/srv
+~/.kate-remote/smb/nas/share/docs            <->   smb://nas/share/docs
 ```
 
-Only registered hosts exist under `~/.kate-remote/sftp/` (host names and
-`user@host:port` as for `ssh`, including `~/.ssh/config` aliases). The first
-access below a registered host connects to it with `sshfs`; idle hosts are
-disconnected and reconnect on the next access, and a host that cannot be
+Only registered hosts exist under `~/.kate-remote/<scheme>/` (host names and
+`user@host:port`; for sftp as for `ssh`, including `~/.ssh/config`
+aliases). The first access below a registered host connects to it: `sftp`
+with `sshfs`, the other schemes (by default `smb`, `webdav`, `webdavs`,
+`ftp`, `fish`, `nfs`) through `kio-fuse`, i.e. KIO's own workers, which log
+in with KDE's password cache and login dialog like Dolphin does. Idle hosts
+are disconnected and reconnect on the next access, and a host that cannot be
 reached fails fast for a while instead of every access waiting for a
 timeout. Because the paths stay the same across reboots, Kate's recent files,
-session restore and projects are meant to work with remote folders as with
-local ones (not yet tried with Kate itself). Listing
-`~/.kate-remote/sftp` shows only connected hosts, so tools walking your home
-directory do not connect anywhere.
+session restore and projects work with remote folders as with local ones.
+Listing `~/.kate-remote/<scheme>` shows only connected hosts, so tools
+walking your home directory do not connect anywhere.
 
 Hosts are registered over DBus (the upcoming Remote Projects plugin does this
 when you open a remote folder); the daemon keeps the list in
@@ -324,6 +327,8 @@ SshCommand=ssh
 KdePasswords=true
 # Extra sshfs -o options, comma separated (e.g. ro)
 SshfsOptions=
+# Schemes mounted through kio-fuse
+KioSchemes=smb,webdav,webdavs,ftp,fish,nfs
 ```
 
 Passwords: ssh asks through `kate-remote-fs-askpass`, which answers login

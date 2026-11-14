@@ -45,7 +45,8 @@ public:
     struct Mount {
         QString scheme;
         QString authority;
-        std::string backendPath;
+        bool kio = false; // mounted through kio-fuse, else sshfs
+        std::string backendPath; // sshfs mount point; kio-fuse: its path for the host
 
         enum class State { Unmounted, Mounting, Mounted, Failed };
         // Guards state, failedAt, lastError; mounting/unmounting holds it.
@@ -134,6 +135,7 @@ private:
     Mount *findOrCreateMount(const std::string &scheme, const std::string &authority);
     int ensureMounted(Mount *mount);
     int mountBackend(Mount *mount, QString *error);
+    int mountKioFuse(Mount *mount, QString *error);
     void markBroken(Mount *mount, uint64_t generation);
     // Unmounts with state and opLock held exclusively. Returns false if busy.
     bool unmountLocked(Mount *mount, bool lazy);

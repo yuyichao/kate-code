@@ -31,8 +31,12 @@ QString defaultMountRoot();
 QString configuredMountRoot();
 QString cleanMountRoot(const QString &setting);
 
-// Schemes the daemon serves.
+// Schemes the daemon serves: sftp (through sshfs) and the KIO schemes.
 bool isSupportedScheme(const QString &scheme);
+// Schemes mounted through kio-fuse: [General] KioSchemes in kate-remoterc
+// (default smb, webdav, webdavs, ftp, fish, nfs); read once per process.
+QStringList kioSchemes();
+bool isKioScheme(const QString &scheme);
 
 // user@host:port as accepted for ssh. Strict on purpose: these names come
 // from file system lookups (anything stat-ing <root>/sftp/<name>) and end up
@@ -60,7 +64,9 @@ bool isLoginPasswordPrompt(const QString &prompt);
 QString userFromPasswordPrompt(const QString &prompt);
 
 // Whether a path component under <root>/<scheme>/ names a host the daemon
-// may connect to.
+// may connect to: [user@]host[:port], strictly (for sftp it ends up on the
+// ssh command line); for KIO schemes the user may contain ';' (an smb
+// DOMAIN;user).
 bool isValidAuthority(const QString &scheme, const QString &authority);
 
 struct Location {

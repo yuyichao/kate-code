@@ -5,6 +5,10 @@
 #include "../RemoteLocation.h"
 
 #include <QCoreApplication>
+#include <QDBusConnection>
+#include <QDBusConnectionInterface>
+#include <QDBusMessage>
+#include <QDBusReply>
 #include <QDebug>
 #include <QFileInfo>
 #include <QDir>
@@ -331,6 +335,9 @@ int fsReaddir(const char *path, void *buf, fuse_fill_dir_t filler, off_t, fuse_f
     fill("..");
     if (r.kind == RemoteFs::Kind::Root) {
         fill("sftp");
+        for (const QString &scheme : KateRemote::kioSchemes()) {
+            fill(scheme.toUtf8().constData());
+        }
     } else if (r.kind == RemoteFs::Kind::Scheme) {
         // Only connected hosts: listing must not connect anywhere (file
         // managers and indexers list directories freely).
@@ -798,6 +805,7 @@ RemoteFs::Mount *RemoteFs::findOrCreateMount(const std::string &scheme, const st
     auto mount = std::make_unique<Mount>();
     mount->scheme = qScheme;
     mount->authority = qAuthority;
+    mount->kio = KateRemote::isKioScheme(qScheme);
     mount->backendPath = QFile::encodeName(m_config.backendDir + QLatin1Char('/') + QString::fromStdString(key)).toStdString();
     return m_mounts.emplace(key, std::move(mount)).first->second.get();
 }
@@ -891,8 +899,47 @@ int RemoteFs::ensureMounted(Mount *mount)
     return fd >= 0 ? 0 : EHOSTUNREACH;
 }
 
+int RemoteFs::mountKioFuse(Mount *mount, QString *error)
+{
+    // kio-fuse mounts KIO URLs below its own (per run) directory; KIO's
+    // workers log in, with KDE's password cache and dialogs.
+    const QString service = QStringLiteral("org.kde.KIOFuse");
+    auto bus = QDBusConnection::sessionBus();
+    if (QDBusConnectionInterface *interface = bus.interface(); interface && !interface->isServiceRegistered(service)) {
+        const QDBusReply<QStringList> activatable = interface->activatableServiceNames();
+        if (!activatable.isValid() || !activatable.value().contains(service)) {
+            *error = QStringLiteral("kio-fuse is not installed");
+            return -1;
+        }
+    }
+    const QString url = mount->scheme + QStringLiteral("://") + mount->authority + QLatin1Char('/');
+    QDBusMessage call = QDBusMessage::createMethodCall(service, QStringLiteral("/org/kde/KIOFuse"), QStringLiteral("org.kde.KIOFuse.VFS"), QStringLiteral("mountUrl"));
+    call.setArguments({url});
+    // May wait for a login dialog.
+    const QDBusMessage reply = bus.call(call, QDBus::Block, m_config.mountTimeout * 1000);
+    if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
+        *error = reply.errorMessage().isEmpty() ? QStringLiteral("kio-fuse could not mount %1").arg(url) : reply.errorMessage();
+        return -1;
+    }
+    const QString path = reply.arguments().constFirst().toString();
+    mount->backendPath = QFile::encodeName(path).toStdString();
+    const int fd = open(mount->backendPath.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    struct statfs fs;
+    if (fd < 0 || fstatfs(fd, &fs) != 0 || static_cast<unsigned long>(fs.f_type) != FuseSuperMagic) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        *error = QStringLiteral("kio-fuse returned %1, which is not mounted").arg(path);
+        return -1;
+    }
+    return fd;
+}
+
 int RemoteFs::mountBackend(Mount *mount, QString *error)
 {
+    if (mount->kio) {
+        return mountKioFuse(mount, error);
+    }
     const QString path = QFile::decodeName(QByteArray::fromStdString(mount->backendPath));
     const auto target = KateRemote::parseSshAuthority(mount->authority);
     if (!target) {
@@ -1058,6 +1105,11 @@ bool RemoteFs::unmountLocked(Mount *mount, bool lazy)
     if (mount->rootFd >= 0) {
         close(mount->rootFd);
         mount->rootFd = -1;
+    }
+    if (mount->kio) {
+        // kio-fuse keeps its own mounts (it has no unmount); releasing our
+        // handle is all.
+        return true;
     }
     const QString path = QFile::decodeName(QByteArray::fromStdString(mount->backendPath));
     if (unmountPath(path, lazy) || !isMountPoint(path)) {
