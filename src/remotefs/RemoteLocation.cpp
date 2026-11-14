@@ -95,6 +95,39 @@ std::optional<SshTarget> parseSshAuthority(const QString &authority)
     return target;
 }
 
+QUrl kioAuthUrl(const SshTarget &target)
+{
+    QUrl url;
+    url.setScheme(QStringLiteral("sftp"));
+    url.setHost(target.host);
+    if (target.port > 0 && target.port != 22) {
+        url.setPort(target.port);
+    }
+    if (!target.user.isEmpty()) {
+        url.setUserName(target.user);
+    }
+    return url;
+}
+
+bool isLoginPasswordPrompt(const QString &prompt)
+{
+    const QString text = prompt.trimmed().toLower();
+    if (text.contains(QLatin1String("passphrase")) || text.contains(QLatin1String("new password")) || text.contains(QLatin1String("retype"))
+        || text.contains(QLatin1String("old password")) || text.contains(QLatin1String("current password"))) {
+        return false;
+    }
+    static const QRegularExpression passwordPrompt(QStringLiteral("password( for [^:]*)?:$"));
+    return passwordPrompt.match(text).hasMatch();
+}
+
+QString userFromPasswordPrompt(const QString &prompt)
+{
+    // "user@host's password: " or "(user@host) Password: "
+    static const QRegularExpression userAtHost(QStringLiteral("^\\(?([^@()\\s]+)@[^\\s']+"));
+    const auto match = userAtHost.match(prompt.trimmed());
+    return match.hasMatch() ? match.captured(1) : QString();
+}
+
 bool isValidAuthority(const QString &scheme, const QString &authority)
 {
     if (scheme == QLatin1String("sftp")) {

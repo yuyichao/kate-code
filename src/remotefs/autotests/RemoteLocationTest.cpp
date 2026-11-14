@@ -67,6 +67,29 @@ private Q_SLOTS:
         QTEST(target->destination(), "destination");
     }
 
+    void kioPasswordCache()
+    {
+        QCOMPARE(kioAuthUrl(*parseSshAuthority(QStringLiteral("host"))), QUrl(QStringLiteral("sftp://host")));
+        QCOMPARE(kioAuthUrl(*parseSshAuthority(QStringLiteral("me@host:22"))), QUrl(QStringLiteral("sftp://me@host")));
+        QCOMPARE(kioAuthUrl(*parseSshAuthority(QStringLiteral("me@host:2222"))), QUrl(QStringLiteral("sftp://me@host:2222")));
+        QCOMPARE(kioAuthUrl(*parseSshAuthority(QStringLiteral("[fe80::1]"))), QUrl(QStringLiteral("sftp://[fe80::1]")));
+
+        QVERIFY(isLoginPasswordPrompt(QStringLiteral("alice@host's password: ")));
+        QVERIFY(isLoginPasswordPrompt(QStringLiteral("(alice@host) Password: ")));
+        QVERIFY(isLoginPasswordPrompt(QStringLiteral("Password: ")));
+        QVERIFY(isLoginPasswordPrompt(QStringLiteral("Password for alice@host: ")));
+        QVERIFY(!isLoginPasswordPrompt(QStringLiteral("Enter passphrase for key '/home/a/.ssh/id_ed25519': ")));
+        QVERIFY(!isLoginPasswordPrompt(QStringLiteral("Are you sure you want to continue connecting (yes/no/[fingerprint])? ")));
+        QVERIFY(!isLoginPasswordPrompt(QStringLiteral("Verification code: ")));
+        QVERIFY(!isLoginPasswordPrompt(QStringLiteral("New password: ")));
+        QVERIFY(!isLoginPasswordPrompt(QStringLiteral("Retype new password: ")));
+        QVERIFY(!isLoginPasswordPrompt(QStringLiteral("Current password: ")));
+
+        QCOMPARE(userFromPasswordPrompt(QStringLiteral("alice@host's password: ")), QStringLiteral("alice"));
+        QCOMPARE(userFromPasswordPrompt(QStringLiteral("(bob@build.example.org) Password: ")), QStringLiteral("bob"));
+        QCOMPARE(userFromPasswordPrompt(QStringLiteral("Password: ")), QString());
+    }
+
     void pathMapping()
     {
         const QString root = QStringLiteral("/home/u/.kate-remote");

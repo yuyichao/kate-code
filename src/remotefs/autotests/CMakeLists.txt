@@ -4,9 +4,12 @@ ecm_add_test(RemoteLocationTest.cpp
 )
 
 if(BUILD_REMOTE_FS)
+    add_executable(kpasswdtool kpasswdtool.cpp)
+    target_link_libraries(kpasswdtool KF6::KIOCore Qt6::Core)
+
     # Mounts a sandboxed local sftp-server through sshfs; skipped (77) when
     # sshfs, bwrap or sftp-server is missing.
     add_test(NAME kateremotefstest
-        COMMAND dbus-run-session -- python3 -I ${CMAKE_CURRENT_SOURCE_DIR}/test_remotefs.py $<TARGET_FILE:kate-remote-fs>)
+        COMMAND dbus-run-session -- python3 -I ${CMAKE_CURRENT_SOURCE_DIR}/test_remotefs.py $<TARGET_FILE:kate-remote-fs> $<TARGET_FILE:kpasswdtool>)
     set_tests_properties(kateremotefstest PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()

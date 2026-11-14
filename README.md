@@ -261,9 +261,12 @@ be reached when Kate starts, its projects stay in the session and come back
 at the next start where it is reachable (its files open empty meanwhile), and
 the start may wait once for the ssh connect timeout. A host that could not be
 connected to when opening a folder is not remembered. Browsing in the dialog
-uses KIO's own sftp connection, so a host that asks for a password asks
-again when the folder is opened. (Tested with the daemon started through
-DBus activation; not yet with the installed systemd unit at login.)
+uses KIO's own sftp connection; what you log in with there is reused: a
+username typed into KIO's login dialog becomes the user of the opened folder
+(`sftp://user@host/…`), and the password is taken from KDE's password cache
+(see below). (Tested with the daemon started through DBus activation and
+KWallet disabled; not yet with the installed systemd unit at login, KWallet,
+or a real password-only host.)
 
 ### kate-remote-fs
 
@@ -317,9 +320,21 @@ RetryAfterFailure=30
 # Seconds to connect (includes waiting for a password prompt)
 MountTimeout=120
 SshCommand=ssh
+# Login passwords from KDE's password cache (shared with KIO)
+KdePasswords=true
 # Extra sshfs -o options, comma separated (e.g. ro)
 SshfsOptions=
 ```
+
+Passwords: ssh asks through `kate-remote-fs-askpass`, which answers login
+password prompts from KDE's password cache, where KIO keeps the passwords of
+its sftp logins: while the window that logged in (e.g. Kate's, through the
+folder dialog) is open, and in KWallet when "Remember password" is ticked.
+So a host you just logged in to with KIO is mounted without asking again. A cached password is only used for the user ssh logs in as; if
+it is wrong, or nothing is cached, KDE's login dialog asks (and caches the
+answer for KIO too). Key passphrases, host key confirmations and other
+prompts go to `ksshaskpass` (or your `SSH_ASKPASS`). Set `KdePasswords=false`
+to use only `ksshaskpass`.
 
 Changing `MountRoot` changes every remote path, so Kate's history of the old
 paths no longer works. sshfs caches directory contents for 20 seconds, so a

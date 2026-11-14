@@ -4,7 +4,9 @@
 
 #include "../RemoteLocation.h"
 
+#include <QCoreApplication>
 #include <QDebug>
+#include <QFileInfo>
 #include <QDir>
 #include <QFile>
 #include <QProcess>
@@ -637,6 +639,18 @@ RemoteFs::RemoteFs(Config config)
     QString help;
     runProgram(m_config.sshfsProgram, {QStringLiteral("-h")}, 10, &help);
     m_noContainSymlinks = help.contains(QLatin1String("no_contain_symlinks"));
+
+    // Next to the daemon (installed, or in the build tree), else where it is
+    // installed.
+    const QString besideDaemon = QCoreApplication::applicationDirPath() + QStringLiteral("/kate-remote-fs-askpass");
+    if (QFileInfo(besideDaemon).isExecutable()) {
+        m_askpassProgram = besideDaemon;
+    }
+#ifdef KATE_REMOTE_ASKPASS_PATH
+    else if (QFileInfo(QStringLiteral(KATE_REMOTE_ASKPASS_PATH)).isExecutable()) {
+        m_askpassProgram = QStringLiteral(KATE_REMOTE_ASKPASS_PATH);
+    }
+#endif
 }
 
 RemoteFs::~RemoteFs()
@@ -933,20 +947,38 @@ int RemoteFs::mountBackend(Mount *mount, QString *error)
         args << QStringLiteral("-p") << QString::number(target->port);
     }
 
+    // ssh has no terminal here: it asks through SSH_ASKPASS.
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    if (!env.contains(QStringLiteral("SSH_ASKPASS")) && (env.contains(QStringLiteral("DISPLAY")) || env.contains(QStringLiteral("WAYLAND_DISPLAY")))) {
-        const QString askpass = QStandardPaths::findExecutable(QStringLiteral("ksshaskpass"));
-        if (!askpass.isEmpty()) {
-            env.insert(QStringLiteral("SSH_ASKPASS"), askpass);
-            if (!env.contains(QStringLiteral("SSH_ASKPASS_REQUIRE"))) {
-                env.insert(QStringLiteral("SSH_ASKPASS_REQUIRE"), QStringLiteral("prefer"));
-            }
+    QString fallbackAskpass = env.value(QStringLiteral("SSH_ASKPASS"));
+    if (fallbackAskpass.isEmpty() && (env.contains(QStringLiteral("DISPLAY")) || env.contains(QStringLiteral("WAYLAND_DISPLAY")))) {
+        fallbackAskpass = QStandardPaths::findExecutable(QStringLiteral("ksshaskpass"));
+    }
+    const QString askpass = m_config.kdePasswords ? m_askpassProgram : QString();
+    QString askpassState;
+    if (!askpass.isEmpty() && fallbackAskpass != askpass) {
+        // Login passwords from KDE's password cache, shared with KIO's sftp
+        // worker; other prompts go to the usual askpass.
+        askpassState = m_config.backendDir + QStringLiteral("/askpass/") + mount->scheme + QLatin1Char('_') + mount->authority;
+        QDir().mkpath(QFileInfo(askpassState).absolutePath());
+        QFile::remove(askpassState);
+        env.insert(QStringLiteral("SSH_ASKPASS"), askpass);
+        env.insert(QStringLiteral("SSH_ASKPASS_REQUIRE"), QStringLiteral("force"));
+        env.insert(QStringLiteral("KATE_REMOTE_AUTHORITY"), mount->authority);
+        env.insert(QStringLiteral("KATE_REMOTE_FALLBACK_ASKPASS"), fallbackAskpass);
+        env.insert(QStringLiteral("KATE_REMOTE_ASKPASS_STATE"), askpassState);
+    } else if (!fallbackAskpass.isEmpty()) {
+        env.insert(QStringLiteral("SSH_ASKPASS"), fallbackAskpass);
+        if (!env.contains(QStringLiteral("SSH_ASKPASS_REQUIRE"))) {
+            env.insert(QStringLiteral("SSH_ASKPASS_REQUIRE"), QStringLiteral("prefer"));
         }
     }
 
     QString output;
     // sshfs returns once the file system is mounted (or failed).
     const int exitCode = runProgram(m_config.sshfsProgram, args, m_config.mountTimeout, &output, env);
+    if (!askpassState.isEmpty()) {
+        QFile::remove(askpassState);
+    }
     if (exitCode != 0) {
         QFile log(sshLog);
         if (log.open(QIODevice::ReadOnly)) {

@@ -22,10 +22,11 @@ import time
 
 SKIP = 77
 DAEMON = os.path.abspath(sys.argv[1])
+KPASSWDTOOL = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else None
 
 SFTP_SERVER = next((p for p in ("/usr/lib/ssh/sftp-server", "/usr/libexec/openssh/sftp-server",
                                 "/usr/lib/openssh/sftp-server") if os.path.exists(p)), None)
-for tool in ("sshfs", "bwrap", "fusermount3", "dbus-send"):
+for tool in ("sshfs", "bwrap", "fusermount3", "dbus-send", "dbus-update-activation-environment"):
     if not shutil.which(tool):
         print(f"SKIP: {tool} not found")
         sys.exit(SKIP)
@@ -42,6 +43,9 @@ ROOT = os.path.join(TMP, "root")          # MountRoot
 RUNTIME = os.path.join(TMP, "runtime")    # XDG_RUNTIME_DIR
 CONFIG = os.path.join(TMP, "config")      # XDG_CONFIG_HOME
 STATE = os.path.join(TMP, "state")        # XDG_STATE_HOME
+DATA = os.path.join(TMP, "data")          # XDG_DATA_HOME
+FALLBACK_ASKPASS = os.path.join(TMP, "fallback-askpass")
+FALLBACK_LOG = os.path.join(TMP, "fallback.log")
 HOSTS_FILE = os.path.join(STATE, "kate-remote-fs", "hosts")
 SSH_LOG = os.path.join(TMP, "ssh.log")
 FAKE_SSH = os.path.join(TMP, "fake-ssh")
@@ -124,10 +128,13 @@ def wait_for(predicate, timeout=10.0, interval=0.1):
 
 def env():
     e = dict(os.environ)
-    e.update(XDG_RUNTIME_DIR=RUNTIME, XDG_CONFIG_HOME=CONFIG, XDG_STATE_HOME=STATE, QT_FORCE_STDERR_LOGGING="1")
-    # No askpass helper popping up from the test.
-    for key in ("DISPLAY", "WAYLAND_DISPLAY", "SSH_ASKPASS", "SSH_AUTH_SOCK"):
+    e.update(XDG_RUNTIME_DIR=RUNTIME, XDG_CONFIG_HOME=CONFIG, XDG_STATE_HOME=STATE, XDG_DATA_HOME=DATA,
+             QT_FORCE_STDERR_LOGGING="1", QT_QPA_PLATFORM="offscreen")
+    # No dialogs from the test: kate-remote-fs-askpass fails instead of
+    # asking, other prompts go to a fake askpass.
+    for key in ("DISPLAY", "WAYLAND_DISPLAY", "SSH_AUTH_SOCK"):
         e.pop(key, None)
+    e.update(SSH_ASKPASS=FALLBACK_ASKPASS, KATE_REMOTE_ASKPASS_NO_DIALOG="1")
     return e
 
 
@@ -158,8 +165,27 @@ def stop_daemon(sig=signal.SIGTERM):
     return daemon.returncode if daemon else None
 
 
+def stop_bus_services():
+    # Services DBus started for the test (kpasswdserver in kiod6, ...)
+    # outlive dbus-run-session; stop those of our runtime directory.
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                environ = f.read().split(b"\0")
+        except OSError:
+            continue
+        if f"XDG_RUNTIME_DIR={RUNTIME}".encode() in environ:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except OSError:
+                pass
+
+
 def cleanup():
     stop_daemon()
+    stop_bus_services()
     # Deepest first; only unmount, never delete through a mount.
     for point, _ in sorted(mounts_under(TMP), key=lambda m: -len(m[0])):
         subprocess.run(["fusermount3", "-u", "-z", point], capture_output=True)
@@ -176,6 +202,13 @@ def cleanup():
 def setup():
     os.makedirs(os.path.join(TREE, "sub"))
     os.makedirs(CONFIG)
+    os.makedirs(DATA)
+    # KWallet would wait for a "create a wallet" prompt nobody answers.
+    with open(os.path.join(CONFIG, "kwalletrc"), "w") as f:
+        f.write("[Wallet]\nEnabled=false\n")
+    with open(FALLBACK_ASKPASS, "w") as f:
+        f.write(f"#!/bin/sh\necho \"$1\" >> {FALLBACK_LOG}\necho fallback-answer\n")
+    os.chmod(FALLBACK_ASKPASS, 0o755)
     os.makedirs(RUNTIME, mode=0o700)
     with open(os.path.join(TREE, "sub", "f.txt"), "w") as f:
         f.write("hello\n")
@@ -193,6 +226,26 @@ for arg in "$@"; do
     [ "$prev" = "-E" ] && log=$arg
     prev=$arg
 done
+# Password hosts: like ssh, ask through SSH_ASKPASS (3 tries); only
+# alice/secret logs in. keyhost: a key passphrase.
+for arg in "$@"; do
+    case "$arg" in *pwhost*) login=$arg;; *keyhost*) key=1;; esac
+done
+if [ -n "$login" ]; then
+    case "$login" in *@*) ;; *) login="$(id -un)@$login";; esac
+    ok=
+    for i in 1 2 3; do
+        echo "askpass-call $login" >> {SSH_LOG}
+        answer=$("$SSH_ASKPASS" "$login's password: ") || break
+        case "$login" in alice@*) [ "$answer" = secret ] && ok=1 && break;; esac
+        echo "Permission denied, please try again." >> "$log"
+    done
+    [ -n "$ok" ] || {{ echo "$login: Permission denied (publickey,password)." >> "$log"; exit 255; }}
+fi
+if [ -n "$key" ]; then
+    answer=$("$SSH_ASKPASS" "Enter passphrase for key '/home/alice/.ssh/id_ed25519': ") || exit 255
+    [ "$answer" = fallback-answer ] || {{ echo "keyhost: Permission denied (publickey)." >> "$log"; exit 255; }}
+fi
 case " $* " in
     *" badhost "*) echo "ssh: connect to host badhost port 22: Connection refused" >> "$log"; exit 255;;
     *" flakyhost "*)
@@ -368,6 +421,78 @@ def test_host_registry():
     check("sftp/newhost" not in open(HOSTS_FILE).read().split(), "removed host dropped from the state file")
 
 
+def kpasswd(*args):
+    return subprocess.run([KPASSWDTOOL, *args], env=env(), capture_output=True, text=True, timeout=60).returncode
+
+
+def askpass_calls(login):
+    if not os.path.exists(SSH_LOG):
+        return 0
+    return sum(1 for line in open(SSH_LOG) if line.strip() == f"askpass-call {login}")
+
+
+def read_host(authority):
+    try:
+        with open(os.path.join(ROOT, "sftp", authority, "data", "sub", "f.txt")) as f:
+            return f.read()
+    except OSError as e:
+        return errno.errorcode.get(e.errno, str(e.errno))
+
+
+def test_kde_passwords():
+    print("passwords from KDE's password cache")
+    if not KPASSWDTOOL:
+        check(False, "kpasswdtool given")
+        return
+    me = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+    for host in ("alice@pwhost", "pwhost", "alice@pwhost2", "alice@pwhost3", "keyhost"):
+        dbus("addHost", "sftp", host)
+
+    check(read_host("alice@pwhost3") == "EHOSTUNREACH", "no cached password: login fails (no dialog in tests)")
+    check("Permission denied" in dbus("lastError", "sftp", "alice@pwhost3"), "lastError has ssh's message")
+    check(askpass_calls("alice@pwhost3") == 1, "ssh stops asking once askpass gives up")
+
+    # As KIO stores it when the username was typed into its login dialog:
+    # under the URL without user.
+    check(kpasswd("add", "sftp://pwhost", "alice", "secret") == 0, "password cached as KIO would")
+    check(read_host("alice@pwhost") == "hello\n", "cached password used for the mount")
+    check(askpass_calls("alice@pwhost") == 1, "answered on the first prompt")
+    # The same entry is alice's: not used when ssh logs in as another user.
+    check(read_host("pwhost") == "EHOSTUNREACH", "another user's cached password not used")
+    check(askpass_calls(f"{me}@pwhost") == 1, "asked once for the local user")
+
+    # A wrong cached password is used once; asked again, the cache is skipped.
+    check(kpasswd("add", "sftp://alice@pwhost2", "alice", "wrong") == 0, "wrong password cached")
+    check(read_host("alice@pwhost2") == "EHOSTUNREACH", "wrong cached password fails")
+    check(askpass_calls("alice@pwhost2") == 2, "cache skipped when ssh asks again")
+    check(kpasswd("add", "sftp://alice@pwhost2", "alice", "secret") == 0, "password corrected")
+    dbus("unmount", "sftp", "alice@pwhost2")
+    check(read_host("alice@pwhost2") == "hello\n", "next attempt uses the cache again")
+
+    # Asked again after a wrong cached password: the entry is dropped and
+    # KDE's dialog asks (a new client's query would otherwise get the cached
+    # entry back without a dialog). Run the helper directly, with dialogs.
+    check(kpasswd("add", "sftp://alice@pwhost9", "alice", "wrong") == 0, "wrong password cached")
+    helper = os.path.join(os.path.dirname(DAEMON), "kate-remote-fs-askpass")
+    state = os.path.join(TMP, "askpass-state")
+    e = env()
+    del e["KATE_REMOTE_ASKPASS_NO_DIALOG"]
+    e.update(KATE_REMOTE_AUTHORITY="alice@pwhost9", KATE_REMOTE_ASKPASS_STATE=state, KATE_REMOTE_FALLBACK_ASKPASS="")
+    first = subprocess.run([helper, "alice@pwhost9's password: "], env=e, capture_output=True, text=True, timeout=30)
+    check(first.returncode == 0 and first.stdout.strip() == "wrong", "first prompt answered from the cache")
+    try:
+        second = subprocess.run([helper, "alice@pwhost9's password: "], env=e, capture_output=True, text=True, timeout=5)
+        check(False, f"asked again: dialog instead of the cached password (got {second.returncode} {second.stdout.strip()!r})")
+    except subprocess.TimeoutExpired:
+        check(True, "asked again: dialog instead of the cached password")
+    check(kpasswd("check", "sftp://alice@pwhost9", "alice") != 0, "wrong password removed from the cache")
+
+    # Other prompts go to the usual askpass.
+    check(read_host("keyhost") == "hello\n", "key passphrase from the fallback askpass")
+    check("Enter passphrase" in (open(FALLBACK_LOG).read() if os.path.exists(FALLBACK_LOG) else ""),
+          "passphrase prompt passed to the fallback")
+
+
 def test_network_drop():
     print("network drop under a live mount")
     path = os.path.join(ROOT, "sftp", "flakyhost", "data", "sub", "f.txt")
@@ -510,16 +635,26 @@ def test_shutdown_and_restart():
         check(f.read() == "hello\n", "works after restarting over a stale mount")
 
 
+def isolate_bus_services():
+    # Services the bus starts (kpasswdserver in kiod6, KWallet) get the bus's
+    # environment, i.e. the user's real config: give them the test's.
+    e = env()
+    names = ("XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "QT_QPA_PLATFORM")
+    subprocess.run(["dbus-update-activation-environment"] + [f"{n}={e[n]}" for n in names] + ["DISPLAY=", "WAYLAND_DISPLAY="],
+                   check=True, env=e, timeout=30)
+
+
 def main():
     try:
         setup()
+        isolate_bus_services()
         try:
             start_daemon()
         except Exception as e:
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_shutdown_and_restart):
             try:
                 test()

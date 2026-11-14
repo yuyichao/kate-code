@@ -13,6 +13,13 @@ if(BUILD_REMOTE_FS)
     target_link_libraries(kate-remote-fs kateremotelocation Qt6::Core Qt6::DBus PkgConfig::FUSE3)
     install(TARGETS kate-remote-fs DESTINATION ${KDE_INSTALL_LIBEXECDIR})
 
+    # SSH_ASKPASS for the mounts: login passwords from KDE's password cache
+    add_executable(kate-remote-fs-askpass askpass/main.cpp)
+    target_link_libraries(kate-remote-fs-askpass kateremotelocation KF6::KIOCore KF6::I18n Qt6::Core)
+    install(TARGETS kate-remote-fs-askpass DESTINATION ${KDE_INSTALL_LIBEXECDIR})
+    target_compile_definitions(kate-remote-fs PRIVATE
+        KATE_REMOTE_ASKPASS_PATH="${KDE_INSTALL_FULL_LIBEXECDIR}/kate-remote-fs-askpass")
+
     configure_file(daemon/kate-remote-fs.service.in ${CMAKE_CURRENT_BINARY_DIR}/kate-remote-fs.service @ONLY)
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/kate-remote-fs.service DESTINATION ${KDE_INSTALL_SYSTEMDUSERUNITDIR})
     configure_file(daemon/org.kde.KateRemoteFS.service.in ${CMAKE_CURRENT_BINARY_DIR}/org.kde.KateRemoteFS.service @ONLY)

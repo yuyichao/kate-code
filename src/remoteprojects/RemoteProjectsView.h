@@ -33,7 +33,9 @@ public:
 
 private:
     void askRemoteFolder();
-    void openUrl(const QUrl &url);
+    // userFromKio: a URL without a user gets the one KIO logged in with.
+    void openUrl(const QUrl &url, bool userFromKio = false);
+    void openUrlAs(const QUrl &url);
     void rebuildRecentMenu();
     void showMessage(const QString &text, const QString &type);
 

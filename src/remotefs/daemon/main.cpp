@@ -36,6 +36,7 @@ static RemoteFs::Config loadConfig()
     config.mountTimeout = group.readEntry("MountTimeout", config.mountTimeout);
     config.sshfsProgram = group.readEntry("SshfsProgram", config.sshfsProgram);
     config.sshCommand = group.readEntry("SshCommand", config.sshCommand);
+    config.kdePasswords = group.readEntry("KdePasswords", config.kdePasswords);
     config.sshfsOptions = group.readEntry("SshfsOptions", QStringList());
     config.backendDir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/kate-remote-fs");
     config.hostsFile = QStandardPaths::writableLocation(QStandardPaths::GenericStateLocation) + QStringLiteral("/kate-remote-fs/hosts");

@@ -3,7 +3,9 @@
 
 #include "RemoteLocation.h"
 
+#include <KIO/AuthInfo>
 #include <KIO/StatJob>
+#include <KPasswdServerClient>
 #include <KActionCollection>
 #include <KActionMenu>
 #include <KLocalizedString>
@@ -14,6 +16,9 @@
 #include <QFileDialog>
 #include <QMenu>
 #include <QMessageBox>
+#include <QThread>
+
+#include <memory>
 
 RemoteProjectsView::RemoteProjectsView(RemoteProjectsPlugin *plugin, KTextEditor::MainWindow *mainWindow)
     : QObject(mainWindow)
@@ -135,7 +140,7 @@ void RemoteProjectsView::askRemoteFolder()
         QString error;
         const auto url = parseInput(resolved.isLocalFile() ? resolved.toLocalFile() : resolved.toString(), mountRoot, &error);
         if (url) {
-            openUrl(*url);
+            openUrl(*url, true);
             return;
         }
         // Started by the user (not by an agent): a modal message is fine.
@@ -144,12 +149,50 @@ void RemoteProjectsView::askRemoteFolder()
     }
 }
 
-void RemoteProjectsView::openUrl(const QUrl &url)
+void RemoteProjectsView::openUrl(const QUrl &requested, bool userFromKio)
 {
     if (!m_mainWindow->pluginView(QStringLiteral("kateprojectplugin"))) {
         showMessage(i18n("Opening a remote folder needs the Project plugin: enable it in Settings > Configure Kate > Plugins."), QStringLiteral("Error"));
         return;
     }
+    const auto location = KateRemote::locationForUrl(requested);
+    const auto target = location ? KateRemote::parseSshAuthority(location->authority) : std::nullopt;
+    if (!userFromKio || !target || !target->user.isEmpty()) {
+        openUrlAs(requested);
+        return;
+    }
+    // Chosen in the folder dialog without a user: KIO may have logged in to
+    // the host as someone else (a username typed into its login dialog
+    // while browsing). Its password cache knows (kept while this window is
+    // open); use that user, or ssh would log in as the default one. Looked
+    // up off the UI thread (the client waits in an event loop).
+    const qlonglong windowId = m_mainWindow->window()->winId();
+    const QUrl authUrl = KateRemote::kioAuthUrl(*target);
+    auto user = std::make_shared<QString>();
+    QThread *thread = QThread::create([authUrl, windowId, user] {
+        KIO::AuthInfo info;
+        info.url = authUrl;
+        KPasswdServerClient client;
+        if (client.checkAuthInfo(&info, windowId, 0)) {
+            *user = info.username;
+        }
+    });
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    connect(thread, &QThread::finished, this, [this, requested, user] {
+        QUrl url = requested;
+        if (!user->isEmpty()) {
+            url.setUserName(*user);
+            if (!KateRemote::locationForUrl(url)) {
+                url = requested; // a user name ssh would not accept
+            }
+        }
+        openUrlAs(url);
+    });
+    thread->start();
+}
+
+void RemoteProjectsView::openUrlAs(const QUrl &url)
+{
     showMessage(i18n("Connecting to %1…", url.host()), QStringLiteral("Info"));
     m_plugin->prepareUrl(url, this, [this, url](const QString &path, const QString &error) {
         if (!error.isEmpty()) {

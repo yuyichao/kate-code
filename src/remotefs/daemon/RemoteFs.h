@@ -38,6 +38,7 @@ public:
         int mountTimeout = 120; // seconds for sshfs (may wait for a password prompt)
         QString sshfsProgram = QStringLiteral("sshfs");
         QString sshCommand = QStringLiteral("ssh"); // run by sshfs, with -E <log>
+        bool kdePasswords = true; // login passwords from KDE's password cache (kate-remote-fs-askpass)
         QStringList sshfsOptions; // "-o" options
     };
 
@@ -145,6 +146,7 @@ private:
     Events m_events;
     struct fuse *m_fuse = nullptr;
     bool m_noContainSymlinks = false; // sshfs knows -o no_contain_symlinks
+    QString m_askpassProgram; // kate-remote-fs-askpass
 
     std::mutex m_hostsMutex;
     std::set<std::string> m_hosts; // "sftp/<authority>"

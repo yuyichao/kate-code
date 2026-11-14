@@ -47,6 +47,18 @@ struct SshTarget {
 };
 std::optional<SshTarget> parseSshAuthority(const QString &authority);
 
+// The URL KIO's sftp worker files the host's password under in KDE's
+// password cache (kpasswdserver): sftp://[user@]host[:port], without the
+// port when it is the default one.
+QUrl kioAuthUrl(const SshTarget &target);
+
+// ssh's prompts through SSH_ASKPASS: a login password ("user@host's
+// password: ", "(user@host) Password: ", "Password: "), or anything else
+// (key passphrases, host key confirmation, one-time codes, new passwords).
+bool isLoginPasswordPrompt(const QString &prompt);
+// The user ssh logs in as, from such a prompt (empty if it does not say).
+QString userFromPasswordPrompt(const QString &prompt);
+
 // Whether a path component under <root>/<scheme>/ names a host the daemon
 // may connect to.
 bool isValidAuthority(const QString &scheme, const QString &authority);
