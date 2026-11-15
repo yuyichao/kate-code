@@ -1,4 +1,8 @@
 #include "ChatInputWidget.h"
+#include <QDateTime>
+#include <QLocale>
+#include <QMouseEvent>
+#include <QTimer>
 #include "FlowLayout.h"
 
 #include <QActionGroup>
@@ -337,8 +341,20 @@ ChatInputWidget::ChatInputWidget(QWidget *parent)
     m_contextLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     m_contextLabel->setStyleSheet(QStringLiteral("QLabel { color: palette(mid); font-size: 11px; }"));
     m_contextLabel->hide();
+    // Plan usage limits, left of the context usage; clicking runs /usage.
+    m_rateLimitLabel = new QLabel(this);
+    m_rateLimitLabel->setObjectName(QStringLiteral("rateLimitLabel"));
+    m_rateLimitLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_rateLimitLabel->setCursor(Qt::PointingHandCursor);
+    m_rateLimitLabel->installEventFilter(this);
+    m_rateLimitLabel->hide();
+    m_rateLimitTimer = new QTimer(this);
+    m_rateLimitTimer->setSingleShot(true);
+    connect(m_rateLimitTimer, &QTimer::timeout, this, &ChatInputWidget::updateRateLimitDisplay);
 
     modeLayout->addStretch();
+    modeLayout->addWidget(m_rateLimitLabel);
+    modeLayout->addSpacing(8);
     modeLayout->addWidget(m_contextLabel);
     modeLayout->addSpacing(8);
     modeLayout->addWidget(m_waitingLabel);
@@ -466,6 +482,13 @@ bool ChatInputWidget::eventFilter(QObject *obj, QEvent *event)
     if (obj == m_optionsRow && event->type() == QEvent::Resize) {
         updateOptionsRowHeight();
         return false;
+    }
+
+    if (obj == m_rateLimitLabel && event->type() == QEvent::MouseButtonRelease) {
+        if (static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton && m_inputEnabled) {
+            Q_EMIT usageDetailsRequested();
+        }
+        return true;
     }
 
     if (obj == m_textEdit && event->type() == QEvent::KeyPress) {
@@ -722,6 +745,106 @@ void ChatInputWidget::setContextUsage(qint64 used, qint64 size)
         m_contextLabel->setToolTip(QStringLiteral("Context window: %1 tokens used").arg(formatTokens(used)));
     }
     m_contextLabel->show();
+}
+
+namespace
+{
+// "14:00" today, else "Tue 08:00" (within a week) or the date.
+QString formatReset(const QDateTime &when, const QDateTime &now)
+{
+    const QLocale locale;
+    const QDateTime local = when.toLocalTime();
+    const QString time = locale.toString(local.time(), QLocale::ShortFormat);
+    if (local.date() == now.date()) {
+        return time;
+    }
+    if (now.daysTo(local) < 7) {
+        return locale.dayName(local.date().dayOfWeek(), QLocale::ShortFormat) + QLatin1Char(' ') + time;
+    }
+    return locale.toString(local, QLocale::ShortFormat);
+}
+
+int percentOf(double utilization)
+{
+    return qRound(utilization * 100);
+}
+}
+
+void ChatInputWidget::setRateLimits(const RateLimits &limits)
+{
+    m_rateLimits = limits;
+    updateRateLimitDisplay();
+}
+
+void ChatInputWidget::updateRateLimitDisplay()
+{
+    m_rateLimitTimer->stop();
+    const RateLimitWindow *shown = m_rateLimits.mostImmediate();
+    if (!shown) {
+        m_rateLimitLabel->clear();
+        m_rateLimitLabel->setToolTip(QString());
+        m_rateLimitLabel->hide();
+        return;
+    }
+    const QDateTime now = QDateTime::currentDateTime();
+    const double utilization = shown->currentUtilization(now);
+    const QString shortName = shown->id == QLatin1String("five_hour") ? QStringLiteral("5h")
+        : shown->id == QLatin1String("seven_day")                     ? QStringLiteral("Week")
+                                                                      : RateLimits::windowLabel(shown->id);
+    m_rateLimitLabel->setText(QStringLiteral("%1 usage %2%").arg(shortName).arg(percentOf(utilization)));
+    // The worst of all windows (a weekly limit reached blocks too): limit
+    // reached red; a warning or 80% and more orange.
+    QString color = QStringLiteral("palette(mid)");
+    for (const RateLimitWindow &window : std::as_const(m_rateLimits.windows)) {
+        if (window.hasReset(now)) {
+            continue;
+        }
+        if (window.status == QLatin1String("rejected")) {
+            color = QStringLiteral("#d9534f");
+            break;
+        }
+        if (window.status == QLatin1String("allowed_warning") || window.utilization >= 0.8) {
+            color = QStringLiteral("#f0ad4e");
+        }
+    }
+    m_rateLimitLabel->setStyleSheet(QStringLiteral("QLabel { color: %1; font-size: 11px; }").arg(color));
+
+    QStringList lines;
+    lines << QStringLiteral("<b>Plan usage</b>");
+    for (const RateLimitWindow &window : std::as_const(m_rateLimits.windows)) {
+        if (window.utilization < 0) {
+            continue;
+        }
+        QString line = QStringLiteral("%1: %2%").arg(RateLimits::windowLabel(window.id).toHtmlEscaped()).arg(percentOf(window.currentUtilization(now)));
+        if (window.hasReset(now)) {
+            line += QStringLiteral(" (reset at %1)").arg(formatReset(window.resetsAt, now));
+        } else {
+            if (window.resetsAt.isValid()) {
+                line += QStringLiteral(", resets %1").arg(formatReset(window.resetsAt, now));
+            }
+            if (window.status == QLatin1String("rejected")) {
+                line += QStringLiteral(" — <b>limit reached</b>");
+            } else if (window.status == QLatin1String("allowed_warning")) {
+                line += QStringLiteral(" — close to the limit");
+            }
+        }
+        lines << line;
+    }
+    if (m_rateLimits.usingOverage) {
+        lines << QStringLiteral("Using extra usage");
+    }
+    if (m_rateLimits.received.isValid()) {
+        lines << QStringLiteral("<i>As of %1</i>").arg(formatReset(m_rateLimits.received, now));
+    }
+    lines << QStringLiteral("Click for details (/usage)");
+    m_rateLimitLabel->setToolTip(lines.join(QStringLiteral("<br>")));
+    m_rateLimitLabel->show();
+
+    // Show the reset when it happens (capped: QTimer takes an int).
+    const QDateTime next = m_rateLimits.nextReset(now);
+    if (next.isValid()) {
+        m_rateLimitTimer->start(static_cast<int>(qMin<qint64>(now.msecsTo(next) + 1000, 24 * 3600 * 1000)));
+    }
 }
 
 void ChatInputWidget::updateWaitingIndicator()

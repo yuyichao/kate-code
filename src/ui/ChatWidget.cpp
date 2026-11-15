@@ -269,6 +269,18 @@ ChatWidget::ChatWidget(QWidget *parent)
         m_inputWidget->setContextUsage(usage.used, usage.size);
         Q_EMIT sessionInfoChanged();
     });
+    // Plan usage limits are the account's: shared by the provider's chats.
+    connect(m_session, &ACPSession::rateLimitsChanged, this, [this](const RateLimits &limits) {
+        RateLimitStore::instance()->update(m_providerId, limits);
+    });
+    connect(RateLimitStore::instance(), &RateLimitStore::changed, this, [this](const QString &providerId) {
+        if (providerId == m_providerId) {
+            m_inputWidget->setRateLimits(RateLimitStore::instance()->limits(m_providerId));
+        }
+    });
+    connect(m_inputWidget, &ChatInputWidget::usageDetailsRequested, this, [this] {
+        onMessageSubmitted(QStringLiteral("/usage"));
+    });
     connect(m_session, &ACPSession::titleChanged, this, &ChatWidget::onSessionTitleChanged);
     connect(m_session, &ACPSession::configOptionsChanged, this, [this](const QJsonArray &options) {
         m_inputWidget->setConfigOptions(options);
@@ -1693,6 +1705,7 @@ void ChatWidget::applyACPBackend()
     m_session->setExecutable(provider.executable, args);
     m_session->setMcpConfigPath(provider.mcpConfigPath);
     m_session->setSessionConfig(provider.sessionConfig);
+    m_inputWidget->setRateLimits(RateLimitStore::instance()->limits(m_providerId));
     updateProviderIcons();
     qDebug() << "[ChatWidget] ACP backend configured:" << provider.executable << args
              << "MCP config:" << provider.mcpConfigPath

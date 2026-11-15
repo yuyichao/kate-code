@@ -2241,6 +2241,13 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
             m_usage.currency = cost[QStringLiteral("currency")].toString();
         }
         Q_EMIT usageChanged(m_usage);
+        const QJsonObject rateLimit = update[QStringLiteral("_meta")].toObject()[QStringLiteral("_claude/rateLimit")].toObject();
+        if (!rateLimit.isEmpty()) {
+            const RateLimits limits = RateLimits::fromClaudeRateLimit(rateLimit, QDateTime::currentDateTime());
+            if (!limits.isEmpty()) {
+                Q_EMIT rateLimitsChanged(limits);
+            }
+        }
     }
     else if (updateType == QStringLiteral("config_option_update")) {
         updateSessionConfigOptions(update[QStringLiteral("configOptions")].toArray(),

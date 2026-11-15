@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../acp/ACPModels.h"
+#include "../acp/RateLimits.h"
 #include <QHash>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -14,6 +15,7 @@ class QComboBox;
 class QCompleter;
 class QMenu;
 class QToolButton;
+class QTimer;
 class FlowLayout;
 
 // Custom QTextEdit that handles QCompleter for slash commands and file references
@@ -83,6 +85,10 @@ public:
     // Context window usage in the status row: the percentage, with the token
     // counts in the tooltip. used < 0 hides it.
     void setContextUsage(qint64 used, qint64 size);
+    // The plan's usage limits in the status row: the most immediate window's
+    // percentage (Claude: the 5-hour limit), all of them in the tooltip;
+    // clicking emits usageDetailsRequested(). Empty limits hide it.
+    void setRateLimits(const RateLimits &limits);
 
     // Session config options from the agent (model, effort, fast mode, ...).
     // "mode" is shown by the mode dropdown and skipped here.
@@ -94,6 +100,8 @@ Q_SIGNALS:
     void permissionModeChanged(const QString &mode);
     void stopClicked();
     void configOptionChanged(const QString &configId, const QJsonValue &value);
+    // The usage limits display was clicked (run /usage).
+    void usageDetailsRequested();
 
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
@@ -119,6 +127,11 @@ private:
     QComboBox *m_modeComboBox;
     QLabel *m_waitingLabel;
     QLabel *m_contextLabel;
+    QLabel *m_rateLimitLabel;
+    RateLimits m_rateLimits;
+    // Refreshes the display when a window resets.
+    QTimer *m_rateLimitTimer;
+    void updateRateLimitDisplay();
     bool m_promptRunning = false;
     bool m_inputEnabled = false;
     QCompleter *m_completer;

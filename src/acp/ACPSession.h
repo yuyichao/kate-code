@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ACPModels.h"
+#include "RateLimits.h"
 #include <QHash>
 #include <QJsonArray>
 #include <QSet>
@@ -17,6 +18,7 @@ class Document;
 
 class ACPService;
 class QTimer;
+
 class EditTracker;
 class TerminalManager;
 class TranscriptWriter;
@@ -131,6 +133,9 @@ Q_SIGNALS:
     void modesAvailable(const QJsonArray &modes);
     void configOptionsChanged(const QJsonArray &configOptions);
     void usageChanged(const SessionUsage &usage);
+    // The plan's usage limits (Claude Code: usage_update's
+    // _meta["_claude/rateLimit"], sent when they change).
+    void rateLimitsChanged(const RateLimits &limits);
     void titleChanged(const QString &title);
     void modeChanged(const QString &modeId);
     void commandsAvailable(const QList<SlashCommand> &commands);

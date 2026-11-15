@@ -12,6 +12,7 @@ set(katecode_SRCS
     acp/ACPService.cpp
     acp/ACPSession.cpp
     acp/ACPSessionDeleter.cpp
+    acp/RateLimits.cpp
     acp/TerminalManager.cpp
 
     # UI layer
