@@ -1,5 +1,5 @@
 # URL <-> path mapping shared by kate-remote-fs, the plugins and Kate Code.
-add_library(kateremotelocation STATIC RemoteLocation.cpp BuildVersion.cpp)
+add_library(kateremotelocation STATIC RemoteLocation.cpp RemotePathMap.cpp BuildVersion.cpp)
 set_target_properties(kateremotelocation PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kateremotelocation PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(kateremotelocation PUBLIC Qt6::Core KF6::ConfigCore)

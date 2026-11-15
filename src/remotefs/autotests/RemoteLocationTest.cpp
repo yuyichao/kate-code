@@ -1,4 +1,9 @@
 #include "RemoteLocation.h"
+#include "RemotePathMap.h"
+
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 #include <QDir>
 #include <QProcess>
@@ -327,6 +332,268 @@ private Q_SLOTS:
             QVERIFY(process.waitForFinished());
             QCOMPARE(QString::fromLocal8Bit(process.readAllStandardOutput()), QStringLiteral("-l\n") + target + QLatin1Char('\n'));
         }
+    }
+
+    void sshAgent_data()
+    {
+        QTest::addColumn<QString>("authority");
+        QTest::addColumn<QString>("path");
+        QTest::addColumn<QString>("program");
+        QTest::addColumn<QStringList>("args");
+        QTest::addColumn<QStringList>("expected"); // after the ssh options, empty: refused
+
+        const QString env = QStringLiteral("exec env PATH=\"$PATH:$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin\" ");
+        const auto remote = [&](const QString &inner) {
+            return QStringLiteral("exec \"$SHELL\" -l -c %1").arg(shellQuote(inner));
+        };
+        QTest::newRow("plain") << "host" << "/home/u/proj" << "claude-agent-acp" << QStringList{}
+                               << QStringList{QStringLiteral("--"), QStringLiteral("host"), remote(QStringLiteral("cd '/home/u/proj' && ") + env + QStringLiteral("'claude-agent-acp'"))};
+        QTest::newRow("user, port, args") << "alice@host:2222" << "/srv" << "vibe-acp" << QStringList{QStringLiteral("--x"), QStringLiteral("a b")}
+                                          << QStringList{QStringLiteral("-l"), QStringLiteral("alice"), QStringLiteral("-p"), QStringLiteral("2222"), QStringLiteral("--"),
+                                                         QStringLiteral("host"), remote(QStringLiteral("cd '/srv' && ") + env + QStringLiteral("'vibe-acp' '--x' 'a b'"))};
+        QTest::newRow("local absolute program") << "host" << "/p" << "/home/me/.local/bin/claude-agent-acp" << QStringList{}
+                                                << QStringList{QStringLiteral("--"), QStringLiteral("host"), remote(QStringLiteral("cd '/p' && ") + env + QStringLiteral("'claude-agent-acp'"))};
+        QTest::newRow("fish domain user") << "DOM;alice@host" << "/x" << "a" << QStringList{} << QStringList{};
+        QTest::newRow("option-like host") << "-oProxyCommand=x" << "/x" << "a" << QStringList{} << QStringList{};
+    }
+
+    void sshAgent()
+    {
+        QFETCH(QString, authority);
+        QFETCH(QString, path);
+        QFETCH(QString, program);
+        QFETCH(QStringList, args);
+        QFETCH(QStringList, expected);
+        const QStringList ssh{QStringLiteral("ssh"), QStringLiteral("-F"), QStringLiteral("/cfg")};
+        const QStringList command = sshAgentCommand(Location{QStringLiteral("sftp"), authority, path}, ssh, program, args);
+        if (expected.isEmpty()) {
+            QVERIFY(command.isEmpty());
+            return;
+        }
+        const QStringList options{QStringLiteral("-T"),
+                                  QStringLiteral("-o"),
+                                  QStringLiteral("ServerAliveInterval=15"),
+                                  QStringLiteral("-o"),
+                                  QStringLiteral("ServerAliveCountMax=3"),
+                                  QStringLiteral("-o"),
+                                  QStringLiteral("ConnectTimeout=10")};
+        QCOMPARE(command, ssh + options + expected);
+        QVERIFY(sshAgentCommand(Location{QStringLiteral("smb"), authority, path}, ssh, program, args).isEmpty());
+    }
+
+    // The agent's remote command as each login shell runs it ("<shell> -c
+    // <command>", $SHELL the same shell): the agent from ~/.local/bin, in
+    // the directory, with its arguments; exit 127 without it.
+    void sshAgentRemoteCommand()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString home = dir.path() + QStringLiteral("/home");
+        const QString target = dir.path() + QStringLiteral("/a b/it's $HOME `x`");
+        QVERIFY(QDir().mkpath(target));
+        QVERIFY(QDir().mkpath(home + QStringLiteral("/.local/bin")));
+        {
+            QFile agent(home + QStringLiteral("/.local/bin/agent"));
+            QVERIFY(agent.open(QIODevice::WriteOnly));
+            agent.write("#!/bin/sh\nfor a in \"$@\"; do echo \"[$a]\"; done; pwd\n");
+            agent.setPermissions(agent.permissions() | QFile::ExeOwner);
+        }
+        const QStringList args{QStringLiteral("--x"), QStringLiteral("$HOME 'q' \"d\"")};
+        const QString remote = sshAgentCommand(Location{QStringLiteral("sftp"), QStringLiteral("h"), target}, {QStringLiteral("ssh")}, QStringLiteral("agent"), args).last();
+        const QString missing =
+            sshAgentCommand(Location{QStringLiteral("sftp"), QStringLiteral("h"), target}, {QStringLiteral("ssh")}, QStringLiteral("no-such-agent"), {}).last();
+        int shells = 0;
+        for (const QString &loginShell : {QStringLiteral("sh"), QStringLiteral("bash"), QStringLiteral("zsh"), QStringLiteral("fish")}) {
+            const QString program = QStandardPaths::findExecutable(loginShell);
+            if (program.isEmpty()) {
+                continue;
+            }
+            ++shells;
+            QProcessEnvironment env;
+            env.insert(QStringLiteral("SHELL"), program);
+            env.insert(QStringLiteral("HOME"), home);
+            env.insert(QStringLiteral("PATH"), QStringLiteral("/usr/bin:/bin"));
+            QProcess process;
+            process.setProcessEnvironment(env);
+            process.start(program, {QStringLiteral("-c"), remote});
+            QVERIFY(process.waitForFinished());
+            QCOMPARE(QString::fromLocal8Bit(process.readAllStandardOutput()),
+                     QStringLiteral("[--x]\n[$HOME 'q' \"d\"]\n") + target + QLatin1Char('\n'));
+            process.start(program, {QStringLiteral("-c"), missing});
+            QVERIFY(process.waitForFinished());
+            QCOMPARE(process.exitCode(), 127);
+        }
+        QVERIFY(shells > 0);
+    }
+
+    void remotePaths()
+    {
+        const QString hostDir = QStringLiteral("/home/me/.kate-remote/sftp/u@h:22");
+        const RemotePathMap map(hostDir);
+        QCOMPARE(map.toLocal(QStringLiteral("/home/u/a.cpp")), hostDir + QStringLiteral("/home/u/a.cpp"));
+        QCOMPARE(map.toLocal(QStringLiteral("/")), hostDir);
+        // Never above the host directory.
+        QCOMPARE(map.toLocal(QStringLiteral("/..")), hostDir);
+        QCOMPARE(map.toLocal(QStringLiteral("/../../../home/me/.ssh/id_ed25519")), hostDir + QStringLiteral("/home/me/.ssh/id_ed25519"));
+        QCOMPARE(map.toLocal(QStringLiteral("/a/./b/../../../x")), hostDir + QStringLiteral("/x"));
+        QCOMPARE(map.toLocal(QStringLiteral("//a//b/")), hostDir + QStringLiteral("/a/b"));
+        QCOMPARE(map.toLocal(QStringLiteral("file:///../../etc/passwd")), QStringLiteral("file://") + hostDir + QStringLiteral("/etc/passwd"));
+        QCOMPARE(map.toLocal(QStringLiteral("file:///a/%2E%2E/%2E%2E/x")), QStringLiteral("file://") + hostDir + QStringLiteral("/x"));
+        QCOMPARE(map.toLocal(QStringLiteral("src/a.cpp")), QStringLiteral("src/a.cpp"));
+        QCOMPARE(map.toLocal(QStringLiteral("file:///home/u/a%20b.cpp")), QStringLiteral("file://") + hostDir + QStringLiteral("/home/u/a b.cpp"));
+        QCOMPARE(map.toLocal(QStringLiteral("https://example.org/x")), QStringLiteral("https://example.org/x"));
+
+        QCOMPARE(map.toRemote(hostDir + QStringLiteral("/home/u/a.cpp")), QStringLiteral("/home/u/a.cpp"));
+        QCOMPARE(map.toRemote(hostDir), QStringLiteral("/"));
+        QCOMPARE(map.toRemote(QStringLiteral("see ") + hostDir + QStringLiteral("/x and ") + hostDir + QStringLiteral(".")), QStringLiteral("see /x and /."));
+        QCOMPARE(map.toRemote(QStringLiteral("file://") + hostDir + QStringLiteral("/a")), QStringLiteral("file:///a"));
+        // Other hosts and other places stay.
+        QCOMPARE(map.toRemote(hostDir + QStringLiteral("2/x")), hostDir + QStringLiteral("2/x"));
+        QCOMPARE(map.toRemote(QStringLiteral("/backup") + hostDir + QStringLiteral("/x")), QStringLiteral("/backup") + hostDir + QStringLiteral("/x"));
+        QCOMPARE(map.toRemote(QStringLiteral("/home/me/other")), QStringLiteral("/home/me/other"));
+
+        // A host directory with characters URIs encode.
+        const RemotePathMap spaced(QStringLiteral("/home/my dir/r/sftp/h"));
+        QCOMPARE(spaced.toRemote(QUrl::fromLocalFile(QStringLiteral("/home/my dir/r/sftp/h/a b")).toString(QUrl::FullyEncoded)), QStringLiteral("file:///a%20b"));
+        QCOMPARE(spaced.toRemote(QUrl::fromLocalFile(QStringLiteral("/home/my dir/r/sftp/h/a b")).toString()), QStringLiteral("file:///a b"));
+
+        const RemotePathMap identity;
+        QVERIFY(identity.isIdentity());
+        QCOMPARE(identity.toLocal(QStringLiteral("/x")), QStringLiteral("/x"));
+        QCOMPARE(identity.toRemote(hostDir + QStringLiteral("/x")), hostDir + QStringLiteral("/x"));
+    }
+
+    void windowsRemotePaths()
+    {
+        const QString hostDir = QStringLiteral("/r/sftp/me@win");
+        const RemotePathMap map(hostDir, RemotePathMap::Style::Windows, QLatin1Char('C'));
+        QCOMPARE(map.toLocal(QStringLiteral("C:\\Users\\me\\proj\\a.cpp")), hostDir + QStringLiteral("/C:/Users/me/proj/a.cpp"));
+        QCOMPARE(map.toLocal(QStringLiteral("c:/Users/me/proj/a.cpp")), hostDir + QStringLiteral("/C:/Users/me/proj/a.cpp"));
+        QCOMPARE(map.toLocal(QStringLiteral("/C:/Users/me")), hostDir + QStringLiteral("/C:/Users/me"));
+        QCOMPARE(map.toLocal(QStringLiteral("d:\\x")), hostDir + QStringLiteral("/D:/x"));
+        QCOMPARE(map.toLocal(QStringLiteral("C:\\")), hostDir + QStringLiteral("/C:"));
+        QCOMPARE(map.toLocal(QStringLiteral("C:\\a\\..\\..\\..\\x")), hostDir + QStringLiteral("/C:/x"));
+        QCOMPARE(map.toLocal(QStringLiteral("file:///C:/Users/me/a%20b.cpp")), QStringLiteral("file://") + hostDir + QStringLiteral("/C:/Users/me/a b.cpp"));
+        QCOMPARE(map.toLocal(QStringLiteral("src\\a.cpp")), QStringLiteral("src\\a.cpp"));
+        QCOMPARE(map.toLocal(QStringLiteral("\\\\server\\share\\x")), QStringLiteral("\\\\server\\share\\x"));
+
+        QCOMPARE(map.toRemote(hostDir + QStringLiteral("/C:/Users/me/my proj/a.cpp"), true), QStringLiteral("C:\\Users\\me\\my proj\\a.cpp"));
+        // In text, a path ends at a space.
+        QCOMPARE(map.toRemote(hostDir + QStringLiteral("/C:/a.cpp has a read/write bug")), QStringLiteral("C:\\a.cpp has a read/write bug"));
+        // As JSON: path keys whole, other strings as text.
+        const QJsonObject message = map.outgoing(QJsonObject{{QStringLiteral("cwd"), QString(hostDir + QStringLiteral("/C:/my proj"))},
+                                                             {QStringLiteral("text"), QString(hostDir + QStringLiteral("/C:/my proj/a b"))}});
+        QCOMPARE(message[QStringLiteral("cwd")].toString(), QStringLiteral("C:\\my proj"));
+        QCOMPARE(message[QStringLiteral("text")].toString(), QStringLiteral("C:\\my proj/a b"));
+        QCOMPARE(map.toRemote(hostDir + QStringLiteral("/C:"), true), QStringLiteral("C:\\"));
+        QCOMPARE(map.toRemote(QStringLiteral("Look at ") + hostDir + QStringLiteral("/C:/Users/me/a.cpp, please")),
+                 QStringLiteral("Look at C:\\Users\\me\\a.cpp, please"));
+        QCOMPARE(map.toRemote(QStringLiteral("file://") + hostDir + QStringLiteral("/C:/Users/me/a.cpp")), QStringLiteral("file:///C:/Users/me/a.cpp"));
+        // Not a drive: as on POSIX hosts.
+        QCOMPARE(map.toRemote(hostDir + QStringLiteral("/x")), QStringLiteral("/x"));
+    }
+
+    void windowsAgent()
+    {
+        const QStringList ssh{QStringLiteral("ssh")};
+        const QStringList command = sshAgentCommand(Location{QStringLiteral("sftp"), QStringLiteral("me@win"), QStringLiteral("/C:/Users/me/it's proj")}, ssh,
+                                                    QStringLiteral("/usr/bin/claude-agent-acp"), {QStringLiteral("--x"), QStringLiteral("a \"b\" c\\")});
+        QVERIFY(!command.isEmpty());
+        QCOMPARE(command.mid(command.size() - 4, 3), (QStringList{QStringLiteral("me"), QStringLiteral("--"), QStringLiteral("win")}));
+        const QString prefix = QStringLiteral("powershell -NoLogo -NoProfile -NonInteractive -EncodedCommand ");
+        QVERIFY(command.last().startsWith(prefix));
+        // Windows' cmd takes command lines up to 8191 characters.
+        QVERIFY2(command.last().size() < 7000, qPrintable(QString::number(command.last().size())));
+        const QByteArray utf16 = QByteArray::fromBase64(command.last().mid(prefix.size()).toLatin1());
+        QString script;
+        for (qsizetype i = 0; i + 1 < utf16.size(); i += 2) {
+            script += QChar(char16_t(uchar(utf16.at(i)) | (uchar(utf16.at(i + 1)) << 8)));
+        }
+        QCOMPARE(script, windowsAgentScript(QStringLiteral("C:\\Users\\me\\it's proj"), QStringLiteral("claude-agent-acp"), {QStringLiteral("--x"), QStringLiteral("a \"b\" c\\")}));
+        QVERIFY(script.contains(QStringLiteral("$d='C:\\Users\\me\\it''s proj'\n")));
+        QVERIFY(script.contains(QStringLiteral("Get-Command -Name 'claude-agent-acp' ")));
+        QVERIFY(script.contains(QStringLiteral("$i.Arguments='--x \"a \\\"b\\\" c\\\\\"'\n")));
+        // fish has no Windows hosts.
+        QVERIFY(sshAgentCommand(Location{QStringLiteral("fish"), QStringLiteral("win"), QStringLiteral("/C:/x")}, ssh, QStringLiteral("a"), {}).isEmpty());
+    }
+
+    void windowsArguments_data()
+    {
+        QTest::addColumn<QString>("arg");
+        QTest::addColumn<QString>("quoted");
+        QTest::newRow("plain") << "--x" << "--x";
+        QTest::newRow("empty") << "" << "\"\"";
+        QTest::newRow("space") << "a b" << "\"a b\"";
+        QTest::newRow("quote") << "a\"b" << "\"a\\\"b\"";
+        QTest::newRow("backslashes") << "C:\\a b\\" << "\"C:\\a b\\\\\"";
+        QTest::newRow("backslash quote") << "a\\\"b" << "\"a\\\\\\\"b\"";
+        QTest::newRow("plain backslash") << "C:\\x" << "C:\\x";
+    }
+
+    void windowsArguments()
+    {
+        QFETCH(QString, arg);
+        QFETCH(QString, quoted);
+        QCOMPARE(windowsArgument(arg), quoted);
+    }
+
+    void remoteMessages()
+    {
+        const QString hostDir = QStringLiteral("/r/sftp/h");
+        const RemotePathMap map(hostDir);
+        const auto json = [](const char *text) {
+            return QJsonDocument::fromJson(text).object();
+        };
+        // From the agent: path-like keys only; titles, commands and text stay.
+        const QJsonObject update = json("{\"sessionUpdate\":\"tool_call\",\"title\":\"Read /srv/a.cpp\",\"kind\":\"read\","
+            "\"locations\":[{\"path\":\"/srv/a.cpp\",\"line\":3}],"
+            "\"rawInput\":{\"file_path\":\"/srv/a.cpp\",\"command\":\"cat /srv/a.cpp\",\"paths\":[\"/x\",\"rel\"]},"
+            "\"content\":[{\"type\":\"diff\",\"path\":\"/srv/a.cpp\",\"oldText\":\"/srv\",\"newText\":\"x\"},"
+            "{\"type\":\"content\",\"content\":{\"type\":\"resource_link\",\"uri\":\"file:///srv/b\"}}]}");
+        const QJsonObject local = map.incoming(update);
+        QCOMPARE(local[QStringLiteral("title")].toString(), QStringLiteral("Read /srv/a.cpp"));
+        QCOMPARE(local[QStringLiteral("locations")].toArray().at(0)[QStringLiteral("path")].toString(), hostDir + QStringLiteral("/srv/a.cpp"));
+        QCOMPARE(local[QStringLiteral("locations")].toArray().at(0)[QStringLiteral("line")].toInt(), 3);
+        const QJsonObject input = local[QStringLiteral("rawInput")].toObject();
+        QCOMPARE(input[QStringLiteral("file_path")].toString(), hostDir + QStringLiteral("/srv/a.cpp"));
+        QCOMPARE(input[QStringLiteral("command")].toString(), QStringLiteral("cat /srv/a.cpp"));
+        QCOMPARE(input[QStringLiteral("paths")].toArray().at(0).toString(), hostDir + QStringLiteral("/x"));
+        QCOMPARE(input[QStringLiteral("paths")].toArray().at(1).toString(), QStringLiteral("rel"));
+        const QJsonArray content = local[QStringLiteral("content")].toArray();
+        QCOMPARE(content.at(0)[QStringLiteral("path")].toString(), hostDir + QStringLiteral("/srv/a.cpp"));
+        QCOMPARE(content.at(0)[QStringLiteral("oldText")].toString(), QStringLiteral("/srv"));
+        QCOMPARE(content.at(1)[QStringLiteral("content")][QStringLiteral("uri")].toString(), QStringLiteral("file://") + hostDir + QStringLiteral("/srv/b"));
+
+        // To the agent: every string.
+        const QJsonObject prompt = json("{\"cwd\":\"/r/sftp/h/srv\",\"prompt\":[{\"type\":\"resource\",\"resource\":{\"uri\":\"file:///r/sftp/h/srv/a.cpp\",\"text\":\"int x;\"}},"
+            "{\"type\":\"text\",\"text\":\"Look at /r/sftp/h/srv/a.cpp\"}],\"n\":1}");
+        const QJsonObject remote = map.outgoing(prompt);
+        QCOMPARE(remote[QStringLiteral("cwd")].toString(), QStringLiteral("/srv"));
+        QCOMPARE(remote[QStringLiteral("n")].toInt(), 1);
+        const QJsonArray blocks = remote[QStringLiteral("prompt")].toArray();
+        QCOMPARE(blocks.at(0)[QStringLiteral("resource")][QStringLiteral("uri")].toString(), QStringLiteral("file:///srv/a.cpp"));
+        QCOMPARE(blocks.at(0)[QStringLiteral("resource")][QStringLiteral("text")].toString(), QStringLiteral("int x;"));
+        QCOMPARE(blocks.at(1)[QStringLiteral("text")].toString(), QStringLiteral("Look at /srv/a.cpp"));
+        QCOMPARE(RemotePathMap().incoming(update), update);
+    }
+
+    void askpassEnvironment()
+    {
+        QProcessEnvironment env;
+        env.insert(QStringLiteral("SSH_ASKPASS"), QStringLiteral("/usr/bin/other-askpass"));
+        QVERIFY(setSshAskpassEnvironment(env, QStringLiteral("/x/kate-remote-fs-askpass"), QStringLiteral("alice@h"), QStringLiteral("/run/state")));
+        QCOMPARE(env.value(QStringLiteral("SSH_ASKPASS")), QStringLiteral("/x/kate-remote-fs-askpass"));
+        QCOMPARE(env.value(QStringLiteral("SSH_ASKPASS_REQUIRE")), QStringLiteral("force"));
+        QCOMPARE(env.value(QStringLiteral("KATE_REMOTE_AUTHORITY")), QStringLiteral("alice@h"));
+        QCOMPARE(env.value(QStringLiteral("KATE_REMOTE_FALLBACK_ASKPASS")), QStringLiteral("/usr/bin/other-askpass"));
+        QCOMPARE(env.value(QStringLiteral("KATE_REMOTE_ASKPASS_STATE")), QStringLiteral("/run/state"));
+
+        // KdePasswords off: only the usual askpass.
+        QProcessEnvironment plain;
+        plain.insert(QStringLiteral("SSH_ASKPASS"), QStringLiteral("/usr/bin/other-askpass"));
+        QVERIFY(!setSshAskpassEnvironment(plain, QString(), QStringLiteral("h"), QStringLiteral("/run/state")));
+        QCOMPARE(plain.value(QStringLiteral("SSH_ASKPASS_REQUIRE")), QStringLiteral("prefer"));
+        QVERIFY(!plain.contains(QStringLiteral("KATE_REMOTE_AUTHORITY")));
     }
 
     void symlinkTargets_data()

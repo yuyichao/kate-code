@@ -8,6 +8,7 @@
 #include <QDBusConnection>
 #include <QDBusInterface>
 #include <QDBusReply>
+#include <QHash>
 #include <QJsonDocument>
 #include <QRegularExpression>
 #include <QString>
@@ -91,8 +92,11 @@ QJsonObject MCPServer::handleMessage(const QJsonObject &msg)
 
 QJsonObject MCPServer::handleInitialize(int id, const QJsonObject &params)
 {
-    Q_UNUSED(params);
     m_initialized = true;
+    // The client's version when it is one whose messages these are (the
+    // tools part did not change); HTTP clients ask for 2025-03-26 or later.
+    static const QStringList versions{QStringLiteral("2025-06-18"), QStringLiteral("2025-03-26"), QStringLiteral("2024-11-05")};
+    const QString requested = params[QStringLiteral("protocolVersion")].toString();
 
     QJsonObject serverInfo;
     serverInfo[QStringLiteral("name")] = QStringLiteral("kate-mcp-server");
@@ -102,7 +106,7 @@ QJsonObject MCPServer::handleInitialize(int id, const QJsonObject &params)
     capabilities[QStringLiteral("tools")] = QJsonObject();
 
     QJsonObject result;
-    result[QStringLiteral("protocolVersion")] = QStringLiteral("2024-11-05");
+    result[QStringLiteral("protocolVersion")] = versions.contains(requested) ? requested : QStringLiteral("2024-11-05");
     result[QStringLiteral("serverInfo")] = serverInfo;
     result[QStringLiteral("capabilities")] = capabilities;
 
@@ -355,6 +359,39 @@ QJsonObject MCPServer::handleToolsList(int id, const QJsonObject &params)
         docsTool, readTool, editTool, writeTool, askUserTool,
         pasteTerminalTool
     };
+    if (!m_remote.isIdentity()) {
+        // Kate's terminal is on the user's computer, not the agent's host.
+        QJsonArray tools = result[QStringLiteral("tools")].toArray();
+        tools.removeLast();
+        // Kate shows the host's files through a mount that lags behind
+        // changes made on the host: not "always use these".
+        static const QString lag = QStringLiteral(
+            "\n\nKate runs on the user's computer and shows this host's files through a mount that shows changes made on the host by other means "
+            "(commands, your own file tools) only after up to about 20 seconds; meanwhile this tool refuses such files, use your own tools for them.");
+        const QHash<QString, QString> descriptions{
+            {QStringLiteral("katecode_read"),
+             QStringLiteral("Reads a file of this host as Kate has it: for a file open in Kate, its buffer with the user's unsaved changes. "
+                            "Use it for files open in Kate (see katecode_documents); by default returns up to 2000 lines, use offset and limit for larger files.")
+                 + lag},
+            {QStringLiteral("katecode_edit"),
+             QStringLiteral("Edits a file of this host through Kate by replacing old_string with new_string, and saves it. The old_string must be unique in the file. "
+                            "For a file open in Kate the change is made in its buffer, where the user reviews and can undo it: prefer it to your own Edit for such files.")
+                 + lag},
+            {QStringLiteral("katecode_write"),
+             QStringLiteral("Writes a file of this host through Kate and saves it. For a file open in Kate its buffer is updated, where the user reviews and can undo the change.")
+                 + lag},
+            {QStringLiteral("katecode_documents"), QStringLiteral("Returns the files of this host that are open in the Kate editor on the user's computer.")},
+        };
+        for (qsizetype i = 0; i < tools.size(); ++i) {
+            QJsonObject tool = tools.at(i).toObject();
+            const QString description = descriptions.value(tool[QStringLiteral("name")].toString());
+            if (!description.isEmpty()) {
+                tool[QStringLiteral("description")] = description;
+                tools[i] = tool;
+            }
+        }
+        result[QStringLiteral("tools")] = tools;
+    }
 
     return makeResponse(id, result);
 }
@@ -362,8 +399,34 @@ QJsonObject MCPServer::handleToolsList(int id, const QJsonObject &params)
 QJsonObject MCPServer::handleToolsCall(int id, const QJsonObject &params)
 {
     const QString toolName = params[QStringLiteral("name")].toString();
-    const QJsonObject arguments = params[QStringLiteral("arguments")].toObject();
+    QJsonObject arguments = params[QStringLiteral("arguments")].toObject();
+    if (!m_remote.isIdentity()) {
+        if (toolName == QStringLiteral("katecode_paste_to_terminal")) {
+            return makeErrorResponse(id, -32602, QStringLiteral("Unknown tool: %1").arg(toolName));
+        }
+        if (arguments.contains(QStringLiteral("file_path"))) {
+            // The host's path; anything not absolute there is refused (a
+            // local reading would be relative to this server).
+            const QString path = arguments[QStringLiteral("file_path")].toString();
+            const QString local = m_remote.toLocal(path);
+            if (local == path) {
+                return makeResponse(id, makeErrorResult(QStringLiteral("Error: file_path must be an absolute path on the agent's host")));
+            }
+            arguments[QStringLiteral("file_path")] = local;
+        }
+        QJsonObject response = dispatchTool(id, toolName, arguments);
+        // Messages may name local paths; file contents stay as they are.
+        const QJsonObject result = response[QStringLiteral("result")].toObject();
+        if (toolName != QStringLiteral("katecode_read") || result[QStringLiteral("isError")].toBool()) {
+            response = m_remote.outgoing(response);
+        }
+        return response;
+    }
+    return dispatchTool(id, toolName, arguments);
+}
 
+QJsonObject MCPServer::dispatchTool(int id, const QString &toolName, const QJsonObject &arguments)
+{
     // Every tool reaches Kate over D-Bus. Refuse cleanly if the configured
     // service name is malformed rather than letting the QDBusInterface
     // constructor abort the whole server inside libdbus.
@@ -425,7 +488,18 @@ QJsonObject MCPServer::executeDocuments(const QJsonObject &arguments)
         return result;
     }
 
-    const QStringList docs = reply.value();
+    QStringList docs = reply.value();
+    if (!m_remote.isIdentity()) {
+        // Only the agent's host's documents, as its paths.
+        const QString prefix = m_remote.hostDir() + QLatin1Char('/');
+        QStringList remote;
+        for (const QString &doc : std::as_const(docs)) {
+            if (doc.startsWith(prefix)) {
+                remote << m_remote.toRemote(doc, true);
+            }
+        }
+        docs = remote;
+    }
     QString text;
     if (docs.isEmpty()) {
         text = QStringLiteral("No documents currently open in Kate.");

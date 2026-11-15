@@ -48,6 +48,7 @@ private:
     struct SummaryJob {
         QString sessionId;
         QString projectRoot;
+        QString agentDir; // where the summariser runs (cwd)
         QString acpSessionId;
         QString prompt;
         QString collected;

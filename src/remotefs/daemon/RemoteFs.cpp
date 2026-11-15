@@ -996,28 +996,14 @@ int RemoteFs::mountBackend(Mount *mount, QString *error)
 
     // ssh has no terminal here: it asks through SSH_ASKPASS.
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    QString fallbackAskpass = env.value(QStringLiteral("SSH_ASKPASS"));
-    if (fallbackAskpass.isEmpty() && (env.contains(QStringLiteral("DISPLAY")) || env.contains(QStringLiteral("WAYLAND_DISPLAY")))) {
-        fallbackAskpass = QStandardPaths::findExecutable(QStringLiteral("ksshaskpass"));
-    }
-    const QString askpass = m_config.kdePasswords ? m_askpassProgram : QString();
-    QString askpassState;
-    if (!askpass.isEmpty() && fallbackAskpass != askpass) {
-        // Login passwords from KDE's password cache, shared with KIO's sftp
-        // worker; other prompts go to the usual askpass.
-        askpassState = m_config.backendDir + QStringLiteral("/askpass/") + mount->scheme + QLatin1Char('_') + mount->authority;
+    // Login passwords from KDE's password cache, shared with KIO's sftp
+    // worker; other prompts go to the usual askpass.
+    QString askpassState = m_config.backendDir + QStringLiteral("/askpass/") + mount->scheme + QLatin1Char('_') + mount->authority;
+    if (KateRemote::setSshAskpassEnvironment(env, m_config.kdePasswords ? m_askpassProgram : QString(), mount->authority, askpassState)) {
         QDir().mkpath(QFileInfo(askpassState).absolutePath());
         QFile::remove(askpassState);
-        env.insert(QStringLiteral("SSH_ASKPASS"), askpass);
-        env.insert(QStringLiteral("SSH_ASKPASS_REQUIRE"), QStringLiteral("force"));
-        env.insert(QStringLiteral("KATE_REMOTE_AUTHORITY"), mount->authority);
-        env.insert(QStringLiteral("KATE_REMOTE_FALLBACK_ASKPASS"), fallbackAskpass);
-        env.insert(QStringLiteral("KATE_REMOTE_ASKPASS_STATE"), askpassState);
-    } else if (!fallbackAskpass.isEmpty()) {
-        env.insert(QStringLiteral("SSH_ASKPASS"), fallbackAskpass);
-        if (!env.contains(QStringLiteral("SSH_ASKPASS_REQUIRE"))) {
-            env.insert(QStringLiteral("SSH_ASKPASS_REQUIRE"), QStringLiteral("prefer"));
-        }
+    } else {
+        askpassState.clear();
     }
 
     QString output;

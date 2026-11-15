@@ -1,6 +1,9 @@
 #include "SummaryGenerator.h"
 #include "../acp/ACPService.h"
 #include "../config/SettingsStore.h"
+#include "RemoteLocation.h"
+
+#include <QDir>
 
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -98,10 +101,15 @@ void SummaryGenerator::generateSummary(const QString &sessionId,
 
     auto *svc = new ACPService(this);
     svc->setExecutable(provider.executable, QProcess::splitCommand(provider.options));
+    // The summariser only reads the transcript it is sent: always local,
+    // and not in a remote folder (the mount), where it could only wait for
+    // the network.
+    svc->setAllowRemote(false);
 
     SummaryJob job;
     job.sessionId = sessionId;
     job.projectRoot = projectRoot;
+    job.agentDir = KateRemote::locationForPath(projectRoot, KateRemote::configuredMountRoot()) ? QDir::homePath() : projectRoot;
     job.prompt = buildPrompt(projectRoot, transcriptContent);
     m_jobs.insert(svc, job);
 
@@ -146,9 +154,9 @@ void SummaryGenerator::generateSummary(const QString &sessionId,
     });
 
     qDebug() << "[SummaryGenerator] Starting summariser agent:" << provider.executable
-             << "in" << projectRoot;
+             << "in" << job.agentDir;
     // start() reports failure through errorOccurred, which failJob() handles.
-    svc->start(projectRoot);
+    svc->start(job.agentDir);
 }
 
 void SummaryGenerator::onServiceResponse(ACPService *svc, int id,
@@ -167,7 +175,7 @@ void SummaryGenerator::onServiceResponse(ACPService *svc, int id,
 
     if (id == job.initId) {
         QJsonObject params;
-        params[QStringLiteral("cwd")] = job.projectRoot;
+        params[QStringLiteral("cwd")] = job.agentDir;
         // Deliberately no MCP servers: the summariser needs no Kate tools.
         params[QStringLiteral("mcpServers")] = QJsonArray();
         job.newId = svc->sendRequest(QStringLiteral("session/new"), params);

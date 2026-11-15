@@ -6,9 +6,15 @@
 #include "EditorSession.h"
 #include "EditorDBusService.h"
 
+#include <KTextEditor/Application>
+#include <KTextEditor/Document>
+#include <KTextEditor/Editor>
+
 #include <QCoreApplication>
 #include <QDebug>
+#include <QDir>
 #include <QTimer>
+#include <QUrl>
 
 namespace
 {
@@ -43,8 +49,35 @@ QStringList EditorSession::listDocuments()
     return m_service ? m_service->listDocuments() : QStringList();
 }
 
+void EditorSession::holdRemoteFiles(const QString &hostDir, int milliseconds)
+{
+    m_heldHostDir = hostDir;
+    m_heldUntil = QDeadlineTimer(milliseconds);
+}
+
+QString EditorSession::heldError(const QString &filePath, bool reading) const
+{
+    if (m_heldHostDir.isEmpty() || m_heldUntil.hasExpired() || !QDir::cleanPath(filePath).startsWith(m_heldHostDir + QLatin1Char('/'))) {
+        return {};
+    }
+    if (reading) {
+        KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
+        KTextEditor::Document *doc = app ? app->findUrl(QUrl::fromLocalFile(filePath)) : nullptr;
+        if (doc && doc->isModified()) {
+            return {};
+        }
+    }
+    return QStringLiteral("ERROR: %1 may have been changed on the agent's host in the last seconds (by a command or another tool), "
+                          "which Kate shows only after up to about 20 seconds. Use your own file tools for it, or try again in %2 seconds.")
+        .arg(filePath)
+        .arg((m_heldUntil.remainingTime() + 999) / 1000);
+}
+
 QString EditorSession::readDocument(const QString &filePath)
 {
+    if (const QString error = heldError(filePath, true); !error.isEmpty()) {
+        return error;
+    }
     return m_service ? m_service->readDocument(filePath) : QStringLiteral("ERROR: Kate Code is shutting down");
 }
 
@@ -52,6 +85,9 @@ QString EditorSession::editDocument(const QString &filePath, const QString &oldT
 {
     if (!m_service) {
         return QStringLiteral("ERROR: Kate Code is shutting down");
+    }
+    if (const QString error = heldError(filePath, false); !error.isEmpty()) {
+        return error;
     }
     const QString result = m_service->editDocument(filePath, oldText, newText);
     if (result == QStringLiteral("OK")) {
@@ -62,6 +98,9 @@ QString EditorSession::editDocument(const QString &filePath, const QString &oldT
 
 QString EditorSession::writeDocument(const QString &filePath, const QString &content)
 {
+    if (const QString error = heldError(filePath, false); !error.isEmpty()) {
+        return error;
+    }
     return m_service ? m_service->writeDocument(filePath, content) : QStringLiteral("ERROR: Kate Code is shutting down");
 }
 

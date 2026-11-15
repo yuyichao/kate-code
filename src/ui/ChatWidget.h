@@ -206,6 +206,9 @@ private:
     void applyDiffColors();
     void applyACPBackend();
     void populateProviderCombo();
+    // Before starting an agent in root: notes in msg when it runs on a
+    // remote host, and updates the provider list for that.
+    void prepareAgentLocation(const QString &root, Message &msg);
     void onProviderComboChanged(int index);
     void updateTerminalSize();
     void resetWebView();
@@ -306,6 +309,9 @@ private:
 
     // Set while stopSessionQuietly() runs.
     bool m_quietStop = false;
+    // The provider list is for a folder on an ssh host, where agents run
+    // (installed or not here).
+    bool m_remoteProviders = false;
     // Session the Reconnect button resumes: the last one that connected
     // (empty for a chat whose first connection failed).
     QString m_reconnectSessionId;

@@ -8,6 +8,7 @@
 #include <QDBusConnection>
 #include <QDBusContext>
 #include <QDBusMessage>
+#include <QDeadlineTimer>
 #include <QHash>
 #include <QObject>
 #include <QPointer>
@@ -57,6 +58,12 @@ public:
     // chat view is reset; emits questionCancelled for each.
     void cancelPendingQuestions(const QString &reason);
 
+    // A remote agent may just have changed files of its host (below
+    // hostDir) by other means, which Kate sees only once sshfs's cache
+    // expires: until then its tools refuse to change them or to read them
+    // (except open documents with unsaved changes, which are the user's).
+    void holdRemoteFiles(const QString &hostDir, int milliseconds);
+
 public Q_SLOTS:
     // DBus methods (org.kde.katecode.Editor). Only DBus methods are slots
     // here: every public slot is exported.
@@ -76,6 +83,8 @@ private:
     friend class EditorDBusService;
     void setRegistered(bool registered) { m_registered = registered; }
     void finishQuestion(const QString &requestId, const QString &reply, bool notifyUi);
+    // The refusal for filePath while held (see holdRemoteFiles()), else empty.
+    QString heldError(const QString &filePath, bool reading) const;
 
     struct PendingQuestion {
         QDBusConnection connection;
@@ -89,4 +98,6 @@ private:
     bool m_destroying = false;
     MainWindowProvider m_mainWindowProvider;
     QHash<QString, PendingQuestion> m_pendingQuestions;
+    QString m_heldHostDir;
+    QDeadlineTimer m_heldUntil;
 };

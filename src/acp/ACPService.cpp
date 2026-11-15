@@ -1,10 +1,19 @@
 #include "ACPService.h"
 
+#include "RemoteLocation.h"
+
+#include <QDBusConnection>
+#include <QDBusMessage>
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QRandomGenerator>
+#include <QRegularExpression>
 #include <QStandardPaths>
+#include <QUuid>
 
 ACPService::ACPService(QObject *parent)
     : QObject(parent)
@@ -27,6 +36,140 @@ ACPService::~ACPService()
         disconnect(m_process, nullptr, this, nullptr);
     }
     stop();
+    removeAskpassState();
+}
+
+// kate-remote-fs-askpass, as kate-remote-fs uses it (empty when its
+// KdePasswords setting is off or the daemon does not run).
+static QString remoteFsAskpassProgram()
+{
+    QDBusMessage call = QDBusMessage::createMethodCall(QStringLiteral("org.kde.KateRemoteFS"),
+                                                       QStringLiteral("/org/kde/KateRemoteFS"),
+                                                       QStringLiteral("org.kde.KateRemoteFS"),
+                                                       QStringLiteral("askpassProgram"));
+    const QDBusMessage reply = QDBusConnection::sessionBus().call(call, QDBus::Block, 3000);
+    return reply.type() == QDBusMessage::ReplyMessage && !reply.arguments().isEmpty() ? reply.arguments().constFirst().toString() : QString();
+}
+
+QString ACPService::remoteHostFor(const QString &workingDir)
+{
+    const auto location = KateRemote::locationForPath(workingDir, KateRemote::configuredMountRoot());
+    if (!location || KateRemote::sshAgentCommand(*location, {QStringLiteral("ssh")}, QStringLiteral("agent"), {}).isEmpty()) {
+        return {};
+    }
+    return location->authority;
+}
+
+QStringList ACPService::remoteCommand(const QString &workingDir)
+{
+    m_pathMap = KateRemote::RemotePathMap();
+    m_remoteHost.clear();
+    if (!m_allowRemote) {
+        return {};
+    }
+    const auto location = KateRemote::locationForPath(workingDir, KateRemote::configuredMountRoot());
+    if (!location || !KateRemote::isSshScheme(location->scheme)) {
+        return {};
+    }
+    const QStringList command = KateRemote::sshAgentCommand(*location, KateRemote::configuredSshCommand(), m_executable, m_executableArgs);
+    if (command.isEmpty()) {
+        // fish logins ssh does not take (DOMAIN;user): the agent works on
+        // the mount locally, as for other remote folders.
+        qWarning() << "[ACPService] Cannot run the agent on" << location->authority << "- running it locally";
+        return {};
+    }
+    m_remoteHost = location->authority;
+    const QString hostDir = KateRemote::pathForLocation({location->scheme, location->authority, QStringLiteral("/")}, KateRemote::configuredMountRoot());
+    const QString windowsPath = KateRemote::windowsPathForSftpPath(location->path);
+    m_pathMap = windowsPath.isEmpty() ? KateRemote::RemotePathMap(hostDir)
+                                      : KateRemote::RemotePathMap(hostDir, KateRemote::RemotePathMap::Style::Windows, location->path.at(1));
+    return command;
+}
+
+QString ACPService::remoteMcpUrl() const
+{
+    return m_mcpRemotePort > 0 ? QStringLiteral("http://127.0.0.1:%1/mcp").arg(m_mcpRemotePort) : QString();
+}
+
+quint16 ACPService::startMcpServer()
+{
+    QByteArray token(32, Qt::Uninitialized);
+    for (char &c : token) {
+        c = "0123456789abcdef"[QRandomGenerator::system()->bounded(16)];
+    }
+    QStringList args{QStringLiteral("--http"), QStringLiteral("--remote-root"), m_pathMap.hostDir()};
+    if (m_pathMap.style() == KateRemote::RemotePathMap::Style::Windows) {
+        // The drive as the mount spells it: the one of the folder.
+        args << QStringLiteral("--remote-windows") << QString(m_pathMap.drive().isNull() ? QLatin1Char('C') : m_pathMap.drive());
+    }
+    QProcessEnvironment env = m_mcpEnvironment;
+    env.insert(QStringLiteral("KATECODE_MCP_TOKEN"), QString::fromLatin1(token));
+    m_mcpProcess = new QProcess(this);
+    m_mcpProcess->setProcessEnvironment(env);
+    m_mcpProcess->setProcessChannelMode(QProcess::ForwardedErrorChannel);
+    m_mcpProcess->start(m_mcpProgram, args);
+    // It prints its port at once ("PORT <n>").
+    QByteArray output;
+    QElapsedTimer timer;
+    timer.start();
+    while (!output.contains('\n') && timer.elapsed() < 3000 && m_mcpProcess->state() != QProcess::NotRunning) {
+        if (m_mcpProcess->waitForReadyRead(100)) {
+            output += m_mcpProcess->readAllStandardOutput();
+        }
+    }
+    const QByteArray line = output.left(output.indexOf('\n')).trimmed();
+    const quint16 port = line.startsWith("PORT ") ? line.mid(5).toUShort() : 0;
+    if (port == 0) {
+        qWarning() << "[ACPService] Kate's MCP server did not start:" << m_mcpProgram << output;
+        stopMcpServer();
+        return 0;
+    }
+    m_mcpToken = token;
+    connect(m_mcpProcess, &QProcess::finished, this, [this](int exitCode, QProcess::ExitStatus status) {
+        qWarning() << "[ACPService] Kate's MCP server for" << m_remoteHost << "exited:" << exitCode << status;
+    });
+    return port;
+}
+
+void ACPService::stopMcpServer()
+{
+    if (m_mcpProcess) {
+        m_mcpProcess->disconnect(this);
+        // It ends at end of input.
+        m_mcpProcess->closeWriteChannel();
+        if (!m_mcpProcess->waitForFinished(1000)) {
+            m_mcpProcess->kill();
+            m_mcpProcess->waitForFinished(1000);
+        }
+        m_mcpProcess->deleteLater();
+        m_mcpProcess = nullptr;
+    }
+    m_mcpLocalPort = 0;
+    m_mcpRemotePort = 0;
+    m_mcpToken.clear();
+    if (m_mcpPending) {
+        m_mcpPending = false;
+        Q_EMIT remoteMcpReady();
+    }
+}
+
+void ACPService::mcpForwardResult(int remotePort)
+{
+    if (!m_mcpPending) {
+        return;
+    }
+    m_mcpPending = false;
+    m_mcpRemotePort = remotePort;
+    qDebug() << "[ACPService] Kate's MCP server on" << m_remoteHost << ":" << remoteMcpUrl();
+    Q_EMIT remoteMcpReady();
+}
+
+void ACPService::removeAskpassState()
+{
+    if (!m_askpassState.isEmpty()) {
+        QFile::remove(m_askpassState);
+        m_askpassState.clear();
+    }
 }
 
 bool ACPService::start(const QString &workingDir)
@@ -42,48 +185,97 @@ bool ACPService::start(const QString &workingDir)
     // itself to the new process's first message.
     m_buffer.clear();
 
+    m_stderrTail.clear();
+    m_stderrLine.clear();
+    removeAskpassState();
+    stopMcpServer();
+
+    QStringList remote = remoteCommand(workingDir);
+    if (!remote.isEmpty() && !m_mcpProgram.isEmpty()) {
+        // Kate's tools: an HTTP MCP server here, reached from the host's
+        // 127.0.0.1 through ssh. Without ExitOnForwardFailure a host that
+        // refuses forwarding still runs the agent (without the tools).
+        m_mcpLocalPort = startMcpServer();
+        if (m_mcpLocalPort > 0) {
+            // Before "-- host <command>". A connection of its own: through
+            // a shared one (ControlMaster) ssh does not report the port,
+            // and the forward would outlive the agent; the report is an
+            // INFO message (a LogLevel of ERROR in ssh_config hides it).
+            // ssh takes the first value of an option: these beat the
+            // config files.
+            const QStringList forward{QStringLiteral("-o"),
+                                      QStringLiteral("ControlPath=none"),
+                                      QStringLiteral("-o"),
+                                      QStringLiteral("LogLevel=INFO"),
+                                      QStringLiteral("-R"),
+                                      QStringLiteral("0:127.0.0.1:%1").arg(m_mcpLocalPort)};
+            for (const QString &arg : forward) {
+                remote.insert(remote.size() - 3, arg);
+            }
+            m_mcpPending = true;
+        }
+    }
+
     m_process = new QProcess(this);
-    m_process->setWorkingDirectory(workingDir);
 
     connect(m_process, &QProcess::readyReadStandardOutput, this, &ACPService::onStdout);
     connect(m_process, &QProcess::readyReadStandardError, this, &ACPService::onStderr);
     connect(m_process, &QProcess::finished, this, &ACPService::onFinished);
     connect(m_process, &QProcess::errorOccurred, this, &ACPService::onError);
 
-    // Resolve executable path - when launched from desktop environments,
-    // user-local paths like ~/.local/bin may not be on PATH
-    QString resolvedExecutable = m_executable;
-    if (!QFileInfo(resolvedExecutable).isAbsolute()) {
-        QString found = QStandardPaths::findExecutable(resolvedExecutable);
-        if (found.isEmpty()) {
-            // Fallback: check common user-local directories where curl|bash
-            // installers and package managers typically place binaries
-            const QString home = QDir::homePath();
-            const QStringList fallbackDirs = {
-                home + QStringLiteral("/.local/bin"),
-                home + QStringLiteral("/bin"),
-                home + QStringLiteral("/.cargo/bin"),
-            };
-            for (const QString &dir : fallbackDirs) {
-                QString candidate = dir + QLatin1Char('/') + resolvedExecutable;
-                if (QFileInfo::exists(candidate)) {
-                    found = candidate;
-                    break;
+    if (!remote.isEmpty()) {
+        // ssh without a terminal: passwords through SSH_ASKPASS, from KDE's
+        // password cache like the mounts, else a dialog.
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        const QString state = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/kate-code-askpass-")
+            + QUuid::createUuid().toString(QUuid::Id128);
+        if (KateRemote::setSshAskpassEnvironment(env, remoteFsAskpassProgram(), m_remoteHost, state)) {
+            m_askpassState = state;
+        }
+        m_process->setProcessEnvironment(env);
+        // Not the mount: the agent's directory is on the host.
+        m_process->setWorkingDirectory(QDir::homePath());
+        qDebug() << "[ACPService] Starting agent on" << m_remoteHost << ":" << remote;
+        m_process->start(remote.constFirst(), remote.mid(1));
+    } else {
+        m_process->setWorkingDirectory(workingDir);
+
+        // Resolve executable path - when launched from desktop environments,
+        // user-local paths like ~/.local/bin may not be on PATH
+        QString resolvedExecutable = m_executable;
+        if (!QFileInfo(resolvedExecutable).isAbsolute()) {
+            QString found = QStandardPaths::findExecutable(resolvedExecutable);
+            if (found.isEmpty()) {
+                // Fallback: check common user-local directories where curl|bash
+                // installers and package managers typically place binaries
+                const QString home = QDir::homePath();
+                const QStringList fallbackDirs = {
+                    home + QStringLiteral("/.local/bin"),
+                    home + QStringLiteral("/bin"),
+                    home + QStringLiteral("/.cargo/bin"),
+                };
+                for (const QString &dir : fallbackDirs) {
+                    QString candidate = dir + QLatin1Char('/') + resolvedExecutable;
+                    if (QFileInfo::exists(candidate)) {
+                        found = candidate;
+                        break;
+                    }
                 }
             }
+            if (!found.isEmpty()) {
+                resolvedExecutable = found;
+            }
         }
-        if (!found.isEmpty()) {
-            resolvedExecutable = found;
-        }
-    }
 
-    qDebug() << "[ACPService] Starting process:" << resolvedExecutable << m_executableArgs;
-    m_process->start(resolvedExecutable, m_executableArgs);
+        qDebug() << "[ACPService] Starting process:" << resolvedExecutable << m_executableArgs;
+        m_process->start(resolvedExecutable, m_executableArgs);
+    }
 
     qDebug() << "[ACPService] Waiting for process to start...";
     if (!m_process->waitForStarted(5000)) {
         qDebug() << "[ACPService] Process failed to start";
-        Q_EMIT errorOccurred(QStringLiteral("Failed to start %1").arg(m_executable));
+        Q_EMIT errorOccurred(isRemote() ? QStringLiteral("Failed to start ssh for the agent on %1").arg(m_remoteHost)
+                                        : QStringLiteral("Failed to start %1").arg(m_executable));
         return false;
     }
 
@@ -107,6 +299,15 @@ void ACPService::stop()
         // Emit disconnected signal since onFinished won't be called (signals disconnected)
         Q_EMIT disconnected(0);
     }
+    removeAskpassState();
+    stopMcpServer();
+}
+
+void ACPService::write(const QJsonObject &msg)
+{
+    const QByteArray data = QJsonDocument(msg).toJson(QJsonDocument::Compact) + "\n";
+    Q_EMIT jsonPayload(QStringLiteral(">>"), QString::fromUtf8(data).trimmed());
+    m_process->write(data);
 }
 
 int ACPService::sendRequest(const QString &method, const QJsonObject &params)
@@ -124,14 +325,12 @@ int ACPService::sendRequest(const QString &method, const QJsonObject &params)
     msg[QStringLiteral("method")] = method;
 
     if (!params.isEmpty()) {
-        msg[QStringLiteral("params")] = params;
+        // Local paths as the host's for a remote agent.
+        msg[QStringLiteral("params")] = m_pathMap.outgoing(params);
     }
 
-    QByteArray data = QJsonDocument(msg).toJson(QJsonDocument::Compact) + "\n";
     qDebug() << "[ACPService] >>" << method << "id:" << m_messageId;
-
-    Q_EMIT jsonPayload(QStringLiteral(">>"), QString::fromUtf8(data).trimmed());
-    m_process->write(data);
+    write(msg);
     return m_messageId;
 }
 
@@ -147,14 +346,11 @@ void ACPService::sendNotification(const QString &method, const QJsonObject &para
     msg[QStringLiteral("method")] = method;
 
     if (!params.isEmpty()) {
-        msg[QStringLiteral("params")] = params;
+        msg[QStringLiteral("params")] = m_pathMap.outgoing(params);
     }
 
-    QByteArray data = QJsonDocument(msg).toJson(QJsonDocument::Compact) + "\n";
     qDebug() << "[ACPService] >> notification:" << method;
-
-    Q_EMIT jsonPayload(QStringLiteral(">>"), QString::fromUtf8(data).trimmed());
-    m_process->write(data);
+    write(msg);
 }
 
 void ACPService::sendResponse(int requestId, const QJsonObject &result, const QJsonObject &error)
@@ -167,17 +363,15 @@ void ACPService::sendResponse(int requestId, const QJsonObject &result, const QJ
     msg[QStringLiteral("jsonrpc")] = QStringLiteral("2.0");
     msg[QStringLiteral("id")] = requestId;
 
+    // Not translated: results carry file contents, not paths.
     if (!error.isEmpty()) {
         msg[QStringLiteral("error")] = error;
     } else {
         msg[QStringLiteral("result")] = result;
     }
 
-    QByteArray data = QJsonDocument(msg).toJson(QJsonDocument::Compact) + "\n";
     qDebug() << "[ACPService] >> response for request id:" << requestId;
-
-    Q_EMIT jsonPayload(QStringLiteral(">>"), QString::fromUtf8(data).trimmed());
-    m_process->write(data);
+    write(msg);
 }
 
 bool ACPService::isRunning() const
@@ -217,9 +411,11 @@ void ACPService::onStdout()
     }
 }
 
-void ACPService::handleMessage(const QJsonObject &msg)
+void ACPService::handleMessage(const QJsonObject &rawMsg)
 {
-    Q_EMIT jsonPayload(QStringLiteral("<<"), QString::fromUtf8(QJsonDocument(msg).toJson(QJsonDocument::Compact)));
+    Q_EMIT jsonPayload(QStringLiteral("<<"), QString::fromUtf8(QJsonDocument(rawMsg).toJson(QJsonDocument::Compact)));
+    // The host's paths as local ones for a remote agent.
+    const QJsonObject msg = m_pathMap.incoming(rawMsg);
 
     if (msg.contains(QStringLiteral("method"))) {
         // Notification or request from ACP
@@ -256,6 +452,28 @@ void ACPService::onStderr()
     }
 
     QByteArray data = m_process->readAllStandardError();
+    if (isRemote()) {
+        m_stderrTail = QByteArray(m_stderrTail + data).right(2000);
+        if (m_mcpPending) {
+            // ssh reports the forward: "Allocated port <n> for remote
+            // forward to 127.0.0.1:<local>", or "Warning: remote port
+            // forwarding failed for listen port 0".
+            m_stderrLine += data;
+            qsizetype end;
+            while (m_mcpPending && (end = m_stderrLine.indexOf('\n')) >= 0) {
+                const QString line = QString::fromLocal8Bit(m_stderrLine.left(end)).trimmed();
+                m_stderrLine.remove(0, end + 1);
+                static const QRegularExpression allocated(QStringLiteral("^Allocated port (\\d+) for remote forward to 127\\.0\\.0\\.1:(\\d+)"));
+                const auto match = allocated.match(line);
+                if (match.hasMatch() && match.captured(2).toUShort() == m_mcpLocalPort) {
+                    mcpForwardResult(match.captured(1).toInt());
+                } else if (line.contains(QLatin1String("remote port forwarding failed"))) {
+                    qWarning() << "[ACPService]" << m_remoteHost << "refused the forward for Kate's MCP server:" << line;
+                    mcpForwardResult(0);
+                }
+            }
+        }
+    }
     QString message = QString::fromUtf8(data).trimmed();
 
     if (!message.isEmpty()) {
@@ -269,8 +487,31 @@ void ACPService::onStderr()
 
 void ACPService::onFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
-    Q_UNUSED(exitStatus);
     qDebug() << "[ACPService] Process finished with exit code:" << exitCode;
+    removeAskpassState();
+    stopMcpServer();
+
+    if (isRemote() && (exitCode != 0 || exitStatus != QProcess::NormalExit)) {
+        // ssh's or the remote shell's reason, else a bare disconnect.
+        const QStringList lines = QString::fromLocal8Bit(m_stderrTail).split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        const QString details = lines.mid(std::max<qsizetype>(0, lines.size() - 3)).join(QLatin1Char('\n')).trimmed();
+        QString message;
+        if (exitCode == 127) {
+            message = m_pathMap.style() == KateRemote::RemotePathMap::Style::Windows
+                ? QStringLiteral("%1 was not found on %2 (searched PATH, %USERPROFILE%\\.local\\bin, \\bin, \\.cargo\\bin and %APPDATA%\\npm).")
+                      .arg(QFileInfo(m_executable).fileName(), m_remoteHost)
+                : QStringLiteral("%1 was not found on %2 (searched the login shell's PATH, ~/.local/bin, ~/bin and ~/.cargo/bin).")
+                      .arg(QFileInfo(m_executable).fileName(), m_remoteHost);
+        } else if (exitCode == 255) {
+            message = QStringLiteral("ssh to %1 failed or the connection was lost.").arg(m_remoteHost);
+        } else {
+            message = QStringLiteral("The agent on %1 exited (exit code %2).").arg(m_remoteHost).arg(exitCode);
+        }
+        if (!details.isEmpty()) {
+            message += QLatin1Char('\n') + details;
+        }
+        Q_EMIT errorOccurred(message);
+    }
 
     if (m_process) {
         // Disconnect signals to prevent further callbacks during cleanup

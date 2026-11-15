@@ -3,6 +3,8 @@
 #include <QString>
 #include <QUrl>
 
+class QProcessEnvironment;
+
 #include <optional>
 #include <string>
 
@@ -108,6 +110,36 @@ QStringList configuredSshCommand();
 // windowsPathForSftpPath()) it starts PowerShell in the folder instead,
 // whether the server's default shell is cmd or PowerShell.
 QStringList sshTerminalCommand(const Location &location, const QStringList &ssh);
+
+// The command line (program first) running an ACP agent (program, args)
+// in location's directory on its host through `ssh -T`, stdin/stdout being
+// the protocol: for sftp and fish locations whose host ssh accepts
+// (parseSshAuthority()), else empty. A local absolute program path becomes
+// its file name.
+// POSIX hosts: the agent runs from a login shell (the user's PATH), with
+// ~/.local/bin, ~/bin and ~/.cargo/bin added; a missing directory fails, a
+// missing agent exits with 127 (env).
+// Windows hosts (sftp drive paths, windowsPathForSftpPath()): PowerShell
+// runs windowsAgentScript() (-EncodedCommand, so either default shell of
+// Windows' sshd passes it on unchanged).
+QStringList sshAgentCommand(const Location &location, const QStringList &ssh, const QString &program, const QStringList &args);
+
+// SSH_ASKPASS for an ssh started without a terminal (env: its environment).
+// With askpass (kate-remote-fs-askpass), login passwords come from KDE's
+// password cache, other prompts go to the previous SSH_ASKPASS or
+// ksshaskpass (KATE_REMOTE_FALLBACK_ASKPASS); stateFile (per connection
+// attempt, removed by the caller before and after) tells a repeated prompt
+// (wrong password). Returns whether askpass is used. Without it, only the
+// fallback is set up.
+bool setSshAskpassEnvironment(QProcessEnvironment &env, const QString &askpass, const QString &authority, const QString &stateFile);
+
+// The PowerShell script starting an agent on a Windows host in folder
+// (a Windows path): the program from PATH plus %USERPROFILE%\.local\bin,
+// \bin, \.cargo\bin and %APPDATA%\npm (exit 127 if missing), its stdio
+// copied as bytes.
+QString windowsAgentScript(const QString &folder, const QString &program, const QStringList &args);
+// 'arg' quoted for a Windows command line (CommandLineToArgvW rules).
+QString windowsArgument(const QString &arg);
 
 // Windows' OpenSSH sftp server shows drives as "/C:/...": the Windows path
 // of such a path ("/C:/Users/me" -> "C:\Users\me", "/d:" -> "D:\"), empty

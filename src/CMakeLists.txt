@@ -51,6 +51,7 @@ qt_add_resources(katecode_RESOURCES katecode.qrc)
 add_library(katecode MODULE ${katecode_SRCS} ${katecode_RESOURCES})
 
 target_link_libraries(katecode
+    kateremotelocation
     KF6::TextEditor
     KF6::I18n
     KF6::CoreAddons
@@ -77,11 +78,14 @@ install(FILES katecodeui.rc DESTINATION ${KDE_INSTALL_DATADIR}/kate/plugins/kate
 add_executable(kate-mcp-server
     mcp/main.cpp
     mcp/MCPServer.cpp
+    mcp/MCPHttpServer.cpp
 )
 
 target_link_libraries(kate-mcp-server
+    kateremotelocation
     Qt6::Core
     Qt6::DBus
+    Qt6::Network
 )
 
 install(TARGETS kate-mcp-server DESTINATION ${KDE_INSTALL_LIBEXECDIR})

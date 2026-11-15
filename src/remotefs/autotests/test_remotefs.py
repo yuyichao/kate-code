@@ -11,6 +11,7 @@ nothing below it is mounted any more (the mounts expose files).
 """
 
 import errno
+import json
 import os
 import pty
 import re
@@ -26,6 +27,7 @@ import time
 SKIP = 77
 DAEMON = os.path.abspath(sys.argv[1])
 KPASSWDTOOL = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else None
+ACPDRIVER = os.path.abspath(sys.argv[3]) if len(sys.argv) > 3 else None
 
 SFTP_SERVER = next((p for p in ("/usr/lib/ssh/sftp-server", "/usr/libexec/openssh/sftp-server",
                                 "/usr/lib/openssh/sftp-server") if os.path.exists(p)), None)
@@ -51,6 +53,8 @@ FALLBACK_ASKPASS = os.path.join(TMP, "fallback-askpass")
 KIO_BIN = os.path.join(TMP, "kio-bin")    # fake ssh for KIO's fish worker (through kio-fuse)
 KIO_SSH_LOG = os.path.join(TMP, "kio-ssh.log")
 FALLBACK_LOG = os.path.join(TMP, "fallback.log")
+AGENT_HOME = os.path.join(TMP, "agent-home")  # the remote's home for agents
+AGENT_LOG = os.path.join(AGENT_HOME, "agent.log")
 HOSTS_FILE = os.path.join(STATE, "kate-remote-fs", "hosts")
 SSH_LOG = os.path.join(TMP, "ssh.log")
 FAKE_SSH = os.path.join(TMP, "fake-ssh")
@@ -233,11 +237,14 @@ for arg in "$@"; do
 done
 # Password hosts: like ssh, ask through SSH_ASKPASS (3 tries); only
 # alice/secret logs in. keyhost: a key passphrase.
+prev=
 for arg in "$@"; do
     case "$arg" in *pwhost*) login=$arg;; *keyhost*) key=1;; esac
+    [ "$prev" = "-l" ] && user=$arg
+    prev=$arg
 done
 if [ -n "$login" ]; then
-    case "$login" in *@*) ;; *) login="$(id -un)@$login";; esac
+    case "$login" in *@*) ;; *) login="${{user:-$(id -un)}}@$login";; esac
     ok=
     for i in 1 2 3; do
         echo "askpass-call $login" >> {SSH_LOG}
@@ -253,6 +260,7 @@ if [ -n "$key" ]; then
 fi
 case " $* " in
     *" badhost "*) echo "ssh: connect to host badhost port 22: Connection refused" >> "$log"; exit 255;;
+    *" badagent "*) echo "ssh: connect to host badagent port 22: Connection refused" >&2; exit 255;;
     *" flakyhost "*)
         if [ -e {TMP}/flaky-down ]; then
             sleep 1
@@ -261,6 +269,23 @@ case " $* " in
         fi
         echo $$ > {TMP}/flakyhost.pid;;
     *" slowhost "*) sleep 1.5;;
+esac
+case " $* " in
+    *" -T "*)
+        # A remote command (Kate Code's agent): run by the login shell
+        # (sh), with a home of its own.
+        # Remote forwards: the sandbox shares our network, so the host's
+        # port is the local one.
+        prev=
+        for arg in "$@"; do
+            [ "$prev" = "-R" ] && echo "Allocated port ${{arg##*:}} for remote forward to 127.0.0.1:${{arg##*:}}" >&2
+            prev=$arg
+            last=$arg
+        done
+        exec bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 --symlink usr/bin /bin \\
+            --ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group \\
+            --bind {TREE} /data --bind {AGENT_HOME} /agent-home --dev /dev --proc /proc --tmpfs /tmp --chdir / \\
+            --die-with-parent --setenv HOME /agent-home --setenv SHELL /bin/sh /bin/sh -c "$last";;
 esac
 exec bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 --symlink usr/bin /bin \\
     --ro-bind /etc/passwd /etc/passwd --ro-bind /etc/group /etc/group \\
@@ -281,6 +306,67 @@ exec bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 -
     --bind {TREE} /data --dev /dev --proc /proc --tmpfs /tmp --chdir / --die-with-parent /bin/sh -c "$last"
 """)
     os.chmod(os.path.join(KIO_BIN, "ssh"), 0o755)
+
+    # An ACP agent for the remote, in ~/.local/bin there: logs what it gets
+    # in its home, reads a file through the client, reports a tool call
+    # with paths.
+    agent = os.path.join(AGENT_HOME, ".local", "bin", "fake-acp")
+    os.makedirs(os.path.dirname(agent))
+    with open(agent, "w") as f:
+        f.write("""#!/usr/bin/python3
+import json, os, sys, urllib.request, urllib.error
+log = open("/agent-home/agent.log", "a")
+def mcp(server, message, token=None):
+    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    for header in server.get("headers", []):
+        headers[header["name"]] = header["value"]
+    if token is not None:
+        headers["Authorization"] = token
+    request = urllib.request.Request(server["url"], json.dumps(message).encode(), headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read()
+            return response.status, json.loads(body) if body else None
+    except urllib.error.HTTPError as e:
+        return e.code, None
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\\n")
+    sys.stdout.flush()
+print("noise from a login profile")
+sys.stdout.flush()
+print("agent stderr", file=sys.stderr)
+cwd = None
+for line in sys.stdin:
+    message = json.loads(line)
+    log.write(json.dumps(message) + "\\n")
+    log.flush()
+    method = message.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+    elif method == "session/new":
+        cwd = message["params"]["cwd"]
+        for server in message["params"]["mcpServers"]:
+            calls = [mcp(server, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}),
+                     mcp(server, {"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                     mcp(server, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                     mcp(server, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "katecode_read", "arguments": {"file_path": "rel.txt"}}}),
+                     mcp(server, {"jsonrpc": "2.0", "id": 4, "method": "ping"}, token="Bearer wrong")]
+            log.write(json.dumps({"mcp": calls}) + "\\n")
+            log.flush()
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"sessionId": "s1"}})
+    elif method == "session/prompt":
+        send({"jsonrpc": "2.0", "id": 900, "method": "fs/read_text_file", "params": {"sessionId": "s1", "path": cwd + "/f.txt"}})
+        reply = json.loads(sys.stdin.readline())
+        log.write(json.dumps(reply) + "\\n")
+        log.flush()
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Read " + cwd + "/f.txt", "kind": "read",
+            "locations": [{"path": cwd + "/f.txt"}], "rawInput": {"file_path": cwd + "/f.txt"}}}})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {
+            "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "pwd=" + os.getcwd()}}}})
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"stopReason": "end_turn"}})
+""")
+    os.chmod(agent, 0o755)
 
     with open(os.path.join(CONFIG, "kate-remoterc"), "w") as f:
         f.write(f"""[General]
@@ -585,6 +671,90 @@ def test_terminal_askpass():
     check(code == 1, f"end of input: no answer ({code} {out!r})")
 
 
+def run_agent(authority, path, program="fake-acp", mcp_server=None):
+    """Kate Code's ACPService for <root>/sftp/<authority><path>; returns
+    (exit code, [messages], [errors], output)."""
+    folder = os.path.join(ROOT, "sftp", authority) + path
+    e = env()
+    if mcp_server:
+        e["ACPDRIVER_MCP_SERVER"] = mcp_server
+    result = subprocess.run([ACPDRIVER, folder, program], env=e, capture_output=True, text=True, timeout=60)
+    messages, errors = [], []
+    for line in result.stdout.splitlines():
+        if line.startswith("MSG "):
+            messages.append(__import__("json").loads(line[4:]))
+        elif line.startswith("ERROR "):
+            errors.append(line[6:])
+    return result.returncode, messages, errors, result.stdout + result.stderr
+
+
+def agent_log():
+    import json
+    if not os.path.exists(AGENT_LOG):
+        return []
+    with open(AGENT_LOG) as f:
+        return [json.loads(line) for line in f]
+
+
+def test_remote_agent():
+    print("Kate Code agents on the remote host (ACPService over ssh)")
+    if not ACPDRIVER:
+        check(False, "acpdriver given")
+        return
+    local = os.path.join(ROOT, "sftp", "goodhost") + "/data/sub"
+    code, messages, errors, output = run_agent("goodhost", "/data/sub")
+    check(code == 0 and "DONE" in output, f"agent ran on the host ({code}): {output}")
+    check("REMOTE goodhost" in output, "agent marked remote")
+    received = agent_log()
+    new = next((m for m in received if m.get("method") == "session/new"), {})
+    check(new.get("params", {}).get("cwd") == "/data/sub", f"agent got the remote cwd: {new}")
+    prompt = next((m for m in received if m.get("method") == "session/prompt"), {})
+    text = prompt.get("params", {}).get("prompt", [{}])[0].get("text")
+    check(text == "Look at /data/sub/f.txt", f"paths in the prompt are remote: {text!r}")
+    reply = next((m for m in received if m.get("id") == 900), {})
+    check(reply.get("result", {}).get("content") == f"content mentions {local}/f.txt", f"file contents not translated: {reply}")
+    read = next((m for m in messages if m.get("method") == "fs/read_text_file"), {})
+    check(read.get("params", {}).get("path") == local + "/f.txt", f"fs request path is local: {read}")
+    tool = next((m["params"]["update"] for m in messages if m.get("method") == "session/update"
+                 and m["params"]["update"].get("sessionUpdate") == "tool_call"), {})
+    check(tool.get("locations") == [{"path": local + "/f.txt"}], f"tool location is local: {tool}")
+    check(tool.get("rawInput", {}).get("file_path") == local + "/f.txt", "tool input path is local")
+    check(tool.get("title") == "Read /data/sub/f.txt", f"title left as the agent wrote it: {tool.get('title')!r}")
+    chunk = next((m["params"]["update"]["content"]["text"] for m in messages if m.get("method") == "session/update"
+                  and m["params"]["update"].get("sessionUpdate") == "agent_message_chunk"), "")
+    check(chunk == "pwd=/data/sub", f"agent runs in the folder: {chunk!r}")
+    check(not errors, f"no errors: {errors}")
+
+    # Login password from KDE's password cache (cached for alice in
+    # test_kde_passwords), as for the mounts.
+    before = askpass_calls("alice@pwhost")
+    code, _, errors, output = run_agent("alice@pwhost", "/data")
+    check(code == 0 and "DONE" in output, f"agent on a password host with the cached password ({code}): {output}")
+    check(askpass_calls("alice@pwhost") == before + 1, "ssh asked once, answered from the cache")
+
+    # Kate's MCP server, through the (fake) ssh remote forward.
+    os.remove(AGENT_LOG)
+    mcp_server = os.path.join(os.path.dirname(ACPDRIVER), "kate-mcp-server")
+    code, _, errors, output = run_agent("goodhost", "/data/sub", mcp_server=mcp_server)
+    check(code == 0 and "MCP http://127.0.0.1:" in output, f"MCP server forwarded ({code}): {output}")
+    calls = next((m["mcp"] for m in agent_log() if "mcp" in m), None)
+    check(calls is not None, "agent got Kate's MCP server")
+    if calls:
+        check(calls[0][0] == 200 and calls[0][1]["result"]["protocolVersion"] == "2025-06-18", f"MCP initialize over HTTP: {calls[0]}")
+        check(calls[1][0] == 202, "MCP notification accepted")
+        tools = [t["name"] for t in calls[2][1]["result"]["tools"]] if calls[2][1] else []
+        check("katecode_read" in tools and "katecode_paste_to_terminal" not in tools, f"remote tool list: {tools}")
+        check("absolute path on the agent's host" in json.dumps(calls[3][1]), f"relative paths refused: {calls[3]}")
+        check(calls[4][0] == 401, f"wrong token refused: {calls[4][0]}")
+
+    code, _, errors, output = run_agent("goodhost", "/data", "no-such-agent")
+    check(code != 0 and any("no-such-agent was not found on goodhost" in e for e in errors), f"missing agent reported: {errors} {output}")
+    code, _, errors, output = run_agent("badagent", "/data")
+    check(code != 0 and any("ssh to badagent failed" in e and "Connection refused" in e for e in errors), f"ssh failure reported: {errors}")
+    code, _, errors, output = run_agent("goodhost", "/data/missing")
+    check(code != 0 and any("exited" in e for e in errors), f"missing folder reported: {errors}")
+
+
 def kio_fuse_pids():
     pids = []
     for pid in os.listdir("/proc"):
@@ -811,7 +981,7 @@ def main():
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_kde_passwords, test_terminal_askpass, test_kio_backend, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_remote_agent, test_terminal_askpass, test_kio_backend, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_shutdown_and_restart):
             try:
                 test()

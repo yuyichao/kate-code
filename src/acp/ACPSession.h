@@ -16,6 +16,7 @@ class Document;
 }
 
 class ACPService;
+class QTimer;
 class EditTracker;
 class TerminalManager;
 class TranscriptWriter;
@@ -154,6 +155,10 @@ Q_SIGNALS:
     void terminalOutputUpdated(const QString &terminalId, const QString &output, bool finished);
     void toolCallTerminalIdSet(const QString &messageId, const QString &toolCallId, const QString &terminalId);
 
+    // A remote agent's tool (not one of Kate's) may change files of its host
+    // (below hostDir), which Kate sees only later (EditorSession::holdRemoteFiles()).
+    void remoteHostActivity(const QString &hostDir);
+
     // Emitted when a built-in Edit/Write tool writes a file, with old and new content for diff display
     void fsEditApplied(const QString &filePath, const QString &oldText, const QString &newText);
 
@@ -212,6 +217,17 @@ private:
     void beginSessionConfiguration(bool loadedSession);
     void sendNextSessionConfigOption();
     void completeSessionSetup(bool loadedSession);
+
+    // A path from the agent (a tool call title): absolute paths of a remote
+    // agent's host as local ones, relative ones below the working directory.
+    QString agentPath(const QString &path) const;
+    // An agent on a remote host changes files there itself; Kate does not
+    // notice (no file notifications through the mount). After its tool
+    // calls and turns, open documents of that host are compared with their
+    // files: unmodified ones are reloaded, modified ones flagged as changed
+    // on disk.
+    void scheduleRemoteDocumentCheck();
+    void checkRemoteDocuments();
 
     // Terminal request handlers
     void handleTerminalCreate(const QJsonObject &params, int requestId);
@@ -304,6 +320,10 @@ private:
     bool m_supportsEmbeddedContext = false;
     bool m_supportsPromptQueueing = false;
     bool m_supportsSetTitle = false;
+    bool m_supportsMcpHttp = false;
+    // Tool calls of a remote agent that change nothing on its host (Kate's
+    // own tools, reads, searches).
+    QSet<QString> m_harmlessToolCalls;
     // The editor <system-reminder> goes with the first ordinary prompt (not
     // with a slash command, which must be sent alone).
     bool m_editorReminderPending = false;
@@ -313,4 +333,9 @@ private:
     QString m_title;
     // In-flight session/set_title requests.
     QSet<int> m_setTitleRequestIds;
+
+    QTimer *m_remoteCheckTimer = nullptr;
+    QTimer *m_remoteLateCheckTimer = nullptr;
+    bool m_remoteCheckRunning = false;
+    bool m_remoteCheckPending = false;
 };

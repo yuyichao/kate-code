@@ -30,6 +30,9 @@ public:
     // file no longer matches the document's checksum. Saving the buffer
     // then would make KTextEditor ask with a modal dialog.
     static bool documentChangedOnDisk(KTextEditor::Document *doc, const QString &filePath);
+    // The file's checksum as Document::checksum() has it (git blob hash),
+    // empty if it cannot be read. Thread-safe.
+    static QByteArray fileChecksum(const QString &filePath);
 
     // Register this service on the session bus.
     // Returns true on success.

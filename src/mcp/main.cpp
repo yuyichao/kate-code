@@ -5,8 +5,16 @@
     Kate MCP Server - standalone MCP server for Kate editor integration.
     Speaks JSON-RPC 2.0 over stdin/stdout (newline-delimited).
     Uses QSocketNotifier + event loop so that DBus calls work.
+
+    For agents on remote hosts (Kate Code runs it, the agent reaches it
+    through an ssh remote forward):
+      kate-mcp-server --http --remote-root <host dir> [--remote-windows <drive>]
+    serves MCP over HTTP on a free port of 127.0.0.1, printed as "PORT <n>"
+    on stdout; requests need "Authorization: Bearer $KATECODE_MCP_TOKEN".
+    It ends at end of input on stdin.
 */
 
+#include "MCPHttpServer.h"
 #include "MCPServer.h"
 
 #include <QCoreApplication>
@@ -15,6 +23,7 @@
 #include <QSocketNotifier>
 
 #include <cerrno>
+#include <cstdio>
 #include <csignal>
 #include <unistd.h>
 
@@ -69,6 +78,30 @@ int main(int argc, char *argv[])
     MCPServer server;
     QByteArray buffer;
 
+    const QStringList args = app.arguments();
+    const bool http = args.contains(QStringLiteral("--http"));
+    const qsizetype rootIndex = args.indexOf(QStringLiteral("--remote-root"));
+    if (rootIndex > 0 && rootIndex + 1 < args.size()) {
+        const qsizetype driveIndex = args.indexOf(QStringLiteral("--remote-windows"));
+        const QString drive = driveIndex > 0 && driveIndex + 1 < args.size() ? args.at(driveIndex + 1) : QString();
+        server.setRemote(drive.isEmpty() ? KateRemote::RemotePathMap(args.at(rootIndex + 1))
+                                         : KateRemote::RemotePathMap(args.at(rootIndex + 1), KateRemote::RemotePathMap::Style::Windows, drive.at(0)));
+    }
+    if (http) {
+        const QByteArray token = qgetenv("KATECODE_MCP_TOKEN");
+        if (token.size() < 16) {
+            fprintf(stderr, "kate-mcp-server: --http needs KATECODE_MCP_TOKEN (16 characters or more)\n");
+            return 2;
+        }
+        auto *httpServer = new MCPHttpServer(&server, token, &app);
+        const quint16 port = httpServer->listen();
+        if (port == 0) {
+            fprintf(stderr, "kate-mcp-server: cannot listen on 127.0.0.1\n");
+            return 1;
+        }
+        writeAll("PORT " + QByteArray::number(port) + '\n');
+    }
+
     auto *notifier = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, &app);
     QObject::connect(notifier, &QSocketNotifier::activated, [&]() {
         char buf[4096];
@@ -93,7 +126,9 @@ int main(int argc, char *argv[])
         while ((pos = buffer.indexOf('\n')) >= 0) {
             const QByteArray line = buffer.left(pos);
             buffer.remove(0, pos + 1);
-            processLine(line, server);
+            if (!http) {
+                processLine(line, server);
+            }
         }
     });
 

@@ -2,6 +2,7 @@
 #include "ChatWebView.h"
 #include "ChatInputWidget.h"
 #include "PermissionDialog.h"
+#include "../acp/ACPService.h"
 #include "../acp/ACPSession.h"
 #include "../config/SettingsStore.h"
 #include "../mcp/EditorSession.h"
@@ -462,6 +463,10 @@ void ChatWidget::setEditorSession(EditorSession *session)
     connect(session, &EditorSession::questionRequested, this, &ChatWidget::showUserQuestion);
     connect(session, &EditorSession::questionCancelled, this, &ChatWidget::removeUserQuestion);
     connect(this, &ChatWidget::userQuestionAnswered, session, &EditorSession::provideQuestionResponse);
+    // Past sshfs's cache (20 s) and the late document check (21 s).
+    connect(m_session, &ACPSession::remoteHostActivity, session, [session](const QString &hostDir) {
+        session->holdRemoteFiles(hostDir, 22000);
+    });
 
     if (session->isRegistered()) {
         m_session->setEditorObjectPath(session->objectPath());
@@ -552,6 +557,7 @@ void ChatWidget::startNewSession(bool resetView, const QString &root)
     sysMsg.role = QStringLiteral("system");
     sysMsg.timestamp = QDateTime::currentDateTime();
     sysMsg.content = QStringLiteral("Starting new session in: %1").arg(projectRoot);
+    prepareAgentLocation(projectRoot, sysMsg);
     m_chatWebView->addMessage(sysMsg);
 
     m_session->start(projectRoot);
@@ -646,6 +652,7 @@ void ChatWidget::resumeSession(const QString &sessionId, const QString &projectR
     sysMsg.role = QStringLiteral("system");
     sysMsg.timestamp = QDateTime::currentDateTime();
     sysMsg.content = QStringLiteral("Resuming session with prior context in: %1").arg(projectRoot);
+    prepareAgentLocation(projectRoot, sysMsg);
     m_chatWebView->addMessage(sysMsg);
 
     m_session->start(projectRoot);
@@ -1692,6 +1699,18 @@ void ChatWidget::applyACPBackend()
              << "session config keys:" << provider.sessionConfig.keys();
 }
 
+void ChatWidget::prepareAgentLocation(const QString &root, Message &msg)
+{
+    const QString host = ACPService::remoteHostFor(root);
+    if (!host.isEmpty()) {
+        msg.content += QStringLiteral(" (the agent runs on %1)").arg(host);
+    }
+    if (m_remoteProviders != !host.isEmpty()) {
+        m_remoteProviders = !host.isEmpty();
+        populateProviderCombo();
+    }
+}
+
 void ChatWidget::populateProviderCombo()
 {
     if (!m_settingsStore || !m_providerCombo) {
@@ -1713,7 +1732,8 @@ void ChatWidget::populateProviderCombo()
 
     for (int i = 0; i < providerList.size(); ++i) {
         const auto &p = providerList[i];
-        bool available = SettingsStore::isExecutableAvailable(p.executable);
+        // On a remote host: whether it is installed there is not known.
+        bool available = m_remoteProviders || SettingsStore::isExecutableAvailable(p.executable);
 
         QString displayText = p.description;
         if (!available) {

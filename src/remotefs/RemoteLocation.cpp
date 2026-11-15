@@ -4,6 +4,9 @@
 #include <KConfigGroup>
 
 #include <QDir>
+#include <QFileInfo>
+#include <QProcessEnvironment>
+#include <QStandardPaths>
 #include <QProcess>
 #include <QRegularExpression>
 
@@ -277,6 +280,61 @@ QString shellQuote(const QString &text)
     return QLatin1Char('\'') + quoted + QLatin1Char('\'');
 }
 
+// PowerShell's -EncodedCommand argument: base64 of the UTF-16LE script,
+// which neither cmd nor PowerShell (Windows sshd's shells) changes.
+static QString powershellEncoded(const QString &script)
+{
+    QByteArray utf16;
+    for (const QChar c : script) {
+        utf16.append(char(c.unicode() & 0xff));
+        utf16.append(char(c.unicode() >> 8));
+    }
+    return QString::fromLatin1(utf16.toBase64());
+}
+
+// 'text' in a PowerShell single-quoted string.
+static QString powershellQuote(const QString &text)
+{
+    return QLatin1Char('\'') + QString(text).replace(QLatin1Char('\''), QLatin1String("''")) + QLatin1Char('\'');
+}
+
+QString windowsArgument(const QString &arg)
+{
+    static const QRegularExpression special(QStringLiteral("[\\s\"]"));
+    if (!arg.isEmpty() && !arg.contains(special)) {
+        return arg;
+    }
+    // CommandLineToArgvW: backslashes are literal except before a quote,
+    // where 2n+1 of them make n and a literal quote.
+    QString quoted = QStringLiteral("\"");
+    int backslashes = 0;
+    for (const QChar c : arg) {
+        if (c == QLatin1Char('\\')) {
+            ++backslashes;
+            continue;
+        }
+        if (c == QLatin1Char('"')) {
+            quoted += QString(backslashes * 2 + 1, QLatin1Char('\\')) + c;
+        } else {
+            quoted += QString(backslashes, QLatin1Char('\\')) + c;
+        }
+        backslashes = 0;
+    }
+    return quoted + QString(backslashes * 2, QLatin1Char('\\')) + QLatin1Char('"');
+}
+
+// [-l user] [-p port] -- host
+static void appendSshDestination(QStringList &command, const SshTarget &target)
+{
+    if (!target.user.isEmpty()) {
+        command << QStringLiteral("-l") << target.user;
+    }
+    if (target.port > 0) {
+        command << QStringLiteral("-p") << QString::number(target.port);
+    }
+    command << QStringLiteral("--") << target.host;
+}
+
 QStringList sshTerminalCommand(const Location &location, const QStringList &ssh)
 {
     if (!isSshScheme(location.scheme) || ssh.isEmpty() || !location.path.startsWith(QLatin1Char('/'))) {
@@ -289,32 +347,126 @@ QStringList sshTerminalCommand(const Location &location, const QStringList &ssh)
     }
     QStringList command = ssh;
     command << QStringLiteral("-t");
-    if (!target->user.isEmpty()) {
-        command << QStringLiteral("-l") << target->user;
-    }
-    if (target->port > 0) {
-        command << QStringLiteral("-p") << QString::number(target->port);
-    }
-    command << QStringLiteral("--") << target->host;
+    appendSshDestination(command, *target);
     const QString windowsPath = windowsPathForSftpPath(location.path);
     if (!windowsPath.isEmpty()) {
         // Windows' sshd runs the command with its default shell, cmd or
         // PowerShell (cmd /c ..., powershell -c ...): start PowerShell in
         // the folder. The script is base64 (UTF-16LE), which neither shell
         // changes; -NoExit keeps the session after it.
-        const QString script = QStringLiteral("Set-Location -LiteralPath '%1'").arg(QString(windowsPath).replace(QLatin1Char('\''), QLatin1String("''")));
-        QByteArray utf16;
-        for (const QChar c : script) {
-            utf16.append(char(c.unicode() & 0xff));
-            utf16.append(char(c.unicode() >> 8));
-        }
-        command << QStringLiteral("powershell -NoLogo -NoExit -EncodedCommand %1").arg(QString::fromLatin1(utf16.toBase64()));
+        const QString script = QStringLiteral("Set-Location -LiteralPath %1").arg(powershellQuote(windowsPath));
+        command << QStringLiteral("powershell -NoLogo -NoExit -EncodedCommand %1").arg(powershellEncoded(script));
         return command;
     }
     // ssh joins the remote command and hands it to the user's login shell;
     // ';' (not '&&') so a missing directory still gives a shell.
     command << QStringLiteral("cd %1; exec \"$SHELL\" -l").arg(shellQuote(location.path));
     return command;
+}
+
+QString windowsAgentScript(const QString &folder, const QString &program, const QStringList &args)
+{
+    QStringList quoted;
+    for (const QString &arg : args) {
+        quoted << windowsArgument(arg);
+    }
+    // Run by Windows PowerShell 5.1 or PowerShell 7, whichever shell sshd
+    // uses. PowerShell re-encodes a native program's output it passes on,
+    // so the agent's stdin/stdout/stderr are copied as bytes instead:
+    // stdin through an unbuffered stream, closed at end of input (the agent
+    // then exits); the script exits with the agent's code. Kept short: cmd
+    // limits a command line to 8191 characters.
+    return QStringLiteral(
+               "$ProgressPreference='SilentlyContinue'\n"
+               "$d=%1\n"
+               "if(-not(Test-Path -LiteralPath $d -PathType Container)){[Console]::Error.WriteLine(\"No such folder: $d\");exit 1}\n"
+               "$h=$env:USERPROFILE\n"
+               "$env:PATH=\"$env:PATH;$h\\.local\\bin;$h\\bin;$h\\.cargo\\bin;$env:APPDATA\\npm\"\n"
+               "$c=Get-Command -Name %2 -CommandType Application -ErrorAction SilentlyContinue|Select-Object -First 1\n"
+               "if(-not $c){[Console]::Error.WriteLine(%3);exit 127}\n"
+               "$i=New-Object Diagnostics.ProcessStartInfo\n"
+               "$i.FileName=$c.Path\n"
+               "$i.Arguments=%4\n"
+               "$i.WorkingDirectory=$d\n"
+               "$i.UseShellExecute=$false\n"
+               "$i.RedirectStandardInput=$true\n"
+               "$i.RedirectStandardOutput=$true\n"
+               "$i.RedirectStandardError=$true\n"
+               "$p=[Diagnostics.Process]::Start($i)\n"
+               "$w=New-Object IO.FileStream($p.StandardInput.BaseStream.SafeFileHandle,[IO.FileAccess]::Write,1)\n"
+               "$o=$p.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())\n"
+               "$e=$p.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())\n"
+               "$n=[Console]::OpenStandardInput().CopyToAsync($w)\n"
+               "while(-not $p.HasExited){if($n -and $n.IsCompleted){$w.Close();$n=$null};Start-Sleep -Milliseconds 100}\n"
+               "[void]$o.Wait(5000);[void]$e.Wait(5000)\n"
+               "exit $p.ExitCode\n")
+        .arg(powershellQuote(folder),
+             powershellQuote(program),
+             powershellQuote(program + QStringLiteral(": not found")),
+             powershellQuote(quoted.join(QLatin1Char(' '))));
+}
+
+QStringList sshAgentCommand(const Location &location, const QStringList &ssh, const QString &program, const QStringList &args)
+{
+    if (!isSshScheme(location.scheme) || ssh.isEmpty() || program.isEmpty() || !location.path.startsWith(QLatin1Char('/'))) {
+        return {};
+    }
+    const auto target = parseSshAuthority(location.authority);
+    if (!target) {
+        return {};
+    }
+    const QString windowsPath = windowsPathForSftpPath(location.path);
+    if (!windowsPath.isEmpty() && location.scheme != QLatin1String("sftp")) {
+        return {};
+    }
+    QStringList command = ssh;
+    // No terminal: stdin/stdout carry the protocol. Notice a dead
+    // connection like the mounts do.
+    command << QStringLiteral("-T") << QStringLiteral("-o") << QStringLiteral("ServerAliveInterval=15") << QStringLiteral("-o")
+            << QStringLiteral("ServerAliveCountMax=3") << QStringLiteral("-o") << QStringLiteral("ConnectTimeout=10");
+    appendSshDestination(command, *target);
+    // A local absolute path means nothing on the host: look the name up.
+    const QString name = QFileInfo(program).isAbsolute() ? QFileInfo(program).fileName() : program;
+    if (!windowsPath.isEmpty()) {
+        command << QStringLiteral("powershell -NoLogo -NoProfile -NonInteractive -EncodedCommand %1").arg(powershellEncoded(windowsAgentScript(windowsPath, name, args)));
+        return command;
+    }
+    QStringList quoted{shellQuote(name)};
+    for (const QString &arg : args) {
+        quoted << shellQuote(arg);
+    }
+    // ssh hands the command to the user's shell without a login profile:
+    // run a login shell for the user's PATH, with the usual per-user
+    // install directories added (as the local search does). Written for
+    // POSIX shells (tested: sh, bash, zsh) and fish 3 ("$PATH" is ':'-joined
+    // there too; not tested).
+    const QString inner = QStringLiteral("cd %1 && exec env PATH=\"$PATH:$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin\" %2")
+                              .arg(shellQuote(location.path), quoted.join(QLatin1Char(' ')));
+    command << QStringLiteral("exec \"$SHELL\" -l -c %1").arg(shellQuote(inner));
+    return command;
+}
+
+bool setSshAskpassEnvironment(QProcessEnvironment &env, const QString &askpass, const QString &authority, const QString &stateFile)
+{
+    QString fallbackAskpass = env.value(QStringLiteral("SSH_ASKPASS"));
+    if (fallbackAskpass.isEmpty() && (env.contains(QStringLiteral("DISPLAY")) || env.contains(QStringLiteral("WAYLAND_DISPLAY")))) {
+        fallbackAskpass = QStandardPaths::findExecutable(QStringLiteral("ksshaskpass"));
+    }
+    if (!askpass.isEmpty() && fallbackAskpass != askpass) {
+        env.insert(QStringLiteral("SSH_ASKPASS"), askpass);
+        env.insert(QStringLiteral("SSH_ASKPASS_REQUIRE"), QStringLiteral("force"));
+        env.insert(QStringLiteral("KATE_REMOTE_AUTHORITY"), authority);
+        env.insert(QStringLiteral("KATE_REMOTE_FALLBACK_ASKPASS"), fallbackAskpass);
+        env.insert(QStringLiteral("KATE_REMOTE_ASKPASS_STATE"), stateFile);
+        return true;
+    }
+    if (!fallbackAskpass.isEmpty()) {
+        env.insert(QStringLiteral("SSH_ASKPASS"), fallbackAskpass);
+        if (!env.contains(QStringLiteral("SSH_ASKPASS_REQUIRE"))) {
+            env.insert(QStringLiteral("SSH_ASKPASS_REQUIRE"), QStringLiteral("prefer"));
+        }
+    }
+    return false;
 }
 
 QString windowsPathForSftpPath(const QString &path)

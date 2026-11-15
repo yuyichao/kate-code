@@ -252,6 +252,13 @@ bool EditorDBusService::documentChangedOnDisk(KTextEditor::Document *doc, const 
         || gitBlobDigest(bytes) != doc->checksum();
 }
 
+QByteArray EditorDBusService::fileChecksum(const QString &filePath)
+{
+    QByteArray bytes;
+    QString error;
+    return readFileBytes(filePath, &bytes, &error) ? gitBlobDigest(bytes) : QByteArray();
+}
+
 QString EditorDBusService::readDocument(const QString &filePath)
 {
     KTextEditor::Document *doc = findDocument(filePath);

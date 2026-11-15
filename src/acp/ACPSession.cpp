@@ -5,13 +5,16 @@
 #include "../util/EditTracker.h"
 #include "../util/TranscriptWriter.h"
 
+#include <KTextEditor/Application>
 #include <KTextEditor/Cursor>
 #include <KTextEditor/Document>
+#include <KTextEditor/Editor>
 #include <KTextEditor/Range>
 #include <KTextEditor/View>
 
 #include <QCoreApplication>
 #include <algorithm>
+#include <memory>
 #include <QDebug>
 #include <QDir>
 #include <QFile>
@@ -21,10 +24,15 @@
 #include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QSet>
+#include <QPointer>
 #include <QTextStream>
+#include <QThread>
+#include <QTimer>
 #include <QStandardPaths>
 #include <QUrl>
 #include <QUuid>
+
+static QString findKateMcpServerPath();
 
 // Helper functions to check tool types (mirrors logic in chat.js)
 // Uses suffix matching for katecode tools to handle different MCP host prefixes
@@ -141,6 +149,15 @@ void ACPSession::start(const QString &workingDir, const QString &permissionMode)
     m_status = ConnectionStatus::Connecting;
     m_editTracker->clear();
     Q_EMIT statusChanged(m_status);
+
+    // Kate's tools for an agent on a remote host: kate-mcp-server over HTTP
+    // through ssh (ACPService), talking to this chat's DBus endpoint.
+    QProcessEnvironment mcpEnv = QProcessEnvironment::systemEnvironment();
+    mcpEnv.insert(QStringLiteral("KATECODE_DBUS_SERVICE"), QStringLiteral("org.kde.katecode.editor.p") + QString::number(QCoreApplication::applicationPid()));
+    if (!m_editorObjectPath.isEmpty()) {
+        mcpEnv.insert(QStringLiteral("KATECODE_DBUS_PATH"), m_editorObjectPath);
+    }
+    m_service->setRemoteMcpServer(findKateMcpServerPath(), mcpEnv);
 
     if (!m_service->start(workingDir)) {
         // Report the error before the status, so the chat shows it above
@@ -603,6 +620,23 @@ static QString findKateMcpServerPath()
 QJsonArray ACPSession::buildMcpServers() const
 {
     QJsonArray mcpServers;
+    if (m_service->isRemote()) {
+        // The configured stdio servers are local programs, not on the
+        // agent's host. Kate's server is reached over HTTP (an ssh remote
+        // forward), if the agent takes HTTP servers.
+        const QString url = m_service->remoteMcpUrl();
+        if (!url.isEmpty() && m_supportsMcpHttp) {
+            QJsonObject kateMcp;
+            kateMcp[QStringLiteral("type")] = QStringLiteral("http");
+            kateMcp[QStringLiteral("name")] = QStringLiteral("kate");
+            kateMcp[QStringLiteral("url")] = url;
+            kateMcp[QStringLiteral("headers")] = QJsonArray{QJsonObject{{QStringLiteral("name"), QStringLiteral("Authorization")},
+                                                                        {QStringLiteral("value"), QString(QStringLiteral("Bearer ") + m_service->remoteMcpToken())}}};
+            mcpServers.append(kateMcp);
+        }
+        qDebug() << "[ACPSession] Agent on" << m_service->remoteHost() << "- Kate's MCP server:" << (mcpServers.isEmpty() ? QStringLiteral("none") : url);
+        return mcpServers;
+    }
     const QString mcpServerPath = findKateMcpServerPath();
 
     if (!mcpServerPath.isEmpty()) {
@@ -946,7 +980,20 @@ QJsonArray ACPSession::buildPromptBlocks(const QueuedPrompt &prompt)
     // Inject editor context and tool preferences once, with the first
     // ordinary prompt (a slash command must be sent alone).
     QString messageText = content;
-    if (m_editorReminderPending && !prompt.command) {
+    if (m_editorReminderPending && !prompt.command && m_service->isRemote()) {
+        m_editorReminderPending = false;
+        messageText += QStringLiteral("\n\n<system-reminder>"
+            "You are running on %1 for the KDE Kate text editor (Kate Code plugin) on the user's computer, "
+            "which shows this host's files. "
+            "The files the user has open in Kate are your working context. "
+            "The workspace root is the current project directory.%2"
+            "</system-reminder>").arg(m_service->remoteHost(), m_service->remoteMcpUrl().isEmpty() || !m_supportsMcpHttp ? QString() : QStringLiteral(
+            "\n\nUse mcp__kate__katecode_documents to see which of this host's files are open in Kate. "
+            "For files open in Kate, use mcp__kate__katecode_read (it includes unsaved changes) and mcp__kate__katecode_edit / "
+            "mcp__kate__katecode_write (the user reviews the changes in the editor). "
+            "Kate sees changes made on this host by other means (commands, your own file tools) only after up to about 20 seconds; "
+            "meanwhile the katecode tools refuse such files: use your own tools for them then."));
+    } else if (m_editorReminderPending && !prompt.command) {
         m_editorReminderPending = false;
         messageText += QStringLiteral("\n\n<system-reminder>"
             "You are running inside the KDE Kate text editor via the Kate Code plugin. "
@@ -984,14 +1031,21 @@ void ACPSession::onConnected()
     QJsonObject params;
     params[QStringLiteral("protocolVersion")] = 1;
 
-    // Advertise terminal support so agent uses terminal/* methods
+    // Advertise terminal support so agent uses terminal/* methods. Not for
+    // an agent on a remote host: commands run there, with its own tools.
     QJsonObject capabilities;
-    capabilities[QStringLiteral("terminal")] = true;
+    capabilities[QStringLiteral("terminal")] = !m_service->isRemote();
 
-    // Advertise filesystem support
+    // Advertise filesystem support. Not for an agent on a remote host: it
+    // changes files there itself (shell commands), which the mount shows
+    // only after sshfs's cache expires (up to 20 s); reads through Kate
+    // could then be stale and a write based on them undo its change. It
+    // uses its own file tools there; Kate reloads open documents
+    // (checkRemoteDocuments()).
+    const bool local = !m_service->isRemote();
     QJsonObject fsCapabilities;
-    fsCapabilities[QStringLiteral("readTextFile")] = true;
-    fsCapabilities[QStringLiteral("writeTextFile")] = true;
+    fsCapabilities[QStringLiteral("readTextFile")] = local;
+    fsCapabilities[QStringLiteral("writeTextFile")] = local;
     capabilities[QStringLiteral("fs")] = fsCapabilities;
 
     // Select options are part of the base protocol. Explicitly advertise the
@@ -1143,6 +1197,7 @@ void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject
         handleSessionNewResponse(id, result);
     } else if (id == m_promptRequestId) {
         // Prompt completed — finish the streaming message.
+        scheduleRemoteDocumentCheck();
         qDebug() << "[ACPSession] Prompt response received, finishing message:" << m_currentMessageId;
         if (!m_currentMessageId.isEmpty()) {
             // Record transcript here for agents that end the turn via the
@@ -1196,6 +1251,7 @@ void ACPSession::handleInitializeResponse(int id, const QJsonObject &result)
     // An object (even empty) announces session/set_title.
     m_supportsSetTitle = agentCaps[QStringLiteral("sessionCapabilities")].toObject()
                              [QStringLiteral("title")].isObject();
+    m_supportsMcpHttp = agentCaps[QStringLiteral("mcpCapabilities")].toObject()[QStringLiteral("http")].toBool(false);
 
     qDebug() << "[ACPSession] Agent capabilities:"
              << "image=" << m_supportsImage
@@ -1205,7 +1261,28 @@ void ACPSession::handleInitializeResponse(int id, const QJsonObject &result)
              << "setTitle=" << m_supportsSetTitle;
 
     // Don't automatically create session - let ChatWidget decide
-    // whether to load an existing session or create a new one
+    // whether to load an existing session or create a new one. A remote
+    // agent's session names Kate's MCP server: wait (briefly) until ssh
+    // reports the forwarded port.
+    if (m_service->isRemoteMcpPending() && m_supportsMcpHttp) {
+        auto *timer = new QTimer(this);
+        timer->setSingleShot(true);
+        auto proceed = std::make_shared<std::function<void()>>();
+        *proceed = [this, timer] {
+            disconnect(m_service, &ACPService::remoteMcpReady, timer, nullptr);
+            timer->deleteLater();
+            if (m_status == ConnectionStatus::Connecting && m_sessionId.isEmpty()) {
+                Q_EMIT initializeComplete();
+            }
+        };
+        connect(m_service, &ACPService::remoteMcpReady, timer, [proceed] { (*proceed)(); });
+        connect(timer, &QTimer::timeout, this, [proceed] {
+            qWarning() << "[ACPSession] No forwarded port for Kate's MCP server; going on without it";
+            (*proceed)();
+        });
+        timer->start(10000);
+        return;
+    }
     Q_EMIT initializeComplete();
 }
 
@@ -1557,6 +1634,27 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
     QJsonObject update = params[QStringLiteral("update")].toObject();
     QString updateType = update[QStringLiteral("sessionUpdate")].toString();
 
+    if (m_service->isRemote() && (updateType == QStringLiteral("tool_call") || updateType == QStringLiteral("tool_call_update"))) {
+        const QString toolCallId = update[QStringLiteral("toolCallId")].toString();
+        if (updateType == QStringLiteral("tool_call")) {
+            const QString name = update[QStringLiteral("_meta")].toObject()[QStringLiteral("claudeCode")].toObject()[QStringLiteral("toolName")].toString()
+                + QLatin1Char(' ') + update[QStringLiteral("title")].toString();
+            static const QStringList harmlessKinds{QStringLiteral("read"), QStringLiteral("search"), QStringLiteral("think"), QStringLiteral("fetch")};
+            if (name.contains(QLatin1String("katecode_")) || harmlessKinds.contains(update[QStringLiteral("kind")].toString())) {
+                m_harmlessToolCalls.insert(toolCallId);
+            }
+        }
+        if (!m_harmlessToolCalls.contains(toolCallId)) {
+            Q_EMIT remoteHostActivity(m_service->pathMap().hostDir());
+        }
+    }
+    if (updateType == QStringLiteral("tool_call_update")) {
+        const QString toolStatus = update[QStringLiteral("status")].toString();
+        if (toolStatus == QStringLiteral("completed") || toolStatus == QStringLiteral("failed")) {
+            scheduleRemoteDocumentCheck();
+        }
+    }
+
     if (updateType == QStringLiteral("agent_message_start")) {
         // Message already created as placeholder
         qDebug() << "[ACPSession] Agent message started";
@@ -1670,7 +1768,7 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
                     // Extract path from title - it may be relative
                     QString titlePath = title.mid(8);  // len("Reading ")
                     if (!titlePath.isEmpty()) {
-                        toolCall.filePath = QDir(m_workingDir).absoluteFilePath(titlePath);
+                        toolCall.filePath = agentPath(titlePath);
                     }
                 }
             } else if (title.startsWith(QStringLiteral("Editing "))) {
@@ -1678,7 +1776,7 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
                 if (toolCall.filePath.isEmpty()) {
                     QString titlePath = title.mid(8);
                     if (!titlePath.isEmpty()) {
-                        toolCall.filePath = QDir(m_workingDir).absoluteFilePath(titlePath);
+                        toolCall.filePath = agentPath(titlePath);
                     }
                 }
             } else if (title.startsWith(QStringLiteral("Writing "))) {
@@ -1686,7 +1784,7 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
                 if (toolCall.filePath.isEmpty()) {
                     QString titlePath = title.mid(8);
                     if (!titlePath.isEmpty()) {
-                        toolCall.filePath = QDir(m_workingDir).absoluteFilePath(titlePath);
+                        toolCall.filePath = agentPath(titlePath);
                     }
                 }
             } else if (title.startsWith(QStringLiteral("Patching "))) {
@@ -1700,7 +1798,7 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
                         titlePath = titlePath.left(parenIdx);
                     }
                     if (!titlePath.isEmpty()) {
-                        toolCall.filePath = QDir(m_workingDir).absoluteFilePath(titlePath);
+                        toolCall.filePath = agentPath(titlePath);
                     }
                 }
             } else if (title.contains(QStringLiteral("bash")) || title.contains(QStringLiteral("Bash")) ||
@@ -2049,7 +2147,7 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
                         rawPath = rawObj[QStringLiteral("file")].toString();
                     }
                     if (!rawPath.isEmpty() && updateFilePath.isEmpty()) {
-                        updateFilePath = rawPath;
+                        updateFilePath = agentPath(rawPath);
                         qDebug() << "[ACPSession] Extracted file path from rawOutput:" << updateFilePath;
                     }
                 } else {
@@ -2309,6 +2407,94 @@ void ACPSession::handlePermissionRequest(const QJsonObject &params, int requestI
     Q_EMIT permissionRequested(request);
 }
 
+QString ACPSession::agentPath(const QString &path) const
+{
+    const KateRemote::RemotePathMap &map = m_service->pathMap();
+    if (!map.isIdentity() && !path.startsWith(QLatin1Char('/'))) {
+        // Relative to the remote working directory, confined to the host.
+        return map.toLocal(map.toRemote(m_workingDir, true) + QLatin1Char('/') + path);
+    }
+    return QDir(m_workingDir).absoluteFilePath(map.toLocal(path));
+}
+
+void ACPSession::scheduleRemoteDocumentCheck()
+{
+    if (!m_service->isRemote()) {
+        return;
+    }
+    if (!m_remoteCheckTimer) {
+        m_remoteCheckTimer = new QTimer(this);
+        m_remoteCheckTimer->setSingleShot(true);
+        connect(m_remoteCheckTimer, &QTimer::timeout, this, &ACPSession::checkRemoteDocuments);
+        m_remoteLateCheckTimer = new QTimer(this);
+        m_remoteLateCheckTimer->setSingleShot(true);
+        connect(m_remoteLateCheckTimer, &QTimer::timeout, this, &ACPSession::checkRemoteDocuments);
+    }
+    // A burst of tool calls makes one check, shortly after the last one.
+    // sshfs may still answer from its cache then (its attributes, hence
+    // the cached contents, are kept up to 20 s): a second check follows.
+    m_remoteCheckTimer->start(1500);
+    m_remoteLateCheckTimer->start(21000);
+}
+
+void ACPSession::checkRemoteDocuments()
+{
+    if (m_remoteCheckRunning) {
+        m_remoteCheckPending = true;
+        return;
+    }
+    KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
+    if (!app || !m_service->isRemote()) {
+        return;
+    }
+    const QString prefix = m_service->pathMap().hostDir() + QLatin1Char('/');
+    QList<QPointer<KTextEditor::Document>> docs;
+    QStringList paths;
+    const QList<KTextEditor::Document *> allDocs = app->documents();
+    for (KTextEditor::Document *doc : allDocs) {
+        const QString path = doc->url().isLocalFile() ? doc->url().toLocalFile() : QString();
+        if (path.startsWith(prefix)) {
+            docs << doc;
+            paths << path;
+        }
+    }
+    if (paths.isEmpty()) {
+        return;
+    }
+    // Reading files through the mount may wait for the network: not in the
+    // GUI thread.
+    auto checksums = std::make_shared<QList<QByteArray>>();
+    QThread *thread = QThread::create([paths, checksums] {
+        for (const QString &path : paths) {
+            checksums->append(EditorDBusService::fileChecksum(path));
+        }
+    });
+    m_remoteCheckRunning = true;
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    connect(thread, &QThread::finished, this, [this, docs, paths, checksums] {
+        m_remoteCheckRunning = false;
+        for (qsizetype i = 0; i < docs.size() && i < checksums->size(); ++i) {
+            KTextEditor::Document *doc = docs.at(i);
+            const QByteArray &checksum = checksums->at(i);
+            // Unreadable (removed) files are left to the user.
+            if (!doc || doc->url().toLocalFile() != paths.at(i) || checksum.isEmpty() || checksum == doc->checksum()) {
+                continue;
+            }
+            qDebug() << "[ACPSession] Changed on" << m_service->remoteHost() << ":" << paths.at(i);
+            if (doc->isModified()) {
+                doc->setModifiedOnDisk(KTextEditor::Document::OnDiskModified);
+            } else {
+                doc->documentReload();
+            }
+        }
+        if (m_remoteCheckPending) {
+            m_remoteCheckPending = false;
+            checkRemoteDocuments();
+        }
+    });
+    thread->start();
+}
+
 void ACPSession::handleTerminalCreate(const QJsonObject &params, int requestId)
 {
     QString command = params[QStringLiteral("command")].toString();
@@ -2318,6 +2504,15 @@ void ACPSession::handleTerminalCreate(const QJsonObject &params, int requestId)
     qint64 outputByteLimit = params[QStringLiteral("outputByteLimit")].toVariant().toLongLong();
 
     qDebug() << "[ACPSession] terminal/create - command:" << command << "cwd:" << cwd;
+
+    if (m_service->isRemote()) {
+        // Never run a remote agent's command here (on the mount).
+        QJsonObject error;
+        error[QStringLiteral("code")] = -32601;
+        error[QStringLiteral("message")] = QStringLiteral("No terminal: the agent runs on %1").arg(m_service->remoteHost());
+        m_service->sendResponse(requestId, QJsonObject(), error);
+        return;
+    }
 
     // Build environment from base system environment plus any overrides
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
@@ -2494,6 +2689,15 @@ void ACPSession::handleTerminalRelease(const QJsonObject &params, int requestId)
 
 void ACPSession::handleFsReadTextFile(const QJsonObject &params, int requestId)
 {
+    if (m_service->isRemote()) {
+        // Not offered to an agent on a remote host (see onConnected()):
+        // it works on the host's files itself.
+        QJsonObject error;
+        error[QStringLiteral("code")] = -32601;
+        error[QStringLiteral("message")] = QStringLiteral("No file access through the editor: the agent runs on %1").arg(m_service->remoteHost());
+        m_service->sendResponse(requestId, QJsonObject(), error);
+        return;
+    }
     QString path = params[QStringLiteral("path")].toString();
     int line = params[QStringLiteral("line")].toInt(1);  // 1-based, default to 1
     int limit = params[QStringLiteral("limit")].toInt(-1);  // -1 means no limit
@@ -2755,6 +2959,15 @@ static QList<LineChange> applySurgicalEdits(KTextEditor::Document *doc, const QS
 
 void ACPSession::handleFsWriteTextFile(const QJsonObject &params, int requestId)
 {
+    if (m_service->isRemote()) {
+        // Not offered to an agent on a remote host (see onConnected()):
+        // it works on the host's files itself.
+        QJsonObject error;
+        error[QStringLiteral("code")] = -32601;
+        error[QStringLiteral("message")] = QStringLiteral("No file access through the editor: the agent runs on %1").arg(m_service->remoteHost());
+        m_service->sendResponse(requestId, QJsonObject(), error);
+        return;
+    }
     QString path = params[QStringLiteral("path")].toString();
     QString content = params[QStringLiteral("content")].toString();
 

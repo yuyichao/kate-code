@@ -12,6 +12,7 @@
 #include "../util/SessionStore.h"
 #include "../util/SummaryStore.h"
 #include "../util/DiffHighlightManager.h"
+#include "RemoteLocation.h"
 
 #include <KActionCollection>
 #include <KLocalizedString>
@@ -481,7 +482,10 @@ void KateCodeView::deleteSavedSession(const QString &sessionId, const QString &p
             const ACPProvider provider = settings->providerById(it.key());
             const QStringList args = provider.options.isEmpty() ? QStringList()
                                                                 : QProcess::splitCommand(provider.options);
-            const QString workingDir = QFileInfo(projectRoot).isDir() ? projectRoot : QDir::homePath();
+            // A remote folder's sessions are on its host (the agent runs
+            // there); not stat-ed here, which could wait for the network.
+            const bool remote = KateRemote::locationForPath(projectRoot, KateRemote::configuredMountRoot()).has_value();
+            const QString workingDir = remote || QFileInfo(projectRoot).isDir() ? projectRoot : QDir::homePath();
             // Owned by the plugin, so it finishes even if this window closes.
             auto *deleter = new ACPSessionDeleter(provider.executable, args, workingDir, it.value(), m_plugin);
             QPointer<KateCodeView> self(this);
@@ -860,6 +864,13 @@ QString KateCodeView::getProjectRoot() const
 
     QDir currentDir(QFileInfo(filePath).absolutePath());
 
+    // A remote folder's search ends at its host's root: above it are the
+    // mount root and local folders (an agent there would run locally).
+    QString hostRoot;
+    if (const auto location = KateRemote::locationForPath(currentDir.absolutePath(), KateRemote::configuredMountRoot())) {
+        hostRoot = KateRemote::pathForLocation({location->scheme, location->authority, QStringLiteral("/")}, KateRemote::configuredMountRoot());
+    }
+
     // 3. Walk up directory tree looking for project indicators
     while (currentDir.exists() && currentDir.path() != QDir::rootPath()) {
         QString dirPath = currentDir.absolutePath();
@@ -896,7 +907,7 @@ QString KateCodeView::getProjectRoot() const
             return dirPath;
         }
 
-        if (!currentDir.cdUp()) {
+        if (currentDir.absolutePath() == hostRoot || !currentDir.cdUp()) {
             break;
         }
     }
