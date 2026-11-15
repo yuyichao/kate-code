@@ -7,10 +7,11 @@ if(BUILD_REMOTE_FS)
     add_executable(kpasswdtool kpasswdtool.cpp)
     target_link_libraries(kpasswdtool KF6::KIOCore Qt6::Core)
 
-    # Kate Code's ACPService with agents on remote hosts.
-    add_executable(acpdriver acpdriver.cpp ${CMAKE_SOURCE_DIR}/src/acp/ACPService.cpp)
+    # Kate Code's ACPService with agents on remote hosts, and
+    # RemoteAgentInstaller (--install).
+    add_executable(acpdriver acpdriver.cpp ${CMAKE_SOURCE_DIR}/src/acp/ACPService.cpp ${CMAKE_SOURCE_DIR}/src/acp/RemoteAgentInstaller.cpp)
     target_include_directories(acpdriver PRIVATE ${CMAKE_SOURCE_DIR}/src/acp)
-    target_link_libraries(acpdriver kateremotelocation Qt6::Core Qt6::DBus)
+    target_link_libraries(acpdriver kateremotelocation KF6::Archive Qt6::Core Qt6::DBus Qt6::Network)
 
     # Mounts a sandboxed local sftp-server through sshfs; skipped (77) when
     # sshfs, bwrap or sftp-server is missing.

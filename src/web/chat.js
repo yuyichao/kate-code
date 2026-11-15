@@ -459,14 +459,19 @@ function addErrorMessage(base64Text) {
     scrollToBottom();
 }
 
-// Connection failure notice with a button that asks Kate to reconnect.
-function addReconnectPrompt(base64Text) {
-    let text;
-    try {
-        text = decodeURIComponent(escape(atob(base64Text)));
-    } catch (e) {
-        text = base64Text;
-    }
+// Connection failure notice with a button that asks Kate to reconnect and,
+// with base64Install (a label), one that installs the agent on the remote
+// host.
+function addReconnectPrompt(base64Text, base64Install) {
+    const decode = (value) => {
+        try {
+            return decodeURIComponent(escape(atob(value || '')));
+        } catch (e) {
+            return value || '';
+        }
+    };
+    const text = decode(base64Text);
+    const installLabel = decode(base64Install);
 
     const container = document.getElementById('messages');
     const el = document.createElement('div');
@@ -491,6 +496,18 @@ function addReconnectPrompt(base64Text) {
     };
     content.appendChild(label);
     content.appendChild(button);
+    if (installLabel) {
+        const install = document.createElement('button');
+        // Disabled with the Reconnect buttons when a new attempt starts.
+        install.className = 'reconnect-button';
+        install.textContent = installLabel;
+        install.onclick = () => {
+            if (window.bridge) {
+                window.bridge.requestAgentInstall();
+            }
+        };
+        content.appendChild(install);
+    }
 
     el.appendChild(header);
     el.appendChild(content);

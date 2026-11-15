@@ -1,5 +1,7 @@
 #include "RemoteLocation.h"
 
+#include <algorithm>
+
 #include <KConfig>
 #include <KConfigGroup>
 
@@ -381,7 +383,7 @@ QString windowsAgentScript(const QString &folder, const QString &program, const 
                "$d=%1\n"
                "if(-not(Test-Path -LiteralPath $d -PathType Container)){[Console]::Error.WriteLine(\"No such folder: $d\");exit 1}\n"
                "$h=$env:USERPROFILE\n"
-               "$env:PATH=\"$env:PATH;$h\\.local\\bin;$h\\bin;$h\\.cargo\\bin;$env:APPDATA\\npm\"\n"
+               "$env:PATH=\"$env:PATH;$h\\.local\\bin;$h\\bin;$h\\.cargo\\bin;$env:APPDATA\\npm;$env:LOCALAPPDATA\\kate-code\\bin\"\n"
                "$c=Get-Command -Name %2 -CommandType Application -ErrorAction SilentlyContinue|Select-Object -First 1\n"
                "if(-not $c){[Console]::Error.WriteLine(%3);exit 127}\n"
                "$i=New-Object Diagnostics.ProcessStartInfo\n"
@@ -404,6 +406,184 @@ QString windowsAgentScript(const QString &folder, const QString &program, const 
              powershellQuote(program),
              powershellQuote(program + QStringLiteral(": not found")),
              powershellQuote(quoted.join(QLatin1Char(' '))));
+}
+
+bool isValidRemoteAgentPackage(const RemoteAgentPackage &package)
+{
+    static const QRegularExpression name(QStringLiteral("^[A-Za-z0-9_][A-Za-z0-9._+-]*$"));
+    if (!name.match(package.id).hasMatch() || !name.match(package.version).hasMatch() || !name.match(package.name).hasMatch()) {
+        return false;
+    }
+    QString cmd = package.cmd;
+    if (cmd.startsWith(QLatin1String("./")) || cmd.startsWith(QLatin1String(".\\"))) {
+        cmd = cmd.mid(2);
+    }
+    const QStringList parts = cmd.split(QRegularExpression(QStringLiteral("[/\\\\]")));
+    return !cmd.isEmpty() && std::all_of(parts.begin(), parts.end(), [](const QString &part) {
+        return name.match(part).hasMatch();
+    });
+}
+
+// cmd without "./", with separators ('/' or '\\').
+static QString agentCmdPath(const QString &cmd, QChar separator)
+{
+    QString path = cmd.startsWith(QLatin1String("./")) || cmd.startsWith(QLatin1String(".\\")) ? cmd.mid(2) : cmd;
+    path.replace(QLatin1Char('/'), separator).replace(QLatin1Char('\\'), separator);
+    return path;
+}
+
+QString remotePlatformScript(bool windows, const QString &name)
+{
+    if (!isValidRemoteAgentPackage({QStringLiteral("a"), QStringLiteral("1"), QStringLiteral("./a"), name})) {
+        return {};
+    }
+    if (windows) {
+        return QStringLiteral("Write-Output ('Windows '+$env:PROCESSOR_ARCHITECTURE)\n"
+                              "if(Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA %1)){Write-Output installed}\n")
+            .arg(powershellQuote(QStringLiteral("kate-code\\bin\\") + name + QStringLiteral(".cmd")));
+    }
+    // ldd names its libc (musl on Alpine); macOS has none. One line, no
+    // single quotes (sshScriptCommand()).
+    return QStringLiteral("uname -s; uname -m; echo \"ldd: $(ldd --version 2>&1 | head -n 1)\"; "
+                          "echo \"loader: $(ls /lib/ld-musl-* 2>/dev/null | head -n 1)\"; "
+                          "if test -e \"$HOME/.local/share/kate-code/bin/%1\"; then echo installed; fi")
+        .arg(name);
+}
+
+std::optional<RemotePlatform> parseRemotePlatform(const QString &output)
+{
+    const QStringList lines = output.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    if (lines.isEmpty()) {
+        return std::nullopt;
+    }
+    const auto arch = [](QString machine) -> QString {
+        machine = machine.trimmed().toLower();
+        if (machine == QLatin1String("x86_64") || machine == QLatin1String("amd64")) {
+            return QStringLiteral("x86_64");
+        }
+        if (machine == QLatin1String("aarch64") || machine == QLatin1String("arm64")) {
+            return QStringLiteral("aarch64");
+        }
+        return {};
+    };
+    RemotePlatform result;
+    QString ldd;
+    QString loader;
+    for (const QString &line : lines) {
+        const QString text = line.trimmed();
+        result.installed |= text == QLatin1String("installed");
+        if (text.startsWith(QLatin1String("ldd:"))) {
+            ldd = text.mid(4).trimmed();
+        } else if (text.startsWith(QLatin1String("loader:"))) {
+            loader = text.mid(7).trimmed();
+        }
+    }
+    const QString first = lines.constFirst().trimmed();
+    if (first.startsWith(QLatin1String("Windows "))) {
+        const QString machine = arch(first.mid(8));
+        if (machine.isEmpty()) {
+            return std::nullopt;
+        }
+        result.key = QStringLiteral("windows-") + machine;
+        return result;
+    }
+    if (lines.size() < 2) {
+        return std::nullopt;
+    }
+    const QString machine = arch(lines.at(1));
+    if (machine.isEmpty()) {
+        return std::nullopt;
+    }
+    if (first == QLatin1String("Darwin")) {
+        result.key = QStringLiteral("darwin-") + machine;
+    } else if (first == QLatin1String("Linux")) {
+        // ldd tells the system's libc; a musl loader alone (musl installed
+        // next to glibc) does not make it a musl system, unless ldd says
+        // nothing (missing).
+        bool musl = ldd.contains(QLatin1String("musl"), Qt::CaseInsensitive);
+        const bool glibc = ldd.contains(QLatin1String("glibc"), Qt::CaseInsensitive) || ldd.contains(QLatin1String("GNU libc"), Qt::CaseInsensitive);
+        if (!musl && !glibc) {
+            musl = !loader.isEmpty();
+        }
+        result.key = QStringLiteral("linux-") + machine + (musl ? QStringLiteral("-musl") : QString());
+    } else {
+        return std::nullopt;
+    }
+    return result;
+}
+
+QString remoteAgentInstallScript(bool windows, const RemoteAgentPackage &package)
+{
+    if (!isValidRemoteAgentPackage(package)) {
+        return {};
+    }
+    if (windows) {
+        // stdin as bytes ([Console]::OpenStandardInput()) into a file, then
+        // Windows' tar (bsdtar, Windows 10 1803+).
+        const QString cmd = agentCmdPath(package.cmd, QLatin1Char('\\'));
+        return QStringLiteral(
+                   "$ErrorActionPreference='Stop'\n"
+                   "$b=Join-Path $env:LOCALAPPDATA 'kate-code'\n"
+                   "$t=Join-Path $b ('.install.'+[guid]::NewGuid().ToString('N'))\n"
+                   "[void](New-Item -ItemType Directory -Force -Path $t)\n"
+                   "try{\n"
+                   "$a=Join-Path $t 'a.tgz'\n"
+                   "$f=[IO.File]::Create($a);[Console]::OpenStandardInput().CopyTo($f);$f.Close()\n"
+                   "$x=Join-Path $t 'x';[void](New-Item -ItemType Directory -Path $x)\n"
+                   "& tar.exe -xzf $a -C $x;if($LASTEXITCODE){exit 2}\n"
+                   "if(-not(Test-Path -LiteralPath (Join-Path $x %3) -PathType Leaf)){[Console]::Error.WriteLine(%4);exit 3}\n"
+                   "$p=Join-Path $b %1\n"
+                   "[void](New-Item -ItemType Directory -Force -Path $p)\n"
+                   "$d=Join-Path $p %2\n"
+                   "if(Test-Path -LiteralPath $d){Remove-Item -LiteralPath $d -Recurse -Force}\n"
+                   "Move-Item -LiteralPath $x -Destination $d\n"
+                   "$n=Join-Path $b 'bin';[void](New-Item -ItemType Directory -Force -Path $n)\n"
+                   "Set-Content -LiteralPath (Join-Path $n %5) -Encoding ASCII -Value %6\n"
+                   "Write-Output installed\n"
+                   "}finally{Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue}\n")
+            .arg(powershellQuote(QStringLiteral("agents\\") + package.id),
+                 powershellQuote(package.version),
+                 powershellQuote(cmd),
+                 powershellQuote(package.cmd + QStringLiteral(" is not in the archive")),
+                 powershellQuote(package.name + QStringLiteral(".cmd")),
+                 powershellQuote(QStringLiteral("@\"%~dp0..\\agents\\%1\\%2\\%3\" %*").arg(package.id, package.version, cmd)));
+    }
+    // One line, no single quotes or backslashes (sshScriptCommand()); every
+    // name is validated, so double quotes suffice. Unpacked into a fresh
+    // directory and moved into place: installs from two chats do not mix.
+    const QString cmd = agentCmdPath(package.cmd, QLatin1Char('/'));
+    return QStringLiteral(
+               "set -e; umask 022; b=\"$HOME/.local/share/kate-code\"; mkdir -p \"$b/agents/%1\" \"$b/bin\"; "
+               "t=$(mktemp -d \"$b/.install.XXXXXX\"); c() { rm -rf \"$t\"; }; trap c EXIT; "
+               "cat > \"$t/a.tgz\"; mkdir \"$t/x\"; tar -xzf \"$t/a.tgz\" -C \"$t/x\"; "
+               "if ! test -f \"$t/x/%3\"; then echo \"%3 is not in the archive\" >&2; exit 3; fi; "
+               "chmod +x \"$t/x/%3\"; rm -rf \"$b/agents/%1/%2\"; mv \"$t/x\" \"$b/agents/%1/%2\"; "
+               "ln -sfn \"../agents/%1/%2/%3\" \"$b/bin/%4\"; echo installed")
+        .arg(package.id, package.version, cmd, package.name);
+}
+
+QStringList sshScriptCommand(const Location &location, const QStringList &ssh, const QString &script)
+{
+    if (!isSshScheme(location.scheme) || ssh.isEmpty() || script.isEmpty()) {
+        return {};
+    }
+    const auto target = parseSshAuthority(location.authority);
+    if (!target) {
+        return {};
+    }
+    const bool windows = !windowsPathForSftpPath(location.path).isEmpty();
+    if (windows && location.scheme != QLatin1String("sftp")) {
+        return {};
+    }
+    QStringList command = ssh;
+    command << QStringLiteral("-T") << QStringLiteral("-o") << QStringLiteral("ConnectTimeout=10");
+    appendSshDestination(command, *target);
+    if (windows) {
+        command << QStringLiteral("powershell -NoLogo -NoProfile -NonInteractive -EncodedCommand %1").arg(powershellEncoded(script));
+    } else {
+        command << QStringLiteral("exec /bin/sh -c '%1'").arg(script);
+    }
+    return command;
 }
 
 QStringList sshAgentCommand(const Location &location, const QStringList &ssh, const QString &program, const QStringList &args)
@@ -440,7 +620,7 @@ QStringList sshAgentCommand(const Location &location, const QStringList &ssh, co
     // install directories added (as the local search does). Written for
     // POSIX shells (tested: sh, bash, zsh) and fish 3 ("$PATH" is ':'-joined
     // there too; not tested).
-    const QString inner = QStringLiteral("cd %1 && exec env PATH=\"$PATH:$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin\" %2")
+    const QString inner = QStringLiteral("cd %1 && exec env PATH=\"$PATH:$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$HOME/.local/share/kate-code/bin\" %2")
                               .arg(shellQuote(location.path), quoted.join(QLatin1Char(' ')));
     command << QStringLiteral("exec \"$SHELL\" -l -c %1").arg(shellQuote(inner));
     return command;

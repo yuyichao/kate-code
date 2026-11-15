@@ -37,6 +37,7 @@ ChatWebView::ChatWebView(QWidget *parent)
     connect(m_bridge, &WebBridge::permissionResponse, this, &ChatWebView::permissionResponseReady);
     connect(m_bridge, &WebBridge::jumpToEditRequested, this, &ChatWebView::jumpToEditRequested);
     connect(m_bridge, &WebBridge::reconnectRequested, this, &ChatWebView::reconnectRequested);
+    connect(m_bridge, &WebBridge::agentInstallRequested, this, &ChatWebView::agentInstallRequested);
     connect(m_bridge, &WebBridge::questionAnswersSubmitted, this, [this](const QString &requestId, const QString &answersJson) {
         QJsonDocument doc = QJsonDocument::fromJson(answersJson.toUtf8());
         Q_EMIT userQuestionAnswered(requestId, doc.object());
@@ -542,10 +543,11 @@ void ChatWebView::showError(const QString &text)
     runJavaScript(script);
 }
 
-void ChatWebView::showReconnectPrompt(const QString &text)
+void ChatWebView::showReconnectPrompt(const QString &text, const QString &installLabel)
 {
     const QString base64Text = QString::fromLatin1(text.toUtf8().toBase64());
-    runJavaScript(QStringLiteral("addReconnectPrompt('%1');").arg(base64Text));
+    const QString base64Install = QString::fromLatin1(installLabel.toUtf8().toBase64());
+    runJavaScript(QStringLiteral("addReconnectPrompt('%1', '%2');").arg(base64Text, base64Install));
 }
 
 void ChatWebView::disableReconnectPrompts()
@@ -590,4 +592,9 @@ void WebBridge::submitQuestionAnswers(const QString &requestId, const QString &a
 void WebBridge::requestReconnect()
 {
     Q_EMIT reconnectRequested();
+}
+
+void WebBridge::requestAgentInstall()
+{
+    Q_EMIT agentInstallRequested();
 }

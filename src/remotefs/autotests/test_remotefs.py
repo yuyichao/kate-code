@@ -757,6 +757,93 @@ def test_remote_agent():
     check(code != 0 and any("exited" in e for e in errors), f"missing folder reported: {errors}")
 
 
+def run_install(entry, program, authority="goodhost", path="/data/sub"):
+    """acpdriver --install (RemoteAgentInstaller) with the registry entry;
+    returns (exit code, output)."""
+    entry_file = os.path.join(TMP, "registry-entry.json")
+    with open(entry_file, "w") as f:
+        json.dump(entry, f)
+    e = env()
+    e["ACPDRIVER_DOWNLOADS"] = os.path.join(TMP, "agent-downloads")
+    folder = os.path.join(ROOT, "sftp", authority) + path
+    result = subprocess.run([ACPDRIVER, "--install", folder, entry_file, program], env=e, capture_output=True, text=True, timeout=60)
+    return result.returncode, result.stdout + result.stderr
+
+
+def test_remote_agent_install():
+    print("installing an agent from the ACP registry on the remote host")
+    import hashlib
+    import tarfile
+    import zipfile
+    machine = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(os.uname().machine)
+    if not machine:
+        print("  (skipped: unknown machine)")
+        return
+    musl = any(os.path.exists(p) for p in __import__("glob").glob("/lib/ld-musl-*"))
+    platform = f"linux-{machine}" + ("-musl" if musl else "")
+    with open(os.path.join(AGENT_HOME, ".local", "bin", "fake-acp")) as f:
+        agent = f.read()
+    work = os.path.join(TMP, "agent-archives")
+    os.makedirs(work, exist_ok=True)
+    # A zip (re-packed as .tar.gz before it is sent) and a .tar.gz (sent as is).
+    zip_path = os.path.join(work, "fake-installed.zip")
+    with zipfile.ZipFile(zip_path, "w") as z:
+        info = zipfile.ZipInfo("pkg/fake-installed")
+        info.external_attr = 0o755 << 16
+        z.writestr(info, agent)
+        z.writestr("pkg/README", "fake\n")
+    tgz_path = os.path.join(work, "fake-installed-2.tar.gz")
+    src = os.path.join(work, "src")
+    os.makedirs(os.path.join(src, "pkg"), exist_ok=True)
+    with open(os.path.join(src, "pkg", "fake-installed"), "w") as f:
+        f.write(agent.replace("pwd=", "v2 pwd="))
+    os.chmod(os.path.join(src, "pkg", "fake-installed"), 0o755)
+    with tarfile.open(tgz_path, "w:gz") as t:
+        t.add(os.path.join(src, "pkg"), arcname="pkg")
+
+    def entry(archive, version, sha=None, plat=platform):
+        with open(archive, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        return {"id": "fake-acp-agent", "name": "Fake Agent", "version": version,
+                "distribution": {"binary": {plat: {"archive": "file://" + archive, "cmd": "./pkg/fake-installed",
+                                                   "sha256": sha or digest}},
+                                 "npx": {"package": "fake"}}}
+
+    installed = os.path.join(AGENT_HOME, ".local", "share", "kate-code")
+    code, _, errors, output = run_agent("goodhost", "/data/sub", "fake-installed")
+    check(code != 0 and "MISSING" in output, f"a missing agent is reported as such: {output}")
+
+    code, output = run_install(entry(zip_path, "1.0"), "npx")
+    check("CANINSTALL 0" in output, "no offer when the provider runs another program (npx)")
+    code, output = run_install(entry(zip_path, "1.0", sha="0" * 64), "fake-installed")
+    check(code != 0 and "SHA-256" in output, f"a wrong SHA-256 is refused: {output}")
+    check(not os.path.exists(os.path.join(installed, "agents")), "nothing reaches the host then")
+    code, output = run_install(entry(zip_path, "1.0", plat="linux-riscv64"), "fake-installed")
+    check(code != 0 and "no Fake Agent build for goodhost" in output, f"no build for the host's platform: {output}")
+
+    code, output = run_install(entry(zip_path, "1.0"), "fake-installed")
+    check(code == 0 and "CANINSTALL 1" in output and "Re-packing" in output and "FINISHED 1 Installed Fake Agent 1.0 on goodhost" in output,
+          f"installed from a zip: {output}")
+    code, _, errors, output = run_agent("goodhost", "/data/sub", "fake-installed")
+    check(code == 0 and "DONE" in output and not errors, f"the installed agent runs ({code}): {errors} {output}")
+
+    code, output = run_install(entry(tgz_path, "2.0"), "fake-installed")
+    check(code == 0 and "Re-packing" not in output and "FINISHED 1" in output, f"reinstalled from a .tar.gz: {output}")
+    check(os.readlink(os.path.join(installed, "bin", "fake-installed")) == "../agents/fake-acp-agent/2.0/pkg/fake-installed",
+          "the launcher runs the new version")
+    os.remove(AGENT_LOG)
+    code, messages, errors, output = run_agent("goodhost", "/data/sub", "fake-installed")
+    chunk = next((m["params"]["update"]["content"]["text"] for m in messages if m.get("method") == "session/update"
+                  and m["params"]["update"].get("sessionUpdate") == "agent_message_chunk"), "")
+    check(code == 0 and chunk == "v2 pwd=/data/sub", f"the new version runs: {chunk!r}")
+    check(sorted(os.listdir(installed)) == ["agents", "bin"], f"no temporary files left: {os.listdir(installed)}")
+    code, output = run_install(entry(tgz_path, "2.0"), "fake-installed")
+    check(code == 0 and "Downloading" not in output, f"a verified download is reused: {output}")
+
+    code, output = run_install(entry(tgz_path, "3.0"), "fake-installed", authority="badagent")
+    check(code != 0 and "ssh to badagent failed" in output, f"ssh failures reported: {output}")
+
+
 def kio_fuse_pids():
     pids = []
     for pid in os.listdir("/proc"):
@@ -1164,7 +1251,7 @@ def main():
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_kde_passwords, test_remote_agent, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_remote_agent, test_remote_agent_install, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_shutdown_and_restart):
             try:
                 test()

@@ -312,6 +312,7 @@ void AgentIcons::parseRegistry(const QByteArray &json)
     }
     m_registryIcons.clear();
     m_registryAgents.clear();
+    m_registryEntries.clear();
     for (const QJsonValue &value : agents) {
         const QJsonObject agent = value.toObject();
         const QString id = agent[QStringLiteral("id")].toString();
@@ -319,6 +320,7 @@ void AgentIcons::parseRegistry(const QByteArray &json)
             continue;
         }
         m_registryAgents.append({id, agent[QStringLiteral("name")].toString(id)});
+        m_registryEntries.insert(id, agent);
         const QString icon = agent[QStringLiteral("icon")].toString();
         if (!icon.isEmpty()) {
             // The icon may be given relative to the registry.
@@ -335,6 +337,17 @@ QList<QPair<QString, QString>> AgentIcons::registryAgents()
 {
     ensureRegistry();
     return m_registryAgents;
+}
+
+QJsonObject AgentIcons::registryEntry(const QString &id)
+{
+    ensureRegistry();
+    if (!m_registryLoaded) {
+        // A copy older than a day while the fresh one is fetched: better
+        // than nothing (the fetch replaces it).
+        loadRegistryFromDisk(false);
+    }
+    return m_registryEntries.value(id);
 }
 
 void AgentIcons::processPending()

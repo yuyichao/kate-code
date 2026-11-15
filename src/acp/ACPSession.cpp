@@ -99,6 +99,7 @@ ACPSession::ACPSession(QObject *parent)
     connect(m_service, &ACPService::notificationReceived, this, &ACPSession::onNotification);
     connect(m_service, &ACPService::responseReceived, this, &ACPSession::onResponse);
     connect(m_service, &ACPService::jsonPayload, this, &ACPSession::jsonPayload);
+    connect(m_service, &ACPService::remoteAgentMissing, this, &ACPSession::remoteAgentMissing);
     connect(m_service, &ACPService::errorOccurred, this, &ACPSession::onError);
 
     // Forward terminal output to UI

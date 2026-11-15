@@ -13,6 +13,7 @@ set(katecode_SRCS
     acp/ACPSession.cpp
     acp/ACPSessionDeleter.cpp
     acp/RateLimits.cpp
+    acp/RemoteAgentInstaller.cpp
     acp/TerminalManager.cpp
 
     # UI layer
@@ -53,6 +54,7 @@ add_library(katecode MODULE ${katecode_SRCS} ${katecode_RESOURCES})
 
 target_link_libraries(katecode
     kateremotelocation
+    KF6::Archive
     KF6::TextEditor
     KF6::I18n
     KF6::CoreAddons

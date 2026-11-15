@@ -1,4 +1,6 @@
 #include "ChatWidget.h"
+#include <QUuid>
+#include "../acp/RemoteAgentInstaller.h"
 #include "ChatWebView.h"
 #include "ChatInputWidget.h"
 #include "PermissionDialog.h"
@@ -289,6 +291,13 @@ ChatWidget::ChatWidget(QWidget *parent)
             [this](const QString &configId, const QJsonValue &value) {
                 m_session->setConfigOption(configId, value);
             });
+    connect(m_session, &ACPSession::remoteAgentMissing, this, [this] {
+        m_remoteAgentMissing = true;
+        const QString host = ACPService::remoteHostFor(m_session->workingDir());
+        if (!host.isEmpty() && host == m_installedAgentHost) {
+            m_chatWebView->showError(QStringLiteral("The agent Kate Code installed on %1 did not start there (see the error below).").arg(host));
+        }
+    });
     connect(m_session, &ACPSession::errorOccurred, this, &ChatWidget::onError);
     connect(m_session, &ACPSession::sessionError, this, &ChatWidget::onSessionError);
     connect(m_session, &ACPSession::promptCancelled, this, &ChatWidget::onPromptCancelled);
@@ -575,6 +584,87 @@ void ChatWidget::startNewSession(bool resetView, const QString &root)
     m_session->start(projectRoot);
 }
 
+void ChatWidget::addSystemNote(const QString &text)
+{
+    Message note;
+    note.id = QStringLiteral("sys_note_") + QUuid::createUuid().toString(QUuid::Id128);
+    note.role = QStringLiteral("system");
+    note.timestamp = QDateTime::currentDateTime();
+    note.content = text;
+    m_chatWebView->addMessage(note);
+}
+
+QString ChatWidget::agentInstallLabel() const
+{
+    if (!m_remoteAgentMissing || m_agentInstaller || !m_settingsStore) {
+        return {};
+    }
+    const ACPProvider provider = currentProvider();
+    if (provider.registryId.trimmed().isEmpty()) {
+        return {};
+    }
+    const QJsonObject entry = m_settingsStore->agentIcons()->registryEntry(provider.registryId.trimmed());
+    if (entry.isEmpty() || !RemoteAgentInstaller::canInstall(entry, provider.executable)) {
+        return {};
+    }
+    const QString host = ACPService::remoteHostFor(m_session->workingDir());
+    if (host.isEmpty() || host == m_installedAgentHost) {
+        return {};
+    }
+    return QStringLiteral("Install %1 on %2").arg(entry.value(QStringLiteral("name")).toString(provider.registryId), host);
+}
+
+void ChatWidget::onAgentInstallRequested()
+{
+    if (agentInstallLabel().isEmpty()) {
+        return; // a stale button
+    }
+    const ACPProvider provider = currentProvider();
+    const QJsonObject entry = m_settingsStore->agentIcons()->registryEntry(provider.registryId.trimmed());
+    const QString host = ACPService::remoteHostFor(m_session->workingDir());
+    const QString name = entry.value(QStringLiteral("name")).toString(provider.registryId);
+    QStringList authors;
+    for (const QJsonValue &author : entry.value(QStringLiteral("authors")).toArray()) {
+        authors << author.toString();
+    }
+    QString details = QStringLiteral("Download %1 %2 from the ACP registry (agentclientprotocol.com) and install it on %3?\n\n"
+                                     "The build for %3's platform is downloaded here, checked against the registry's SHA-256, "
+                                     "and copied to %3 over ssh into Kate Code's own folder there (~/.local/share/kate-code, or "
+                                     "%LOCALAPPDATA%\\kate-code on Windows), where Kate Code finds it after the agents you "
+                                     "installed yourself.")
+                          .arg(name, entry.value(QStringLiteral("version")).toString(), host);
+    if (!authors.isEmpty()) {
+        details += QStringLiteral("\n\nAuthors: %1").arg(authors.join(QStringLiteral(", ")));
+    }
+    if (const QString license = entry.value(QStringLiteral("license")).toString(); !license.isEmpty()) {
+        details += QStringLiteral("\nLicense: %1").arg(license);
+    }
+    if (const QString repository = entry.value(QStringLiteral("repository")).toString(); !repository.isEmpty()) {
+        details += QStringLiteral("\nRepository: %1").arg(repository);
+    }
+    if (QMessageBox::question(this, QStringLiteral("Install Agent on %1").arg(host), details, QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel)
+        != QMessageBox::Yes) {
+        return;
+    }
+    m_chatWebView->disableReconnectPrompts();
+    m_agentInstaller = new RemoteAgentInstaller(entry, m_session->workingDir(), provider.executable, this);
+    m_agentInstallProviderId = m_providerId;
+    connect(m_agentInstaller, &RemoteAgentInstaller::progress, this, &ChatWidget::addSystemNote);
+    connect(m_agentInstaller, &RemoteAgentInstaller::finished, this, [this, host, installer = m_agentInstaller](bool ok, const QString &message) {
+        installer->deleteLater();
+        m_agentInstaller = nullptr;
+        if (ok) {
+            addSystemNote(message);
+            m_installedAgentHost = host;
+            onReconnectRequested();
+            return;
+        }
+        m_chatWebView->showError(QStringLiteral("Error: ") + message);
+        m_chatWebView->showReconnectPrompt(QStringLiteral("The agent was not installed."), agentInstallLabel());
+    });
+    m_agentInstaller->start();
+}
+
 void ChatWidget::onReconnectRequested()
 {
     if (m_lastStatus == ConnectionStatus::Connecting || m_lastStatus == ConnectionStatus::Connected) {
@@ -796,7 +886,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
             m_statusIndicator->setToolTip(QStringLiteral("Disconnected"));
             if (!m_quietStop) {
                 m_chatWebView->showReconnectPrompt(QStringLiteral("Disconnected from %1.").arg(
-                    m_settingsStore ? currentProvider().description : QStringLiteral("ACP")));
+                    m_settingsStore ? currentProvider().description : QStringLiteral("ACP")), agentInstallLabel());
             }
         }
 
@@ -817,6 +907,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
                                    m_settingsStore->acpLogSubdirectory());
         }
         m_chatWebView->disableReconnectPrompts();
+        m_remoteAgentMissing = false;
         m_newSessionButton->setEnabled(false);
         m_providerCombo->setEnabled(false);
         m_statusIndicator->setStyleSheet(QStringLiteral("QLabel { color: #f0ad4e; font-size: 14px; }"));
@@ -896,7 +987,7 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         m_acpLogger->endSession();
         // The error itself is reported by onError()/describeError().
         m_chatWebView->showReconnectPrompt(QStringLiteral("Could not start a session with %1.").arg(
-            m_settingsStore ? currentProvider().description : QStringLiteral("the agent")));
+            m_settingsStore ? currentProvider().description : QStringLiteral("the agent")), agentInstallLabel());
         break;
     }
 
@@ -1705,6 +1796,13 @@ void ChatWidget::applyACPBackend()
     m_session->setExecutable(provider.executable, args);
     m_session->setMcpConfigPath(provider.mcpConfigPath);
     m_session->setSessionConfig(provider.sessionConfig);
+    if (m_agentInstaller && m_agentInstallProviderId != m_providerId) {
+        // An install for the previous provider's agent (a new session
+        // with the new one follows).
+        m_agentInstaller->cancel();
+        m_agentInstaller->deleteLater();
+        m_agentInstaller = nullptr;
+    }
     m_inputWidget->setRateLimits(RateLimitStore::instance()->limits(m_providerId));
     updateProviderIcons();
     qDebug() << "[ChatWidget] ACP backend configured:" << provider.executable << args
@@ -1888,6 +1986,7 @@ void ChatWidget::connectWebViewSignals()
 
     // Reconnect button in a connection failure notice
     connect(m_chatWebView, &ChatWebView::reconnectRequested, this, &ChatWidget::onReconnectRequested);
+    connect(m_chatWebView, &ChatWebView::agentInstallRequested, this, &ChatWidget::onAgentInstallRequested);
 
     // Apply diff colors when WebView is ready (after page load)
     connect(m_chatWebView, &ChatWebView::webViewReady, this, &ChatWidget::applyDiffColors);

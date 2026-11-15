@@ -342,7 +342,7 @@ private Q_SLOTS:
         QTest::addColumn<QStringList>("args");
         QTest::addColumn<QStringList>("expected"); // after the ssh options, empty: refused
 
-        const QString env = QStringLiteral("exec env PATH=\"$PATH:$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin\" ");
+        const QString env = QStringLiteral("exec env PATH=\"$PATH:$HOME/.local/bin:$HOME/bin:$HOME/.cargo/bin:$HOME/.local/share/kate-code/bin\" ");
         const auto remote = [&](const QString &inner) {
             return QStringLiteral("exec \"$SHELL\" -l -c %1").arg(shellQuote(inner));
         };
@@ -515,6 +515,188 @@ private Q_SLOTS:
         QVERIFY(script.contains(QStringLiteral("$i.Arguments='--x \"a \\\"b\\\" c\\\\\"'\n")));
         // fish has no Windows hosts.
         QVERIFY(sshAgentCommand(Location{QStringLiteral("fish"), QStringLiteral("win"), QStringLiteral("/C:/x")}, ssh, QStringLiteral("a"), {}).isEmpty());
+    }
+
+    void remoteAgentPackages_data()
+    {
+        QTest::addColumn<QString>("id");
+        QTest::addColumn<QString>("version");
+        QTest::addColumn<QString>("cmd");
+        QTest::addColumn<QString>("name");
+        QTest::addColumn<bool>("valid");
+        QTest::newRow("claude") << "claude-acp" << "0.106.0" << "./claude-agent-acp" << "claude-agent-acp" << true;
+        QTest::newRow("windows subdir") << "goose" << "1.59.0" << "./goose-package\\goose.exe" << "goose" << true;
+        QTest::newRow("subdir") << "a" << "2026.11.11" << "bin/a+b_c" << "a" << true;
+        QTest::newRow("dotdot cmd") << "a" << "1" << "./../x" << "x" << false;
+        QTest::newRow("dotdot inside") << "a" << "1" << "./d/../../x" << "x" << false;
+        QTest::newRow("absolute cmd") << "a" << "1" << "/bin/sh" << "sh" << false;
+        QTest::newRow("quote in version") << "a" << "1\"; rm -rf ~" << "./a" << "a" << false;
+        QTest::newRow("dollar in id") << "$(x)" << "1" << "./a" << "a" << false;
+        QTest::newRow("dot version") << "a" << ".." << "./a" << "a" << false;
+        QTest::newRow("space in name") << "a" << "1" << "./a" << "a b" << false;
+        QTest::newRow("dash name") << "a" << "1" << "./a" << "-a" << false;
+        QTest::newRow("empty cmd") << "a" << "1" << "./" << "a" << false;
+    }
+
+    void remoteAgentPackages()
+    {
+        QFETCH(QString, id);
+        QFETCH(QString, version);
+        QFETCH(QString, cmd);
+        QFETCH(QString, name);
+        QFETCH(bool, valid);
+        const RemoteAgentPackage package{id, version, cmd, name};
+        QCOMPARE(isValidRemoteAgentPackage(package), valid);
+        QCOMPARE(remoteAgentInstallScript(false, package).isEmpty(), !valid);
+        QCOMPARE(remoteAgentInstallScript(true, package).isEmpty(), !valid);
+        // The probe takes the name only when it is valid.
+        const bool nameValid = QRegularExpression(QStringLiteral("^[A-Za-z0-9_][A-Za-z0-9._+-]*$")).match(name).hasMatch();
+        QCOMPARE(remotePlatformScript(false, name).isEmpty(), !nameValid);
+    }
+
+    void remotePlatforms_data()
+    {
+        QTest::addColumn<QString>("output");
+        QTest::addColumn<QString>("key");
+        QTest::addColumn<bool>("installed");
+        QTest::newRow("linux glibc") << "Linux\nx86_64\nldd: ldd (GNU libc) 2.42\nloader: \n" << "linux-x86_64" << false;
+        QTest::newRow("linux arm64") << "Linux\naarch64\nldd: ldd (Ubuntu GLIBC 2.39-0ubuntu8) 2.39\nloader:\ninstalled\n" << "linux-aarch64" << true;
+        QTest::newRow("glibc with musl installed") << "Linux\nx86_64\nldd: ldd (GNU libc) 2.42\nloader: /lib/ld-musl-x86_64.so.1\n" << "linux-x86_64" << false;
+        QTest::newRow("alpine") << "Linux\nx86_64\nldd: musl libc (x86_64)\nloader: /lib/ld-musl-x86_64.so.1\n" << "linux-x86_64-musl" << false;
+        QTest::newRow("musl without ldd") << "Linux\naarch64\nldd: sh: ldd: not found\nloader: /lib/ld-musl-aarch64.so.1\n" << "linux-aarch64-musl" << false;
+        QTest::newRow("macos arm") << "Darwin\narm64\nldd: sh: ldd: command not found\nloader:\n" << "darwin-aarch64" << false;
+        QTest::newRow("macos intel") << "Darwin\nx86_64\n" << "darwin-x86_64" << false;
+        QTest::newRow("freebsd amd64") << "FreeBSD\namd64\n" << "" << false;
+        QTest::newRow("windows") << "Windows AMD64\r\n" << "windows-x86_64" << false;
+        QTest::newRow("windows arm") << "Windows ARM64\r\ninstalled\r\n" << "windows-aarch64" << true;
+        QTest::newRow("windows x86") << "Windows x86\r\n" << "" << false;
+        QTest::newRow("riscv") << "Linux\nriscv64\n" << "" << false;
+        QTest::newRow("empty") << "" << "" << false;
+    }
+
+    void remotePlatforms()
+    {
+        QFETCH(QString, output);
+        QFETCH(QString, key);
+        QFETCH(bool, installed);
+        const auto platform = parseRemotePlatform(output);
+        QCOMPARE(platform ? platform->key : QString(), key);
+        if (platform) {
+            QCOMPARE(platform->installed, installed);
+        }
+    }
+
+    // The install script as each login shell runs it (sshScriptCommand()'s
+    // remote command), with a .tar.gz on stdin: unpacked, the launcher
+    // runs the program; a reinstall replaces it; an archive without the
+    // program fails and changes nothing.
+    void remoteAgentInstall()
+    {
+        const QString tar = QStandardPaths::findExecutable(QStringLiteral("tar"));
+        if (tar.isEmpty()) {
+            QSKIP("tar not found");
+        }
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString home = dir.path() + QStringLiteral("/my home");
+        QVERIFY(QDir().mkpath(home));
+        const auto makeArchive = [&](const QString &name, const QByteArray &output) {
+            const QString src = dir.path() + QStringLiteral("/src-") + name;
+            QDir().mkpath(src + QStringLiteral("/sub"));
+            QFile program(src + QStringLiteral("/sub/agent-bin"));
+            if (!program.open(QIODevice::WriteOnly)) {
+                return QString();
+            }
+            program.write("#!/bin/sh\necho " + output + "\n");
+            program.close();
+            // Not executable in the archive: the script sets it.
+            program.setPermissions(QFile::ReadOwner | QFile::WriteOwner);
+            const QString archive = dir.path() + QLatin1Char('/') + name + QStringLiteral(".tar.gz");
+            QProcess::execute(tar, {QStringLiteral("-czf"), archive, QStringLiteral("-C"), src, QStringLiteral(".")});
+            return archive;
+        };
+        const QString v1 = makeArchive(QStringLiteral("v1"), "one");
+        const QString v2 = makeArchive(QStringLiteral("v2"), "two");
+        const RemoteAgentPackage package{QStringLiteral("my-agent"), QStringLiteral("1.0"), QStringLiteral("./sub/agent-bin"), QStringLiteral("agent")};
+        const QString folder = dir.path() + QStringLiteral("/project");
+        QVERIFY(QDir().mkpath(folder));
+        const Location location{QStringLiteral("sftp"), QStringLiteral("h"), folder};
+        const QString install = sshScriptCommand(location, {QStringLiteral("ssh")}, remoteAgentInstallScript(false, package)).last();
+        RemoteAgentPackage wrong = package;
+        wrong.cmd = QStringLiteral("./other");
+        const QString installWrong = sshScriptCommand(location, {QStringLiteral("ssh")}, remoteAgentInstallScript(false, wrong)).last();
+        const QString probe = sshScriptCommand(location, {QStringLiteral("ssh")}, remotePlatformScript(false, QStringLiteral("agent"))).last();
+        // As sshAgentCommand() finds it.
+        const QString run = sshAgentCommand(location, {QStringLiteral("ssh")}, QStringLiteral("agent"), {}).last();
+        const auto shellRun = [&](const QString &shell, const QString &command, const QString &stdinFile, QByteArray *out) {
+            QProcessEnvironment env;
+            env.insert(QStringLiteral("SHELL"), shell);
+            env.insert(QStringLiteral("HOME"), home);
+            env.insert(QStringLiteral("PATH"), QStringLiteral("/usr/bin:/bin"));
+            QProcess process;
+            process.setProcessEnvironment(env);
+            process.setStandardInputFile(stdinFile.isEmpty() ? QProcess::nullDevice() : stdinFile);
+            process.start(shell, {QStringLiteral("-c"), command});
+            process.waitForFinished();
+            *out = process.readAllStandardOutput();
+            return process.exitCode();
+        };
+        int shells = 0;
+        for (const QString &loginShell : {QStringLiteral("sh"), QStringLiteral("bash"), QStringLiteral("zsh"), QStringLiteral("fish")}) {
+            const QString shell = QStandardPaths::findExecutable(loginShell);
+            if (shell.isEmpty()) {
+                continue;
+            }
+            ++shells;
+            QDir(home + QStringLiteral("/.local")).removeRecursively();
+            QByteArray out;
+            QCOMPARE(shellRun(shell, probe, {}, &out), 0);
+            QVERIFY2(parseRemotePlatform(QString::fromLocal8Bit(out)).has_value(), out.constData());
+            QVERIFY(!parseRemotePlatform(QString::fromLocal8Bit(out))->installed);
+            QCOMPARE(shellRun(shell, install, v1, &out), 0);
+            QVERIFY(out.contains("installed"));
+            QCOMPARE(shellRun(shell, probe, {}, &out), 0);
+            QVERIFY(parseRemotePlatform(QString::fromLocal8Bit(out))->installed);
+            // The agent's own command finds it (sshAgentCommand() runs
+            // "$SHELL" -l: a login shell, as sshd would).
+            QCOMPARE(shellRun(shell, run, {}, &out), 0);
+            QCOMPARE(out, QByteArray("one\n"));
+            QCOMPARE(shellRun(shell, install, v2, &out), 0);
+            QCOMPARE(shellRun(shell, run, {}, &out), 0);
+            QCOMPARE(out, QByteArray("two\n"));
+            QCOMPARE(shellRun(shell, installWrong, v1, &out), 3);
+            QCOMPARE(shellRun(shell, run, {}, &out), 0);
+            QCOMPARE(out, QByteArray("two\n"));
+            // No temporary directories left.
+            const QStringList left = QDir(home + QStringLiteral("/.local/share/kate-code")).entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot);
+            QCOMPARE(left, (QStringList{QStringLiteral("agents"), QStringLiteral("bin")}));
+        }
+        QVERIFY(shells > 0);
+    }
+
+    void windowsAgentInstall()
+    {
+        const RemoteAgentPackage package{QStringLiteral("goose"), QStringLiteral("1.59.0"), QStringLiteral("./goose-package\\goose.exe"), QStringLiteral("goose")};
+        const QStringList command = sshScriptCommand(Location{QStringLiteral("sftp"), QStringLiteral("me@win"), QStringLiteral("/C:/Users/me/proj")},
+                                                     {QStringLiteral("ssh")},
+                                                     remoteAgentInstallScript(true, package));
+        QVERIFY(!command.isEmpty());
+        const QString prefix = QStringLiteral("powershell -NoLogo -NoProfile -NonInteractive -EncodedCommand ");
+        QVERIFY(command.last().startsWith(prefix));
+        QVERIFY2(command.last().size() < 7000, qPrintable(QString::number(command.last().size())));
+        const QByteArray utf16 = QByteArray::fromBase64(command.last().mid(prefix.size()).toLatin1());
+        QString script;
+        for (qsizetype i = 0; i + 1 < utf16.size(); i += 2) {
+            script += QChar(char16_t(uchar(utf16.at(i)) | (uchar(utf16.at(i + 1)) << 8)));
+        }
+        QCOMPARE(script, remoteAgentInstallScript(true, package));
+        QVERIFY(script.contains(QStringLiteral("(Join-Path $x 'goose-package\\goose.exe')")));
+        QVERIFY(script.contains(QStringLiteral("-Value '@\"%~dp0..\\agents\\goose\\1.59.0\\goose-package\\goose.exe\" %*'")));
+        QVERIFY(script.contains(QStringLiteral("(Join-Path $n 'goose.cmd')")));
+        // The agent's script looks there last.
+        QVERIFY(windowsAgentScript(QStringLiteral("C:\\x"), QStringLiteral("goose"), {}).contains(QStringLiteral(";$env:LOCALAPPDATA\\kate-code\\bin\"")));
+        const QString probe = remotePlatformScript(true, QStringLiteral("goose"));
+        QVERIFY(probe.contains(QStringLiteral("'kate-code\\bin\\goose.cmd'")));
     }
 
     void windowsArguments_data()

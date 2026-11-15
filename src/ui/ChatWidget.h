@@ -9,6 +9,8 @@
 #include <QWidget>
 #include <functional>
 
+class RemoteAgentInstaller;
+
 namespace KTextEditor {
 class Document;
 }
@@ -140,6 +142,8 @@ Q_SIGNALS:
 
 private Q_SLOTS:
     void onReconnectRequested();
+    // The failure notice's "Install <agent> on <host>" button.
+    void onAgentInstallRequested();
     void onNewSessionClicked();
     void onStopClicked();
     void onMessageSubmitted(const QString &message);
@@ -292,6 +296,16 @@ private:
     bool m_shutdownDone = false;
 
     QPointer<EditorSession> m_editorSession;
+    // Installing the agent on a remote host (RemoteAgentInstaller): offered
+    // when the remote agent was not found (exit 127) and the provider's
+    // registry entry has a build that runs its executable.
+    QPointer<RemoteAgentInstaller> m_agentInstaller;
+    QString m_agentInstallProviderId; // the provider it installs for
+    bool m_remoteAgentMissing = false;
+    QString m_installedAgentHost; // where this chat installed it (no second offer)
+    // The install button's label, empty when there is nothing to offer.
+    QString agentInstallLabel() const;
+    void addSystemNote(const QString &text);
     std::function<bool(const QString &)> m_openSessionLocator;
 
     // This chat's provider. Starts as the global default (activeProvider);

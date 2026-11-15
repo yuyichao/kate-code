@@ -42,13 +42,16 @@ public:
     // Show a distinct error banner in the chat (ACP/session errors).
     void showError(const QString &text);
 
-    // Connection failure notice with a Reconnect button (reconnectRequested).
-    void showReconnectPrompt(const QString &text);
+    // Connection failure notice with a Reconnect button (reconnectRequested)
+    // and, with installLabel, a button installing the agent on the remote
+    // host (agentInstallRequested).
+    void showReconnectPrompt(const QString &text, const QString &installLabel = QString());
     // Disable the Reconnect buttons shown so far (a new attempt has started).
     void disableReconnectPrompts();
 
 Q_SIGNALS:
     void reconnectRequested();
+    void agentInstallRequested();
     void permissionResponseReady(int requestId, const QString &optionId);
     void jumpToEditRequested(const QString &filePath, int startLine, int endLine);
     void webViewReady();
@@ -85,10 +88,12 @@ public Q_SLOTS:
     Q_INVOKABLE void jumpToEdit(const QString &filePath, int startLine, int endLine);
     Q_INVOKABLE void submitQuestionAnswers(const QString &requestId, const QString &answersJson);
     Q_INVOKABLE void requestReconnect();
+    Q_INVOKABLE void requestAgentInstall();
 
 Q_SIGNALS:
     void permissionResponse(int requestId, const QString &optionId);
     void jumpToEditRequested(const QString &filePath, int startLine, int endLine);
     void questionAnswersSubmitted(const QString &requestId, const QString &answersJson);
     void reconnectRequested();
+    void agentInstallRequested();
 };

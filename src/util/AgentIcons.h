@@ -2,6 +2,7 @@
 
 #include <QHash>
 #include <QIcon>
+#include <QJsonObject>
 #include <QObject>
 #include <QSet>
 #include <QUrl>
@@ -41,6 +42,10 @@ public:
     // copy. Loads the registry in the background (iconsChanged() fires) if
     // it is not known yet.
     QList<QPair<QString, QString>> registryAgents();
+    // The registry's entry for an agent (name, version, distribution, ...),
+    // empty if unknown or the registry is not loaded yet (it is then loaded
+    // in the background).
+    QJsonObject registryEntry(const QString &id);
 
 Q_SIGNALS:
     void iconsChanged();
@@ -69,6 +74,7 @@ private:
     mutable QIcon m_defaultIcon;
     QHash<QString, QUrl> m_registryIcons;   // registry id -> icon URL
     QList<QPair<QString, QString>> m_registryAgents;
+    QHash<QString, QJsonObject> m_registryEntries;
     bool m_registryLoaded = false;
     bool m_registryRequested = false;       // network fetch started this run
     QSet<QString> m_pending;                // ids waiting for the registry

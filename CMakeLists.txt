@@ -14,6 +14,7 @@ include(KDECompilerSettings NO_POLICY_SCOPE)
 include(FeatureSummary)
 
 find_package(KF6 ${REQUIRED_KF_VERSION} REQUIRED COMPONENTS
+    Archive
     I18n
     TextEditor
     CoreAddons

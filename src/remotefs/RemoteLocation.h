@@ -146,6 +146,40 @@ QString windowsArgument(const QString &arg);
 // for any other path.
 QString windowsPathForSftpPath(const QString &path);
 
+// --- Agents Kate Code installs on a host (ACP registry binaries) ---
+// POSIX hosts: unpacked in ~/.local/share/kate-code/agents/<id>/<version>,
+// run through the symlink ~/.local/share/kate-code/bin/<name>; Windows:
+// %LOCALAPPDATA%\kate-code\agents\<id>\<version> and the launcher
+// %LOCALAPPDATA%\kate-code\bin\<name>.cmd. The bin directory is the last
+// one sshAgentCommand() searches, so the user's own install wins.
+struct RemoteAgentPackage {
+    QString id; // registry id
+    QString version;
+    QString cmd; // the program in the archive ("./claude-agent-acp", "./dir\\x.exe")
+    QString name; // what the provider runs (the launcher's name)
+};
+// Registry data ends up in a script run on the host: ids, versions and names
+// are letters, digits and ".+_-" (not starting with a dot or '-'); cmd is a
+// relative path ("./" allowed) of such names.
+bool isValidRemoteAgentPackage(const RemoteAgentPackage &package);
+// The script reporting the host's platform (parseRemotePlatform()) and
+// whether Kate Code's copy of 'name' is there.
+QString remotePlatformScript(bool windows, const QString &name);
+struct RemotePlatform {
+    QString key; // the registry's platform: "linux-x86_64", "linux-aarch64-musl", "darwin-aarch64", "windows-x86_64", ...
+    bool installed = false; // Kate Code's launcher exists
+};
+std::optional<RemotePlatform> parseRemotePlatform(const QString &output);
+// The script installing package from a .tar.gz on its stdin; prints
+// "installed" at the end. Exit 3: cmd is not in the archive.
+QString remoteAgentInstallScript(bool windows, const RemoteAgentPackage &package);
+// The command line (program first) running script on location's host
+// through `ssh -T`: POSIX hosts "/bin/sh -c" (the script must be one line
+// without single quotes or backslashes: any login shell passes it on),
+// Windows hosts PowerShell (-EncodedCommand). Empty when ssh cannot reach
+// the location (as sshAgentCommand()).
+QStringList sshScriptCommand(const Location &location, const QStringList &ssh, const QString &script);
+
 // 'text' quoted for a POSIX shell.
 QString shellQuote(const QString &text);
 

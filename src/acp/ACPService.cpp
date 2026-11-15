@@ -41,7 +41,7 @@ ACPService::~ACPService()
 
 // kate-remote-fs-askpass, as kate-remote-fs uses it (empty when its
 // KdePasswords setting is off or the daemon does not run).
-static QString remoteFsAskpassProgram()
+QString ACPService::remoteFsAskpassProgram()
 {
     QDBusMessage call = QDBusMessage::createMethodCall(QStringLiteral("org.kde.KateRemoteFS"),
                                                        QStringLiteral("/org/kde/KateRemoteFS"),
@@ -497,11 +497,14 @@ void ACPService::onFinished(int exitCode, QProcess::ExitStatus exitStatus)
         const QString details = lines.mid(std::max<qsizetype>(0, lines.size() - 3)).join(QLatin1Char('\n')).trimmed();
         QString message;
         if (exitCode == 127) {
+            // Also a program that cannot run there (another platform, a
+            // missing interpreter): the stderr lines below tell.
             message = m_pathMap.style() == KateRemote::RemotePathMap::Style::Windows
-                ? QStringLiteral("%1 was not found on %2 (searched PATH, %USERPROFILE%\\.local\\bin, \\bin, \\.cargo\\bin and %APPDATA%\\npm).")
+                ? QStringLiteral("%1 was not found on %2 (searched PATH, %USERPROFILE%\\.local\\bin, \\bin, \\.cargo\\bin, %APPDATA%\\npm and Kate Code's %LOCALAPPDATA%\\kate-code\\bin).")
                       .arg(QFileInfo(m_executable).fileName(), m_remoteHost)
-                : QStringLiteral("%1 was not found on %2 (searched the login shell's PATH, ~/.local/bin, ~/bin and ~/.cargo/bin).")
+                : QStringLiteral("%1 was not found on %2 (searched the login shell's PATH, ~/.local/bin, ~/bin, ~/.cargo/bin and Kate Code's ~/.local/share/kate-code/bin), or cannot run there.")
                       .arg(QFileInfo(m_executable).fileName(), m_remoteHost);
+            Q_EMIT remoteAgentMissing();
         } else if (exitCode == 255) {
             message = QStringLiteral("ssh to %1 failed or the connection was lost.").arg(m_remoteHost);
         } else {

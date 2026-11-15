@@ -5,7 +5,14 @@
 //   ERROR <text>     errorOccurred()
 //   DONE             the prompt's response arrived
 //   DISCONNECTED <n> the agent exited
+//   MISSING          remoteAgentMissing()
+// acpdriver --install <folder> <registry entry JSON file> <program>
+// runs RemoteAgentInstaller instead:
+//   PROGRESS <text>, then FINISHED <0|1> <message>
 #include "ACPService.h"
+#include "RemoteAgentInstaller.h"
+
+#include <QFile>
 
 #include <QCoreApplication>
 #include <QJsonArray>
@@ -24,6 +31,27 @@ int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
     const QStringList args = app.arguments();
+    if (args.size() == 5 && args.at(1) == QLatin1String("--install")) {
+        QFile entry(args.at(3));
+        if (!entry.open(QIODevice::ReadOnly)) {
+            return 2;
+        }
+        RemoteAgentInstaller installer(QJsonDocument::fromJson(entry.readAll()).object(), args.at(2), args.at(4));
+        installer.setAllowFileUrls(true);
+        if (qEnvironmentVariableIsSet("ACPDRIVER_DOWNLOADS")) {
+            installer.setDownloadDirectory(qEnvironmentVariable("ACPDRIVER_DOWNLOADS"));
+        }
+        out(QStringLiteral("CANINSTALL %1").arg(RemoteAgentInstaller::canInstall(QJsonDocument::fromJson((entry.seek(0), entry.readAll())).object(), args.at(4)) ? 1 : 0));
+        QObject::connect(&installer, &RemoteAgentInstaller::progress, [](const QString &text) {
+            out(QStringLiteral("PROGRESS ") + text);
+        });
+        QObject::connect(&installer, &RemoteAgentInstaller::finished, [](bool ok, const QString &message) {
+            out(QStringLiteral("FINISHED %1 %2").arg(ok ? 1 : 0).arg(QString(message).replace(QLatin1Char('\n'), QLatin1String(" | "))));
+            QCoreApplication::exit(ok ? 0 : 1);
+        });
+        QTimer::singleShot(0, &installer, &RemoteAgentInstaller::start);
+        return app.exec();
+    }
     if (args.size() < 3) {
         std::fprintf(stderr, "usage: acpdriver <folder> <agent> [args...]\n");
         return 2;
@@ -40,6 +68,9 @@ int main(int argc, char **argv)
     int promptId = -1;
     bool done = false;
 
+    QObject::connect(&service, &ACPService::remoteAgentMissing, [] {
+        out(QStringLiteral("MISSING"));
+    });
     QObject::connect(&service, &ACPService::connected, [&] {
         out(QStringLiteral("REMOTE %1").arg(service.isRemote() ? service.remoteHost() : QStringLiteral("-")));
         initId = service.sendRequest(QStringLiteral("initialize"), QJsonObject{{QStringLiteral("protocolVersion"), 1}});

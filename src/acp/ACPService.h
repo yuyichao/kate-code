@@ -46,6 +46,9 @@ public:
     // The host ([user@]host[:port]) an agent for workingDir runs on (a
     // folder on an ssh host, see setAllowRemote()), else empty (local).
     static QString remoteHostFor(const QString &workingDir);
+    // kate-remote-fs-askpass from the kate-remote-fs daemon (DBus), empty
+    // without it: for ssh without a terminal.
+    static QString remoteFsAskpassProgram();
     // Kate's MCP server for a remote agent: program (kate-mcp-server) and
     // its environment. A remote start runs it with --http on a local port
     // and asks ssh to forward a port of the host's 127.0.0.1 to it (-R
@@ -80,6 +83,9 @@ Q_SIGNALS:
     void connected();
     void disconnected(int exitCode);
     void errorOccurred(const QString &message);
+    // A remote agent exited with 127: not found on the host (or not
+    // runnable there). Emitted before errorOccurred() and disconnected().
+    void remoteAgentMissing();
     void jsonPayload(const QString &direction, const QString &json);
     // The remote MCP server's port is known (or failed): see remoteMcpUrl().
     void remoteMcpReady();
