@@ -59,6 +59,8 @@ HOSTS_FILE = os.path.join(STATE, "kate-remote-fs", "hosts")
 SSH_LOG = os.path.join(TMP, "ssh.log")
 FAKE_SSH = os.path.join(TMP, "fake-ssh")
 DAEMON_LOG = os.path.join(TMP, "daemon.log")
+DAV_TREE = os.path.join(TMP, "dav")       # a WebDAV share (served at /dav/; "/" is 404)
+DAV_DEEP = os.path.join(TMP, "dav-deep")  # one at /deep/er/dav/ (/deep/ and /deep/er/ are 404)
 BACKEND = os.path.join(RUNTIME, "kate-remote-fs")
 
 failures = []
@@ -807,6 +809,187 @@ def test_kio_backend():
     check(read_host_path(os.path.join(data, "sub", "f.txt")) == "hello\n", "kio-fuse restarted, host remounted")
 
 
+def start_webdav_server():
+    """A minimal WebDAV server on 127.0.0.1 with shares at /dav/ and
+    /deep/er/dav/ while "/" and anything else is 404, like Seafile's
+    /seafdav or Nextcloud's /remote.php/dav/files/<user>/. Enough for KIO's
+    webdav worker. server.requests counts the requests."""
+    import http.server
+    import email.utils
+    import urllib.parse
+    from xml.sax.saxutils import escape
+
+    for tree in (DAV_TREE, DAV_DEEP):
+        os.makedirs(os.path.join(tree, "sub"), exist_ok=True)
+        with open(os.path.join(tree, "sub", "f.txt"), "w") as f:
+            f.write("dav hello\n")
+    shares = {"/deep/er/dav": DAV_DEEP, "/dav": DAV_TREE}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            pass
+
+        def local(self):
+            path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+            for prefix, tree in shares.items():
+                if path == prefix or path.startswith(prefix + "/"):
+                    parts = [p for p in path[len(prefix):].split("/") if p]
+                    return None if ".." in parts else os.path.join(tree, *parts)
+            return None
+
+        def parse_request(self):
+            server.requests += 1
+            return super().parse_request()
+
+        def send(self, code, body=b"", headers=()):
+            self.send_response(code)
+            for name, value in headers:
+                self.send_header(name, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def body(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            return self.rfile.read(length) if length else b""
+
+        def do_OPTIONS(self):
+            self.send(200, headers=[("DAV", "1, 2"), ("Allow", "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, MOVE, PROPFIND")])
+
+        def entry(self, href, path):
+            st = os.stat(path)
+            is_dir = os.path.isdir(path)
+            modified = email.utils.formatdate(st.st_mtime, usegmt=True)
+            props = f"<D:resourcetype>{'<D:collection/>' if is_dir else ''}</D:resourcetype><D:getlastmodified>{modified}</D:getlastmodified>"
+            if not is_dir:
+                props += f"<D:getcontentlength>{st.st_size}</D:getcontentlength><D:getcontenttype>text/plain</D:getcontenttype>"
+            return (f"<D:response><D:href>{escape(urllib.parse.quote(href))}</D:href><D:propstat><D:prop>{props}</D:prop>"
+                    f"<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>")
+
+        def do_PROPFIND(self):
+            self.body()
+            path = self.local()
+            if path is None or not os.path.exists(path):
+                return self.send(404)
+            href = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+            if os.path.isdir(path) and not href.endswith("/"):
+                href += "/"
+            responses = [self.entry(href, path)]
+            if os.path.isdir(path) and self.headers.get("Depth", "infinity") != "0":
+                for name in sorted(os.listdir(path)):
+                    child = os.path.join(path, name)
+                    responses.append(self.entry(href + name + ("/" if os.path.isdir(child) else ""), child))
+            xml = '<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">' + "".join(responses) + "</D:multistatus>"
+            self.send(207, xml.encode(), [("Content-Type", 'application/xml; charset="utf-8"')])
+
+        def do_GET(self):
+            path = self.local()
+            if path is None or not os.path.isfile(path):
+                return self.send(404)
+            with open(path, "rb") as f:
+                self.send(200, f.read(), [("Content-Type", "text/plain")])
+
+        do_HEAD = do_GET
+
+        def do_PUT(self):
+            data = self.body()
+            path = self.local()
+            if path is None or not os.path.isdir(os.path.dirname(path)):
+                return self.send(409 if path else 404)
+            existed = os.path.exists(path)
+            with open(path, "wb") as f:
+                f.write(data)
+            self.send(204 if existed else 201)
+
+        def do_DELETE(self):
+            path = self.local()
+            if path is None or not os.path.exists(path):
+                return self.send(404)
+            shutil.rmtree(path) if os.path.isdir(path) else os.unlink(path)
+            self.send(204)
+
+        def do_MKCOL(self):
+            self.body()
+            path = self.local()
+            if path is None:
+                return self.send(403)
+            if os.path.exists(path):
+                return self.send(405)
+            os.mkdir(path)
+            self.send(201)
+
+        def do_MOVE(self):
+            path = self.local()
+            destination = self.headers.get("Destination", "")
+            self.path = urllib.parse.urlsplit(destination).path
+            target = self.local()
+            if path is None or target is None or not os.path.exists(path):
+                return self.send(404)
+            existed = os.path.exists(target)
+            os.replace(path, target)
+            self.send(204 if existed else 201)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.requests = 0
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_kio_folders():
+    print("KIO hosts mounted from their folders (WebDAV shares below an unreadable /)")
+    server = start_webdav_server()
+    try:
+        authority = f"127.0.0.1:{server.server_address[1]}"
+        check(dbus("addHost", "webdav", authority) is True, "addHost webdav")
+        host = os.path.join(ROOT, "webdav", authority)
+        share = os.path.join(host, "dav")
+        check(read_host_path(os.path.join(share, "sub", "f.txt")) == "EHOSTUNREACH", "without folders the host is mounted from /, which is 404")
+        check(dbus("lastError", "webdav", authority) != "", "lastError explains")
+
+        check(dbus("addFolder", "webdav", authority, "/dav/missing") != "", "addFolder: a missing folder fails")
+        check(dbus("addFolder", "webdav", authority, "/dav") == "", "addFolder")
+        check(read_host_path(os.path.join(share, "sub", "f.txt")) == "dav hello\n", "file read in the share")
+        check(sorted(os.listdir(host)) == ["dav"], "the host lists only the share")
+        check(sorted(os.listdir(share)) == ["sub"], "the share lists its files")
+        with open(os.path.join(share, "sub", "new.txt"), "w") as f:
+            f.write("via dav")
+        check(wait_for(lambda: os.path.exists(os.path.join(DAV_TREE, "sub", "new.txt"))
+                       and open(os.path.join(DAV_TREE, "sub", "new.txt")).read() == "via dav"), "write reaches the share")
+        before = server.requests
+        check(read_host_path(os.path.join(host, "HEAD")) == "ENOENT", "other names on the host do not exist")
+        check(server.requests == before, "without asking the server")
+
+        # Two unreadable folders above the share: kio-fuse walks to it.
+        deep = os.path.join(host, "deep", "er", "dav", "sub")
+        check(read_host_path(os.path.join(deep, "f.txt")) == "ENOENT", "an unregistered share is not there")
+        check(dbus("addFolder", "webdav", authority, "/deep/er/dav/sub") == "", "addFolder while connected")
+        check(read_host_path(os.path.join(deep, "f.txt")) == "dav hello\n", "file read in the deeper share")
+        check(sorted(os.listdir(host)) == ["dav", "deep"], "the host lists both shares")
+        check(sorted(os.listdir(os.path.join(host, "deep"))) == ["er"], "folders above a share list the way to it")
+        check(dbus("addFolder", "webdav", authority, "/dav/sub") == "", "addFolder inside a registered folder")
+        with open(HOSTS_FILE) as f:
+            entries = f.read().split()
+        check(sorted(e for e in entries if e.startswith("webdav/")) ==
+              [f"webdav/{authority}", f"webdav/{authority}/dav", f"webdav/{authority}/deep/er/dav/sub"],
+              "registered folders are kept in the hosts file (not missing or nested ones)")
+
+        check(dbus("unmount", "webdav", authority) is True, "unmount")
+        check(read_host_path(os.path.join(deep, "f.txt")) == "dav hello\n", "connecting again mounts the registered folders")
+        check(stop_daemon() == 0, "daemon stopped")
+        start_daemon()
+        check(read_host_path(os.path.join(share, "sub", "f.txt")) == "dav hello\n"
+              and read_host_path(os.path.join(deep, "f.txt")) == "dav hello\n", "registered folders kept across restarts")
+        check(dbus("removeHost", "webdav", authority) is True, "removeHost")
+        with open(HOSTS_FILE) as f:
+            check("webdav/" not in f.read(), "removeHost forgets its folders")
+    finally:
+        server.shutdown()
+        server.server_close()
+
 def read_host_path(path):
     try:
         if os.path.isdir(path):
@@ -981,7 +1164,7 @@ def main():
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_kde_passwords, test_remote_agent, test_terminal_askpass, test_kio_backend, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_remote_agent, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_shutdown_and_restart):
             try:
                 test()

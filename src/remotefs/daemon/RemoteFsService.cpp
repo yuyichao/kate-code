@@ -4,6 +4,10 @@
 
 #include "RemoteFs.h"
 
+#include <QDBusConnection>
+
+#include <thread>
+
 RemoteFsService::RemoteFsService(RemoteFs *fs, QObject *parent)
     : QObject(parent)
     , m_fs(fs)
@@ -63,4 +67,16 @@ bool RemoteFsService::addHost(const QString &scheme, const QString &authority)
 bool RemoteFsService::removeHost(const QString &scheme, const QString &authority)
 {
     return m_fs->removeHost(scheme, authority);
+}
+
+QString RemoteFsService::addFolder(const QString &scheme, const QString &authority, const QString &path, const QDBusMessage &message)
+{
+    // Off the main thread: connecting may wait for a login dialog.
+    message.setDelayedReply(true);
+    RemoteFs *fs = m_fs;
+    std::thread([fs, scheme, authority, path, message] {
+        const QString error = fs->addFolder(scheme, authority, path);
+        QDBusConnection::sessionBus().send(message.createReply(error));
+    }).detach();
+    return {};
 }

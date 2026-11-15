@@ -60,6 +60,21 @@ void inBackground(QObject *context, std::function<bool()> check, std::function<v
     thread->start();
 }
 
+// Whether the local path of a remote folder is a directory, connecting
+// its host. Blocks: for inBackground().
+bool isRemoteDir(const QString &path, const QString &mountRoot)
+{
+    // KIO hosts are mounted from their registered folders (the root of a
+    // WebDAV server is often not readable). Older daemons do not know
+    // addFolder (the error is ignored).
+    if (const auto location = KateRemote::locationForPath(path, mountRoot); location && KateRemote::isKioScheme(location->scheme)) {
+        QDBusConnection::sessionBus().call(daemonCall(QStringLiteral("addFolder"), {location->scheme, location->authority, location->path}),
+                                           QDBus::Block,
+                                           150000);
+    }
+    return QFileInfo(path).isDir();
+}
+
 bool isBelow(const QString &path, const QString &root)
 {
     return path == root || path.startsWith(root + QLatin1Char('/'));
@@ -254,10 +269,11 @@ void RemoteProjectsPlugin::prepareUrl(const QUrl &url, QObject *context, std::fu
                 done({}, reply.isError() ? reply.error().message() : i18n("%1 is not a valid host.", authority));
                 return;
             }
+            const QString mountRoot = m_mountRoot;
             inBackground(
                 context,
-                [path] {
-                    return QFileInfo(path).isDir();
+                [path, mountRoot] {
+                    return isRemoteDir(path, mountRoot);
                 },
                 [=](bool isDir) {
                     if (isDir) {
@@ -341,11 +357,12 @@ void RemoteProjectsPlugin::readSessionConfig(const KConfigGroup &config)
     }
     const QPointer<QObject> plugin(projectPlugin);
     const QPointer<RemoteProjectsPlugin> self(this);
+    const QString mountRoot = m_mountRoot;
     for (const QString &path : std::as_const(m_sessionProjects)) {
         inBackground(
             this,
-            [path] {
-                return QFileInfo(path).isDir();
+            [path, mountRoot] {
+                return isRemoteDir(path, mountRoot);
             },
             [self, plugin, path](bool isDir) {
                 if (isDir && plugin && self) {

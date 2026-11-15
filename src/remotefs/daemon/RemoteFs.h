@@ -119,6 +119,15 @@ public:
     bool addHost(const QString &scheme, const QString &authority);
     // Disconnects the host first; false if files are open on it.
     bool removeHost(const QString &scheme, const QString &authority);
+    // Registers a folder (absolute remote path) of a registered host and
+    // connects it; empty, or why it failed (then it is not registered).
+    // KIO hosts are mounted from their folders, not from "/" (kio-fuse
+    // mounts from the first readable folder on the way, so a WebDAV share
+    // below an unreadable "/" works, and shows the folders above it as
+    // directories listing only the way to it); a KIO host without folders
+    // (registered before folders were) is mounted from "/". Blocks (may
+    // wait for a login dialog).
+    QString addFolder(const QString &scheme, const QString &authority, const QString &path);
 
     // --- used by the FUSE callbacks ---
     enum class Kind { Root, Scheme, Host, Invalid };
@@ -141,6 +150,9 @@ private:
     int ensureMounted(Mount *mount);
     int mountBackend(Mount *mount, QString *error);
     int mountKioFuse(Mount *mount, QString *error);
+    // kio-fuse's mountUrl() for the host's folder rel ("." for "/"): the
+    // local path of the host's directory in kio-fuse, else false and why.
+    bool kioFuseMount(const Mount *mount, const std::string &rel, std::string *hostPath, QString *error);
     void markBroken(Mount *mount, uint64_t generation);
     // Unmounts with state and opLock held exclusively. Returns false if busy.
     bool unmountLocked(Mount *mount, bool lazy);
@@ -157,6 +169,10 @@ private:
 
     std::mutex m_hostsMutex;
     std::set<std::string> m_hosts; // "sftp/<authority>"
+    // Registered folders of KIO hosts: "<scheme>/<authority>" -> paths
+    // relative to the host's root. Kept in the hosts file as
+    // "<scheme>/<authority>/<path>" (older daemons skip these lines).
+    std::map<std::string, std::set<std::string>> m_folders;
 
     std::mutex m_mountsMutex;
     std::map<std::string, std::unique_ptr<Mount>> m_mounts;

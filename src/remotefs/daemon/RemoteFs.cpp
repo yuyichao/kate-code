@@ -17,6 +17,7 @@
 #include <QProcessEnvironment>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QUrl>
 
 #include <fuse.h>
 
@@ -28,6 +29,7 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <thread>
 #include <cstring>
@@ -899,37 +901,90 @@ int RemoteFs::ensureMounted(Mount *mount)
     return fd >= 0 ? 0 : EHOSTUNREACH;
 }
 
-int RemoteFs::mountKioFuse(Mount *mount, QString *error)
+bool RemoteFs::kioFuseMount(const Mount *mount, const std::string &rel, std::string *hostPath, QString *error)
 {
-    // kio-fuse mounts KIO URLs below its own (per run) directory; KIO's
-    // workers log in, with KDE's password cache and dialogs.
     const QString service = QStringLiteral("org.kde.KIOFuse");
     auto bus = QDBusConnection::sessionBus();
     if (QDBusConnectionInterface *interface = bus.interface(); interface && !interface->isServiceRegistered(service)) {
         const QDBusReply<QStringList> activatable = interface->activatableServiceNames();
         if (!activatable.isValid() || !activatable.value().contains(service)) {
             *error = QStringLiteral("kio-fuse is not installed");
-            return -1;
+            return false;
         }
     }
-    const QString url = mount->scheme + QStringLiteral("://") + mount->authority + QLatin1Char('/');
+    const QString path = rel == "." ? QString() : QFile::decodeName(QByteArray::fromStdString(rel));
+    QUrl url;
+    url.setScheme(mount->scheme);
+    url.setAuthority(mount->authority);
+    url.setPath(QLatin1Char('/') + path, QUrl::DecodedMode);
+    const QString urlText = url.toString(QUrl::FullyEncoded);
     QDBusMessage call = QDBusMessage::createMethodCall(service, QStringLiteral("/org/kde/KIOFuse"), QStringLiteral("org.kde.KIOFuse.VFS"), QStringLiteral("mountUrl"));
-    call.setArguments({url});
+    call.setArguments({urlText});
     // May wait for a login dialog.
     const QDBusMessage reply = bus.call(call, QDBus::Block, m_config.mountTimeout * 1000);
     if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
-        *error = reply.errorMessage().isEmpty() ? QStringLiteral("kio-fuse could not mount %1").arg(url) : reply.errorMessage();
+        *error = reply.errorMessage().isEmpty() ? QStringLiteral("kio-fuse could not mount %1").arg(urlText) : reply.errorMessage();
+        return false;
+    }
+    // kio-fuse's path is <its root>/<scheme>/<authority>/<path>.
+    QString local = reply.arguments().constFirst().toString();
+    if (!path.isEmpty()) {
+        if (!local.endsWith(QLatin1Char('/') + path)) {
+            *error = QStringLiteral("kio-fuse returned %1 for %2").arg(local, urlText);
+            return false;
+        }
+        local.chop(path.size() + 1);
+    }
+    *hostPath = QFile::encodeName(local).toStdString();
+    return true;
+}
+
+int RemoteFs::mountKioFuse(Mount *mount, QString *error)
+{
+    // kio-fuse mounts KIO URLs below its own (per run) directory; KIO's
+    // workers log in, with KDE's password cache and dialogs. Mounting the
+    // registered folders rather than "/": the root of a WebDAV server is
+    // often not readable (the share is below it).
+    std::vector<std::string> folders;
+    {
+        std::lock_guard lock(m_hostsMutex);
+        const auto it = m_folders.find(QString(mount->scheme + QLatin1Char('/') + mount->authority).toStdString());
+        if (it != m_folders.end()) {
+            folders.assign(it->second.begin(), it->second.end());
+        }
+    }
+    if (folders.empty()) {
+        folders.emplace_back("."); // registered before folders were
+    }
+    std::string hostPath;
+    QString firstError;
+    for (const std::string &folder : folders) {
+        std::string path;
+        QString folderError;
+        if (kioFuseMount(mount, folder, &path, &folderError)) {
+            if (hostPath.empty()) {
+                hostPath = path;
+            }
+        } else {
+            // A folder removed on the host: the others still work.
+            qWarning() << "Cannot mount" << mount->scheme << mount->authority << QString::fromStdString(folder) << folderError;
+            if (firstError.isEmpty()) {
+                firstError = folderError;
+            }
+        }
+    }
+    if (hostPath.empty()) {
+        *error = firstError;
         return -1;
     }
-    const QString path = reply.arguments().constFirst().toString();
-    mount->backendPath = QFile::encodeName(path).toStdString();
+    mount->backendPath = hostPath;
     const int fd = open(mount->backendPath.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     struct statfs fs;
     if (fd < 0 || fstatfs(fd, &fs) != 0 || static_cast<unsigned long>(fs.f_type) != FuseSuperMagic) {
         if (fd >= 0) {
             close(fd);
         }
-        *error = QStringLiteral("kio-fuse returned %1, which is not mounted").arg(path);
+        *error = QStringLiteral("kio-fuse returned %1, which is not mounted").arg(QFile::decodeName(QByteArray::fromStdString(hostPath)));
         return -1;
     }
     return fd;
@@ -1212,15 +1267,32 @@ void RemoteFs::loadHosts()
 {
     std::lock_guard lock(m_hostsMutex);
     m_hosts.clear();
+    m_folders.clear();
     QFile file(m_config.hostsFile);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
         return;
     }
+    // "<scheme>/<authority>" for hosts, "<scheme>/<authority>/<path>" for
+    // folders of KIO hosts.
     for (const QByteArray &line : file.readAll().split('\n')) {
         const QString entry = QString::fromUtf8(line).trimmed();
         const qsizetype slash = entry.indexOf(QLatin1Char('/'));
-        if (slash > 0 && KateRemote::isSupportedScheme(entry.left(slash)) && KateRemote::isValidAuthority(entry.left(slash), entry.mid(slash + 1))) {
-            m_hosts.insert(entry.toStdString());
+        if (slash <= 0) {
+            continue;
+        }
+        const QString scheme = entry.left(slash);
+        const qsizetype folderSlash = entry.indexOf(QLatin1Char('/'), slash + 1);
+        const QString authority = entry.mid(slash + 1, folderSlash < 0 ? -1 : folderSlash - slash - 1);
+        if (!KateRemote::isSupportedScheme(scheme) || !KateRemote::isValidAuthority(scheme, authority)) {
+            continue;
+        }
+        const std::string key = QString(scheme + QLatin1Char('/') + authority).toStdString();
+        m_hosts.insert(key);
+        if (folderSlash > 0 && KateRemote::isKioScheme(scheme)) {
+            const QString folder = QDir::cleanPath(entry.mid(folderSlash));
+            if (folder.size() > 1 && !folder.startsWith(QLatin1String("/.."))) {
+                m_folders[key].insert(QFile::encodeName(folder.mid(1)).toStdString());
+            }
         }
     }
 }
@@ -1241,6 +1313,11 @@ bool RemoteFs::writeHostsLocked()
     }
     for (const std::string &key : m_hosts) {
         file.write(QByteArray::fromStdString(key) + '\n');
+        if (const auto folders = m_folders.find(key); folders != m_folders.end()) {
+            for (const std::string &folder : folders->second) {
+                file.write(QByteArray::fromStdString(key) + '/' + QByteArray::fromStdString(folder) + '\n');
+            }
+        }
     }
     if (!file.commit()) {
         qWarning() << "Cannot write" << m_config.hostsFile << file.errorString();
@@ -1280,8 +1357,67 @@ bool RemoteFs::removeHost(const QString &scheme, const QString &authority)
         return false;
     }
     std::lock_guard lock(m_hostsMutex);
-    if (m_hosts.erase(QString(scheme + QLatin1Char('/') + authority).toStdString())) {
+    const std::string key = QString(scheme + QLatin1Char('/') + authority).toStdString();
+    m_folders.erase(key);
+    if (m_hosts.erase(key)) {
         return writeHostsLocked();
     }
     return true;
+}
+
+QString RemoteFs::addFolder(const QString &scheme, const QString &authority, const QString &path)
+{
+    const QString folder = QDir::cleanPath(path);
+    if (!folder.startsWith(QLatin1Char('/')) || folder.startsWith(QLatin1String("/.."))) {
+        return QStringLiteral("%1 is not an absolute path").arg(path);
+    }
+    const std::string key = QString(scheme + QLatin1Char('/') + authority).toStdString();
+    if (!isRegistered(key)) {
+        return QStringLiteral("%1 is not a registered host").arg(QString::fromStdString(key));
+    }
+    Mount *mount = findOrCreateMount(scheme.toStdString(), authority.toStdString());
+    if (!mount) {
+        return QStringLiteral("%1 is not a valid host").arg(authority);
+    }
+    const std::string rel = folder == QLatin1String("/") ? std::string(".") : QFile::encodeName(folder.mid(1)).toStdString();
+    if (mount->kio && rel != ".") {
+        // Mounted in kio-fuse first: only folders that work are registered.
+        std::string hostPath;
+        QString error;
+        if (!kioFuseMount(mount, rel, &hostPath, &error)) {
+            std::lock_guard stateLock(mount->stateMutex);
+            mount->lastError = error; // for the Remote Projects plugin's message
+            return error;
+        }
+        bool added = false;
+        {
+            std::lock_guard lock(m_hostsMutex);
+            std::set<std::string> &folders = m_folders[key];
+            const bool covered = std::any_of(folders.begin(), folders.end(), [&](const std::string &known) {
+                return rel == known || (rel.size() > known.size() && rel.compare(0, known.size(), known) == 0 && rel[known.size()] == '/');
+            });
+            if (!covered) {
+                folders.insert(rel);
+                writeHostsLocked();
+                added = true;
+            }
+        }
+        if (added) {
+            // An earlier failure (say, of "/" before any folder was known)
+            // is not retried for a while: try again with the folder.
+            std::lock_guard stateLock(mount->stateMutex);
+            if (mount->state == Mount::State::Failed) {
+                mount->state = Mount::State::Unmounted;
+            }
+        }
+    }
+    struct stat st;
+    const int result = withMount(mount, [&](int root) {
+        return errnoResult(fstatat(root, rel.c_str(), &st, 0));
+    });
+    if (result == 0) {
+        return S_ISDIR(st.st_mode) ? QString() : QStringLiteral("%1 is not a folder").arg(folder);
+    }
+    const QString error = lastError(scheme, authority);
+    return error.isEmpty() ? QString::fromLocal8Bit(strerror(-result)) : error;
 }

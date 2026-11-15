@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QDBusMessage>
 #include <QObject>
 #include <QStringList>
 
@@ -44,6 +45,12 @@ public Q_SLOTS:
     bool addHost(const QString &scheme, const QString &authority);
     // Disconnects and forgets the host; false if files are open on it.
     bool removeHost(const QString &scheme, const QString &authority);
+    // Registers a folder (remote absolute path) of a registered host and
+    // connects it: empty, or the error (then it is not registered). KIO
+    // hosts are mounted from their registered folders, not from "/" (often
+    // not readable on WebDAV servers). Answers when done (may wait for a
+    // login dialog).
+    QString addFolder(const QString &scheme, const QString &authority, const QString &path, const QDBusMessage &message);
 
 Q_SIGNALS:
     void mounted(const QString &scheme, const QString &authority);
