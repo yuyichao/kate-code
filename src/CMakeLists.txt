@@ -72,7 +72,6 @@ target_link_libraries(katecode
 
 # Installation
 install(TARGETS katecode DESTINATION ${KDE_INSTALL_PLUGINDIR}/kf6/ktexteditor)
-install(FILES katecode.json DESTINATION ${KDE_INSTALL_PLUGINDIR}/kf6/ktexteditor)
 install(FILES katecodeui.rc DESTINATION ${KDE_INSTALL_DATADIR}/kate/plugins/katecode)
 
 # Kate MCP Server executable

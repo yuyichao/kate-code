@@ -8,7 +8,6 @@
         "Category": "Editor",
         "Description": "Claude Code integration for Kate text editor",
         "Icon": "code-context",
-        "Id": "katecode",
         "License": "MIT",
         "Name": "Kate Code",
         "Version": "1.5.1",
