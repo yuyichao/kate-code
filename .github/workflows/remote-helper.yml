@@ -1,0 +1,253 @@
+name: Remote helper
+
+# kate-code-helper (remote-helper/), built and tested on each platform's own
+# runner. A tag remote-helper-v<version> (the version in
+# remote-helper/CMakeLists.txt) publishes a GitHub release with the archives
+# and manifest.json. Kate Code downloads the helper for a host from the
+# release, checking the SHA-256 pinned in its own source
+# (remote-helper/pin-release.py writes the pin from a release).
+
+on:
+  push:
+    branches: ['**']
+    tags: ['remote-helper-v*'] # path filters do not apply to tags
+    paths:
+      - 'remote-helper/**'
+      - '.github/workflows/remote-helper.yml'
+  pull_request:
+    paths:
+      - 'remote-helper/**'
+      - '.github/workflows/remote-helper.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }} (static musl)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The 32-bit builds run natively too: x86_64 kernels run i386
+        # programs; the arm64 runners' CPUs are reported to run 32-bit ARM
+        # ones (not yet seen here: the first run tells).
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            docker: linux/amd64
+            machine: X86-64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            docker: linux/arm64
+            machine: AArch64
+          - arch: x86 # Alpine x86: i686-class CPUs
+            runner: ubuntu-24.04
+            docker: linux/386
+            machine: Intel 80386
+          - arch: arm # Alpine armhf: ARMv6 and later, hard-float
+            runner: ubuntu-24.04-arm
+            docker: linux/arm/v6
+            machine: ARM
+    steps:
+      - uses: actions/checkout@v4
+
+      # Alpine through docker run, not as the job container: JavaScript
+      # actions (checkout, upload) do not run in Alpine on arm64 runners.
+      - name: Build and test (Alpine)
+        run: |
+          docker run --rm --platform ${{ matrix.docker }} -v "$PWD:/src" -w /src/remote-helper alpine:3.22 sh -euxc '
+            apk --print-arch
+            apk add --no-cache build-base cmake ninja python3 linux-headers file
+            cmake -B /tmp/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DKATE_CODE_HELPER_STATIC=ON -DCMAKE_EXE_LINKER_FLAGS=-s
+            cmake --build /tmp/build
+            ctest --test-dir /tmp/build --output-on-failure --no-tests=error
+            # Static (or static-pie): no program interpreter, no libraries.
+            file /tmp/build/kate-code-helper
+            readelf -h /tmp/build/kate-code-helper | grep -E "Machine: +(.* )?${{ matrix.machine }}\$"
+            ! readelf -l /tmp/build/kate-code-helper | grep -q INTERP
+            ! readelf -d /tmp/build/kate-code-helper | grep -q NEEDED
+            mkdir -p /src/dist
+            cp /tmp/build/kate-code-helper /src/dist/
+            chown -R '"$(id -u):$(id -g)"' /src/dist'
+
+      # The same binary on the runner's glibc system (and as a non-root
+      # user: the read-only directory checks run here).
+      - name: Test on the runner (glibc)
+        run: python3 -I remote-helper/tests/test_protocol.py dist/kate-code-helper
+
+      - name: Package
+        run: tar -czf kate-code-helper-linux-${{ matrix.arch }}.tar.gz -C dist kate-code-helper
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: kate-code-helper-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: macOS (universal)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -S remote-helper -B build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+          cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+      # Apple Silicon kills unsigned programs: Apple's linker signs ad hoc;
+      # make sure nothing after it broke that.
+      - name: Check the signature and architectures
+        run: |
+          codesign --verify --strict --verbose=2 build/kate-code-helper
+          codesign -dv build/kate-code-helper 2>&1 | tee /dev/stderr | grep -q 'Signature=adhoc'
+          lipo -archs build/kate-code-helper | tee /dev/stderr | grep -q 'x86_64 arm64\|arm64 x86_64'
+
+      - name: Run the x86_64 slice (Rosetta)
+        run: |
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 build/kate-code-helper --version
+          else
+            echo "::warning::Rosetta is not installed: the x86_64 slice was not run"
+          fi
+
+      # Without macOS metadata (AppleDouble ._ entries, extended
+      # attributes): the archive holds only the program.
+      - name: Package
+        run: |
+          mkdir dist
+          cp build/kate-code-helper dist/
+          xattr -c dist/kate-code-helper
+          COPYFILE_DISABLE=1 tar --no-mac-metadata -czf kate-code-helper-darwin-universal.tar.gz -C dist kate-code-helper
+          [ "$(tar -tzf kate-code-helper-darwin-universal.tar.gz)" = kate-code-helper ]
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-universal
+          path: kate-code-helper-darwin-universal.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-2025
+            platform: x64
+          - arch: aarch64
+            runner: windows-11-arm
+            platform: ARM64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Build
+        run: |
+          cmake -S remote-helper -B build -A ${{ matrix.platform }}
+          cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp build/Release/kate-code-helper.exe dist/
+          tar -czf kate-code-helper-windows-${{ matrix.arch }}.tar.gz -C dist kate-code-helper.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: kate-code-helper-windows-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/remote-helper-v')
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Manifest
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 -I - "$TAG" <<'EOF'
+          import hashlib, json, os, re, sys
+          tag = sys.argv[1]
+          cmake = open("remote-helper/CMakeLists.txt").read()
+          version = re.search(r"project\(kate-code-helper VERSION ([0-9.]+)", cmake).group(1)
+          if tag != "remote-helper-v" + version:
+              sys.exit("tag %s does not match the version %s in remote-helper/CMakeLists.txt" % (tag, version))
+          protocol = int(re.search(r"ProtocolVersion = (\d+);", open("remote-helper/src/Server.h").read()).group(1))
+          archives = {
+              "linux-x86_64": "kate-code-helper-linux-x86_64.tar.gz",
+              "linux-aarch64": "kate-code-helper-linux-aarch64.tar.gz",
+              "linux-x86": "kate-code-helper-linux-x86.tar.gz",
+              "linux-arm": "kate-code-helper-linux-arm.tar.gz",
+              "darwin-aarch64": "kate-code-helper-darwin-universal.tar.gz",
+              "darwin-x86_64": "kate-code-helper-darwin-universal.tar.gz",
+              "windows-x86_64": "kate-code-helper-windows-x86_64.tar.gz",
+              "windows-aarch64": "kate-code-helper-windows-aarch64.tar.gz",
+          }
+          platforms = {}
+          sums = []
+          for platform, archive in archives.items():
+              data = open(os.path.join("dist", archive), "rb").read()
+              digest = hashlib.sha256(data).hexdigest()
+              program = "kate-code-helper.exe" if platform.startswith("windows-") else "kate-code-helper"
+              platforms[platform] = {"archive": archive, "sha256": digest, "size": len(data), "program": program}
+              # A static musl build runs on glibc and musl systems alike.
+              if platform.startswith("linux-"):
+                  platforms[platform + "-musl"] = platforms[platform]
+          for archive in sorted(set(archives.values())):
+              sums.append("%s  %s\n" % (hashlib.sha256(open(os.path.join("dist", archive), "rb").read()).hexdigest(), archive))
+          manifest = {"name": "kate-code-helper", "version": version, "protocol": protocol, "platforms": platforms}
+          with open("dist/manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2, sort_keys=True)
+              f.write("\n")
+          with open("dist/SHA256SUMS", "w") as f:
+              f.writelines(sums)
+          EOF
+          cat dist/manifest.json
+
+      # What remote-helper/pin-release.py checks before Kate Code pins the
+      # release, here before publishing (only checks: the pin is a commit
+      # made by hand).
+      - name: Check the release files
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python3 -I remote-helper/pin-release.py "${TAG#remote-helper-v}" --from-dir dist --output "$RUNNER_TEMP/pin.json"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "kate-code-helper ${TAG#remote-helper-v}" \
+            --notes "Kate Code's helper for remote hosts (see remote-helper/PROTOCOL.md). Kate Code downloads it through manifest.json." \
+            --latest=false dist/*

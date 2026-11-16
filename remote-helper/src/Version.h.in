@@ -1,0 +1,3 @@
+#pragma once
+
+#define HELPER_VERSION "@PROJECT_VERSION@"

@@ -1,0 +1,32 @@
+// Windows version resource: an executable without one looks suspicious to
+// antivirus heuristics.
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Kate Code contributors"
+            VALUE "FileDescription", "Kate Code remote helper"
+            VALUE "FileVersion", "@PROJECT_VERSION@"
+            VALUE "InternalName", "kate-code-helper"
+            VALUE "LegalCopyright", "MIT License, Kate Code contributors"
+            VALUE "OriginalFilename", "kate-code-helper.exe"
+            VALUE "ProductName", "Kate Code"
+            VALUE "ProductVersion", "@PROJECT_VERSION@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
