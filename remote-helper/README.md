@@ -37,7 +37,8 @@ runner:
   32-bit ARM one is expected to, not seen yet.)
   A 32-bit userland on a 64-bit kernel takes the 64-bit build: a static
   program needs only the kernel.
-- macOS: universal arm64 + x86_64, ad-hoc signed by the linker (checked).
+- macOS: universal arm64 + x86_64, ad-hoc signed after linking (`codesign
+  --sign -` in CMake: the linker signs only arm64 slices; each slice checked).
   This is enough: the helper reaches a Mac through ssh, without the
   quarantine attribute Gatekeeper checks, and macOS charges its file access
   to sshd ("Allow full disk access for remote users"), not to its own

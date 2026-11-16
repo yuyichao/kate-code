@@ -65,6 +65,13 @@ endif()
 if(KATE_CODE_HELPER_STATIC AND NOT WIN32 AND NOT APPLE)
     target_link_options(kate-code-helper PRIVATE -static)
 endif()
+if(APPLE)
+    # Apple Silicon runs only signed code. The linker signs arm64 output ad
+    # hoc, but not x86_64 slices: sign the finished (universal) program.
+    add_custom_command(TARGET kate-code-helper POST_BUILD
+        COMMAND codesign --force --sign - $<TARGET_FILE:kate-code-helper>
+        VERBATIM)
+endif()
 
 install(TARGETS kate-code-helper RUNTIME DESTINATION bin)
 

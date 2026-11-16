@@ -102,13 +102,16 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --no-tests=error
 
-      # Apple Silicon kills unsigned programs: Apple's linker signs ad hoc;
-      # make sure nothing after it broke that.
+      # Apple Silicon kills unsigned programs: the build signs the universal
+      # program ad hoc (the linker alone signs only the arm64 slice).
       - name: Check the signature and architectures
         run: |
-          codesign --verify --strict --verbose=2 build/kate-code-helper
-          codesign -dv build/kate-code-helper 2>&1 | tee /dev/stderr | grep -q 'Signature=adhoc'
           lipo -archs build/kate-code-helper | tee /dev/stderr | grep -q 'x86_64 arm64\|arm64 x86_64'
+          for arch in arm64 x86_64; do
+            codesign --verify --strict --verbose=2 --arch "$arch" build/kate-code-helper
+            codesign -dv --arch "$arch" build/kate-code-helper 2>&1 | tee /dev/stderr | grep -q 'Signature=adhoc'
+          done
+          codesign --verify --strict --verbose=2 build/kate-code-helper
 
       - name: Run the x86_64 slice (Rosetta)
         run: |
