@@ -87,9 +87,13 @@ jobs:
           path: kate-code-helper-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
+  # Built on an Intel runner: GitHub's arm64 macOS runners are short of
+  # capacity (jobs waited and were cancelled, "not acquired by Runner").
+  # The tests here run the x86_64 slice; macos-arm64 below runs the arm64
+  # slice of the packaged archive when an arm64 runner is free.
   macos:
     name: macOS (universal)
-    runs-on: macos-15
+    runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -113,14 +117,6 @@ jobs:
           done
           codesign --verify --strict --verbose=2 build/kate-code-helper
 
-      - name: Run the x86_64 slice (Rosetta)
-        run: |
-          if arch -x86_64 /usr/bin/true 2>/dev/null; then
-            arch -x86_64 build/kate-code-helper --version
-          else
-            echo "::warning::Rosetta is not installed: the x86_64 slice was not run"
-          fi
-
       # Without macOS metadata (AppleDouble ._ entries, extended
       # attributes): the archive holds only the program.
       - name: Package
@@ -136,6 +132,31 @@ jobs:
           name: darwin-universal
           path: kate-code-helper-darwin-universal.tar.gz
           if-no-files-found: error
+
+  # The arm64 slice of the archive as released (Apple Silicon refuses to run
+  # it unsigned). Not needed by the release: an arm64 runner may not come
+  # for a long time (the signature of both slices is checked above).
+  macos-arm64:
+    name: macOS arm64 (archive)
+    needs: macos
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: darwin-universal
+          path: ${{ runner.temp }}/archive
+
+      - name: Test
+        run: |
+          mkdir "$RUNNER_TEMP/unpacked"
+          tar -xzf "$RUNNER_TEMP/archive/kate-code-helper-darwin-universal.tar.gz" -C "$RUNNER_TEMP/unpacked"
+          [ "$(uname -m)" = arm64 ]
+          "$RUNNER_TEMP/unpacked/kate-code-helper" --version
+          python3 -I remote-helper/tests/test_protocol.py "$RUNNER_TEMP/unpacked/kate-code-helper"
 
   windows:
     name: Windows ${{ matrix.arch }}
