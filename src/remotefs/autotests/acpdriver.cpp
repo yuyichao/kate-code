@@ -13,6 +13,11 @@
 // runs RemoteHelper (kate-code-helper on the host; file:// downloads):
 //   PROGRESS <text>, READY, DIGEST <hex> (file's), WATCHING (file is
 //   watched: change it now), CHANGED <paths>; or STOPPED <message>
+// acpdriver --remote-fs-client report|silent
+// a client of kate-remote-fs that stays connected until stdin ends: report
+// sends setOpenPaths() for each line of stdin (space-separated paths; an
+// empty line: none) and prints REPORTED; silent only calls mountRoot() (as
+// an older Remote Projects plugin) and prints CONNECTED
 #include "ACPService.h"
 #include "RemoteAgentInstaller.h"
 #include "RemoteHelper.h"
@@ -21,6 +26,8 @@
 #include <QFile>
 
 #include <QCoreApplication>
+#include <QDBusConnection>
+#include <QDBusMessage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QTimer>
@@ -37,6 +44,30 @@ int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
     const QStringList args = app.arguments();
+    if (args.size() == 3 && args.at(1) == QLatin1String("--remote-fs-client")) {
+        const auto call = [](const QString &method, const QVariantList &arguments) {
+            QDBusMessage message = QDBusMessage::createMethodCall(QStringLiteral("org.kde.KateRemoteFS"),
+                                                                  QStringLiteral("/org/kde/KateRemoteFS"),
+                                                                  QStringLiteral("org.kde.KateRemoteFS"),
+                                                                  method);
+            message.setArguments(arguments);
+            return QDBusConnection::sessionBus().call(message, QDBus::Block, 30000);
+        };
+        if (args.at(2) == QLatin1String("silent")) {
+            const QDBusMessage reply = call(QStringLiteral("mountRoot"), {});
+            out(reply.type() == QDBusMessage::ReplyMessage ? QStringLiteral("CONNECTED") : QStringLiteral("ERROR ") + reply.errorMessage());
+            while (std::getchar() != EOF) {
+            }
+            return 0;
+        }
+        char line[8192];
+        while (std::fgets(line, sizeof(line), stdin)) {
+            const QStringList paths = QString::fromLocal8Bit(line).trimmed().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+            const QDBusMessage reply = call(QStringLiteral("setOpenPaths"), {paths});
+            out(reply.type() == QDBusMessage::ReplyMessage ? QStringLiteral("REPORTED") : QStringLiteral("ERROR ") + reply.errorMessage());
+        }
+        return 0;
+    }
     if (args.size() == 5 && args.at(1) == QLatin1String("--install")) {
         QFile entry(args.at(3));
         if (!entry.open(QIODevice::ReadOnly)) {

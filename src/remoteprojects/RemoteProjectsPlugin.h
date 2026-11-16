@@ -4,12 +4,22 @@
 #include <KTextEditor/SessionConfigInterface>
 
 #include <QList>
+#include <QPointer>
 #include <QStringList>
 #include <QUrl>
 #include <QVariant>
 
 #include <functional>
 #include <optional>
+
+class QDBusServiceWatcher;
+class QTimer;
+
+namespace KTextEditor
+{
+class Document;
+class MainWindow;
+}
 
 /**
  * Remote Projects: opens remote folders (sftp://host/path) as Kate projects
@@ -61,11 +71,34 @@ public:
     // nullopt when no window has a project plugin view to ask.
     std::optional<QStringList> openRemoteProjects() const;
 
+    // Asks kate-remote-fs to restart (e.g. after an update); the outcome is
+    // shown in window's Output view. It refuses while remote projects or
+    // documents are open in any Kate.
+    void restartDaemon(KTextEditor::MainWindow *window);
+
 Q_SIGNALS:
     void recentUrlsChanged();
 
+private Q_SLOTS:
+    // Sends the open remote paths to the daemon shortly (changes come in
+    // bursts).
+    void scheduleReport();
+
 private:
     void startDaemon();
+    // A restart of kate-remote-fs unmounts the mount root, which ends the
+    // inotify watches Kate keeps there: open documents would show as
+    // deleted, projects stop following their files. So the daemon is told
+    // which remote projects and documents are open here (setOpenPaths(),
+    // again when it restarts) and refuses to restart meanwhile.
+    void watchOpenPaths();
+    void watchDocument(KTextEditor::Document *document);
+    void watchProjectPlugin(QObject *projectPlugin);
+    void reportOpenPaths();
+    // Local paths of open remote projects and documents.
+    QStringList openRemotePaths() const;
+    void daemonRegistered();
+    void showMessage(KTextEditor::MainWindow *window, const QString &text, const QString &type);
     // Sets m_versionWarning when the running daemon is not this build.
     void checkDaemonVersion();
     void loadRecent();
@@ -81,4 +114,11 @@ private:
     // that an offline start does not forget them.
     QStringList m_sessionProjects;
     QStringList m_pendingProjects;
+
+    QTimer *m_reportTimer = nullptr;
+    std::optional<QStringList> m_reported; // last sent to the daemon (reset on errors and when it restarts)
+    QDBusServiceWatcher *m_daemonWatcher = nullptr;
+    // The window that asked for a restart: told when the daemon is back.
+    QPointer<KTextEditor::MainWindow> m_restartWindow;
+    QTimer *m_restartTimeout = nullptr;
 };

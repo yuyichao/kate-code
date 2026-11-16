@@ -151,10 +151,10 @@ def env():
     return e
 
 
-def start_daemon():
+def start_daemon(program=None):
     global daemon
     log = open(DAEMON_LOG, "a")
-    daemon = subprocess.Popen([DAEMON], env=env(), stdout=log, stderr=subprocess.STDOUT)
+    daemon = subprocess.Popen([program or DAEMON], env=env(), stdout=log, stderr=subprocess.STDOUT)
     def ready():
         # A crashed instance leaves a dead mount behind; wait for a live one.
         try:
@@ -1347,6 +1347,117 @@ def test_dbus_unmount():
     held.close()
 
 
+def remote_fs_client(mode):
+    """acpdriver --remote-fs-client: stays connected to kate-remote-fs until
+    closed (report: setOpenPaths() per report(); silent: as an older
+    Remote Projects plugin, never reports)."""
+    client = subprocess.Popen([ACPDRIVER, "--remote-fs-client", mode], env=env(), stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, text=True)
+    if mode == "silent":
+        check(client.stdout.readline().strip() == "CONNECTED", "silent client connected")
+    return client
+
+
+def report(client, paths):
+    client.stdin.write(" ".join(paths) + "\n")
+    client.stdin.flush()
+    check(client.stdout.readline().strip() == "REPORTED", f"reported {paths}")
+
+
+def close_client(client):
+    client.stdin.close()
+    client.wait(10)
+
+
+def daemon_exe():
+    return os.readlink(f"/proc/{daemon.pid}/exe")
+
+
+def name_owner_pid():
+    # Asks the bus, not the daemon: does not start one (the private bus
+    # would start the installed kate-remote-fs, which may take the lock).
+    out = subprocess.run(["dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
+                          "org.freedesktop.DBus.GetConnectionUnixProcessID", "string:org.kde.KateRemoteFS"],
+                         capture_output=True, text=True, timeout=30).stdout
+    m = re.search(r"uint32 (\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def daemon_answers():
+    """Our daemon process (not one the bus started) owns the name again."""
+    try:
+        return daemon.poll() is None and name_owner_pid() == daemon.pid and "sftp" in os.listdir(ROOT)
+    except OSError:
+        return False
+
+
+def test_restart():
+    print("restart on request, refused while remote paths are held")
+    if not ACPDRIVER:
+        print("  (skipped: no acpdriver)")
+        return
+    doc = os.path.join(ROOT, "sftp", "goodhost", "data", "sub", "f.txt")
+    holder = remote_fs_client("report")
+    report(holder, [doc])
+    answer = dbus("restart")
+    check(answer.startswith("Not restarted") and doc in answer and f"pid {holder.pid}" in answer,
+          f"refused while a client has a remote document open: {answer!r}")
+    with open(doc) as f:
+        check(f.read() == "hello\n", "mount still works after a refusal")
+
+    report(holder, [])
+    silent = remote_fs_client("silent")
+    answer = dbus("restart")
+    check(answer.startswith("Not restarted") and f"pid {silent.pid}" in answer and "does not report" in answer,
+          f"refused while a client never reported: {answer!r}")
+    close_client(silent)
+
+    busy = subprocess.Popen(["sleep", "60"], cwd=os.path.join(ROOT, "sftp", "goodhost", "data", "sub"))
+    try:
+        answer = dbus("restart")
+        check(answer.startswith("Not restarted") and f"sleep (pid {busy.pid})" in answer,
+              f"refused while a working directory is on the mount: {answer!r}")
+        with open(doc) as f:
+            check(f.read() == "hello\n", "mount still works after the busy refusal")
+    finally:
+        busy.kill()
+        busy.wait()
+
+    pid = daemon.pid
+    check(dbus("restart") == "", "restarts once nothing holds the mount")
+    check(wait_for(lambda: "Restarting on request" in open(DAEMON_LOG).read(), timeout=10), "restart logged")
+    check(wait_for(daemon_answers, timeout=30), "the restarted daemon (same process, exec) owns the name again")
+    check(daemon.pid == pid, "restarted in place (exec)")
+    check("sftp/goodhost" in dbus("hosts"), "registered hosts kept across the restart")
+    with open(doc) as f:
+        check(f.read() == "hello\n", "works after the restart")
+    close_client(holder)
+
+    print("restart on its own after the executable was replaced")
+    copy_dir = os.path.join(TMP, "daemon-copy")
+    os.makedirs(copy_dir, exist_ok=True)
+    copy = os.path.join(copy_dir, "kate-remote-fs")
+    shutil.copy2(DAEMON, copy)
+    check(stop_daemon() == 0, "stopped for the copy")
+    start_daemon(copy)
+    holder = remote_fs_client("report")
+    report(holder, [doc])
+    shutil.copy2(DAEMON, copy + ".new")
+    os.replace(copy + ".new", copy)
+    check(daemon_exe().endswith(" (deleted)"), "executable replaced")
+    time.sleep(6)  # idle hosts disconnected (3 s), a few checks (1 s)
+    check(daemon_exe().endswith(" (deleted)") and daemon.poll() is None, "no restart while a document is open")
+    report(holder, [])
+    check(wait_for(lambda: daemon.poll() is not None or not daemon_exe().endswith(" (deleted)"), timeout=15)
+          and daemon.poll() is None, "restarted once nothing is open")
+    check(wait_for(daemon_answers, timeout=30), "the restarted daemon owns the name again")
+    with open(doc) as f:
+        check(f.read() == "hello\n", "works after the automatic restart")
+    close_client(holder)
+    check(stop_daemon() == 0, "copy stopped")
+    start_daemon()
+
+
 def test_shutdown_and_restart():
     print("shutdown and restart")
     open(os.path.join(ROOT, "sftp", "goodhost", "data", "sub", "f.txt")).read()
@@ -1386,7 +1497,7 @@ def main():
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
                      test_host_registry, test_kde_passwords, test_remote_agent, test_remote_agent_install, test_remote_helper, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
-                     test_dbus_unmount, test_shutdown_and_restart):
+                     test_dbus_unmount, test_restart, test_shutdown_and_restart):
             try:
                 test()
             except Exception as e:  # report and continue with the next test

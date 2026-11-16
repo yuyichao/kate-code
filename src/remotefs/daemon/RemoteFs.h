@@ -99,6 +99,12 @@ public:
 
     // Unmounts idle hosts; called periodically from the main thread.
     void unmountIdle();
+    // Whether a host is connected or connecting.
+    bool hasActiveMounts();
+    // For a restart: unmounts the file system unless it is in use (open
+    // files, working directories: the kernel's own check, no lazy unmount),
+    // which ends run(). Empty on success, else why not.
+    QString unmountRootIfUnused();
     // Unmounts one host unless files are open. Returns false if it stays
     // mounted.
     bool unmountHost(const QString &scheme, const QString &authority);
@@ -164,6 +170,7 @@ private:
     Config m_config;
     Events m_events;
     struct fuse *m_fuse = nullptr;
+    std::atomic<bool> m_rootUnmounted{false}; // by unmountRootIfUnused()
     bool m_noContainSymlinks = false; // sshfs knows -o no_contain_symlinks
     QString m_askpassProgram; // kate-remote-fs-askpass
 

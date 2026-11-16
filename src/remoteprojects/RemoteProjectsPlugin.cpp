@@ -9,6 +9,7 @@
 #include <KPluginFactory>
 #include <KSharedConfig>
 #include <KTextEditor/Application>
+#include <KTextEditor/Document>
 #include <KTextEditor/Editor>
 #include <KTextEditor/MainWindow>
 
@@ -16,8 +17,10 @@
 #include <QDBusConnectionInterface>
 #include <QDBusMessage>
 #include <QDBusPendingCallWatcher>
+#include <QDBusError>
 #include <QDBusPendingReply>
 #include <QDBusReply>
+#include <QDBusServiceWatcher>
 #include <QDir>
 #include <QFileInfo>
 #include <QPointer>
@@ -89,6 +92,201 @@ RemoteProjectsPlugin::RemoteProjectsPlugin(QObject *parent, const QVariantList &
     // Kate restores the session's documents right after loading the plugins:
     // the remote paths must work by then.
     startDaemon();
+    watchOpenPaths();
+}
+
+void RemoteProjectsPlugin::watchOpenPaths()
+{
+    m_reportTimer = new QTimer(this);
+    m_reportTimer->setSingleShot(true);
+    m_reportTimer->setInterval(300);
+    connect(m_reportTimer, &QTimer::timeout, this, &RemoteProjectsPlugin::reportOpenPaths);
+
+    // A new daemon (started, or restarted) knows nothing yet.
+    m_daemonWatcher = new QDBusServiceWatcher(DaemonService, QDBusConnection::sessionBus(), QDBusServiceWatcher::WatchForRegistration, this);
+    connect(m_daemonWatcher, &QDBusServiceWatcher::serviceRegistered, this, &RemoteProjectsPlugin::daemonRegistered);
+
+    KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
+    connect(app, &KTextEditor::Application::documentCreated, this, [this](KTextEditor::Document *document) {
+        watchDocument(document);
+        scheduleReport();
+    });
+    // Still listed when this is emitted: the report comes later.
+    connect(app, &KTextEditor::Application::documentWillBeDeleted, this, &RemoteProjectsPlugin::scheduleReport);
+    for (KTextEditor::Document *document : app->documents()) {
+        watchDocument(document);
+    }
+    watchProjectPlugin(app->plugin(QStringLiteral("kateprojectplugin")));
+    connect(app, &KTextEditor::Application::pluginCreated, this, [this](const QString &name, KTextEditor::Plugin *plugin) {
+        if (name == QLatin1String("kateprojectplugin")) {
+            watchProjectPlugin(plugin);
+            scheduleReport();
+        }
+    });
+    // Once at start, even with nothing open: a client that never reports
+    // blocks restarts.
+    scheduleReport();
+}
+
+void RemoteProjectsPlugin::watchDocument(KTextEditor::Document *document)
+{
+    // A document usually gets its URL after documentCreated (and Save As
+    // changes it).
+    connect(document, &KTextEditor::Document::documentUrlChanged, this, &RemoteProjectsPlugin::scheduleReport, Qt::UniqueConnection);
+}
+
+void RemoteProjectsPlugin::watchProjectPlugin(QObject *projectPlugin)
+{
+    if (!projectPlugin) {
+        return;
+    }
+    // The project plugin has no public header: by name.
+    for (const char *signal : {SIGNAL(projectAdded(QObject *)), SIGNAL(projectRemoved(QObject *))}) {
+        if (projectPlugin->metaObject()->indexOfSignal(QMetaObject::normalizedSignature(signal + 1).constData()) >= 0) {
+            connect(projectPlugin, signal, this, SLOT(scheduleReport()), Qt::UniqueConnection);
+        } else {
+            qWarning() << "[RemoteProjects] The project plugin has no signal" << (signal + 1) << "- open remote projects may not be reported";
+        }
+    }
+}
+
+void RemoteProjectsPlugin::scheduleReport()
+{
+    if (m_reportTimer) {
+        m_reportTimer->start();
+    }
+}
+
+QStringList RemoteProjectsPlugin::openRemotePaths() const
+{
+    QStringList paths = openRemoteProjects().value_or(QStringList());
+    const QString root = QDir::cleanPath(m_mountRoot);
+    const QString canonicalRoot = QDir(root).canonicalPath();
+    for (KTextEditor::Document *document : KTextEditor::Editor::instance()->application()->documents()) {
+        if (!document->url().isLocalFile()) {
+            continue;
+        }
+        const QString path = QDir::cleanPath(document->url().toLocalFile());
+        if (isBelow(path, root) || (!canonicalRoot.isEmpty() && isBelow(path, canonicalRoot))) {
+            paths << path;
+        }
+    }
+    paths.sort();
+    paths.removeDuplicates();
+    return paths;
+}
+
+void RemoteProjectsPlugin::reportOpenPaths()
+{
+    const QStringList paths = openRemotePaths();
+    // Compared with the last list sent (not the last answered: calls on one
+    // connection arrive in order, and a reply may take long).
+    if (m_reported == paths) {
+        return;
+    }
+    m_reported = paths;
+    QDBusMessage message = daemonCall(QStringLiteral("setOpenPaths"), {paths});
+    // Not a reason to start the daemon: it gets the list when it starts.
+    message.setAutoStartService(false);
+    auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(message), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this](QDBusPendingCallWatcher *call) {
+        call->deleteLater();
+        if (call->isError()) {
+            // Not running (sent when it starts), or older than this: sent
+            // again next time.
+            m_reported.reset();
+            if (call->error().type() != QDBusError::ServiceUnknown) {
+                qInfo() << "[RemoteProjects] Open remote paths not reported:" << call->error().message();
+            }
+        }
+    });
+}
+
+void RemoteProjectsPlugin::daemonRegistered()
+{
+    m_reported.reset();
+    scheduleReport();
+    if (!m_restartWindow) {
+        return;
+    }
+    QPointer<KTextEditor::MainWindow> window = std::exchange(m_restartWindow, nullptr);
+    if (m_restartTimeout) {
+        m_restartTimeout->stop();
+    }
+    auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(daemonCall(QStringLiteral("version"))), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, window](QDBusPendingCallWatcher *call) {
+        call->deleteLater();
+        const QDBusPendingReply<QString> version = *call;
+        const QString mine = KateRemote::buildVersion();
+        if (version.isError()) {
+            showMessage(window, i18n("kate-remote-fs restarted."), QStringLiteral("Info"));
+        } else if (version.value() == mine) {
+            showMessage(window, i18n("kate-remote-fs restarted (version %1).", version.value()), QStringLiteral("Info"));
+        } else {
+            showMessage(window,
+                        i18n("kate-remote-fs restarted, but it is version %1 and this Remote Projects plugin %2: restart Kate too if it was running before the update.",
+                             version.value(),
+                             mine),
+                        QStringLiteral("Warning"));
+        }
+    });
+}
+
+void RemoteProjectsPlugin::restartDaemon(KTextEditor::MainWindow *window)
+{
+    // This Kate's latest open paths first (the daemon checks them).
+    reportOpenPaths();
+    QDBusMessage message = daemonCall(QStringLiteral("restart"));
+    message.setAutoStartService(false);
+    auto *watcher = new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(message), this);
+    const QPointer<KTextEditor::MainWindow> target(window);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, target](QDBusPendingCallWatcher *call) {
+        call->deleteLater();
+        const QDBusPendingReply<QString> reply = *call;
+        if (reply.isError()) {
+            if (reply.error().type() == QDBusError::ServiceUnknown) {
+                showMessage(target, i18n("kate-remote-fs is not running: it starts when a remote folder is opened."), QStringLiteral("Info"));
+            } else if (reply.error().type() == QDBusError::UnknownMethod) {
+                showMessage(target,
+                            i18n("This kate-remote-fs is too old to restart on request. Close remote projects and documents in every Kate (remote folders are disconnected meanwhile), then run: systemctl --user restart kate-remote-fs"),
+                            QStringLiteral("Warning"));
+            } else {
+                showMessage(target, i18n("kate-remote-fs did not restart: %1", reply.error().message()), QStringLiteral("Error"));
+            }
+            return;
+        }
+        if (!reply.value().isEmpty()) {
+            showMessage(target, i18n("kate-remote-fs did not restart. %1", reply.value()), QStringLiteral("Warning"));
+            return;
+        }
+        showMessage(target, i18n("Restarting kate-remote-fs…"), QStringLiteral("Info"));
+        // Told when its name has a new owner (shutting down may take a while).
+        m_restartWindow = target;
+        if (!m_restartTimeout) {
+            m_restartTimeout = new QTimer(this);
+            m_restartTimeout->setSingleShot(true);
+            m_restartTimeout->setInterval(120000);
+            connect(m_restartTimeout, &QTimer::timeout, this, [this] {
+                if (QPointer<KTextEditor::MainWindow> window = std::exchange(m_restartWindow, nullptr)) {
+                    showMessage(window, i18n("kate-remote-fs has not come back after restarting; it starts again when a remote folder is opened."), QStringLiteral("Warning"));
+                }
+            });
+        }
+        m_restartTimeout->start();
+    });
+}
+
+void RemoteProjectsPlugin::showMessage(KTextEditor::MainWindow *window, const QString &text, const QString &type)
+{
+    qInfo().noquote() << "[RemoteProjects]" << type << text;
+    if (!window) {
+        return;
+    }
+    QVariantMap message;
+    message[QStringLiteral("text")] = text;
+    message[QStringLiteral("type")] = type;
+    message[QStringLiteral("category")] = i18n("Remote Projects");
+    window->showMessage(message);
 }
 
 QObject *RemoteProjectsPlugin::createView(KTextEditor::MainWindow *mainWindow)
@@ -141,7 +339,9 @@ void RemoteProjectsPlugin::checkDaemonVersion()
     // A running daemon is not restarted when its package is upgraded: the
     // old one keeps serving (without newer fixes, e.g. password reuse).
     auto bus = QDBusConnection::sessionBus();
-    const QString restart = i18n("Restart it with remote projects closed (remote folders are disconnected meanwhile): systemctl --user restart kate-remote-fs");
+    // Daemons with restart() also restart on their own once nothing is open;
+    // older ones (the one running when this first arrives) do not.
+    const QString restart = i18n("Close remote projects and documents in every Kate, then use Tools > Restart Remote Folder Service (remote folders are disconnected meanwhile); for an older kate-remote-fs: systemctl --user restart kate-remote-fs");
     const QDBusReply<uint> pid = bus.interface()->servicePid(DaemonService);
     if (pid.isValid() && pid.value() > 0) {
         char target[PATH_MAX];

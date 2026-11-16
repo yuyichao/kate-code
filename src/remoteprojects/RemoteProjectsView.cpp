@@ -43,6 +43,15 @@ RemoteProjectsView::RemoteProjectsView(RemoteProjectsPlugin *plugin, KTextEditor
     connect(m_plugin, &RemoteProjectsPlugin::recentUrlsChanged, this, &RemoteProjectsView::rebuildRecentMenu);
     rebuildRecentMenu();
 
+    // After an update: restarts kate-remote-fs (refused while remote
+    // projects or documents are open in any Kate).
+    auto *restart = new QAction(QIcon::fromTheme(QStringLiteral("view-refresh")), i18n("Restart Remote Folder Service"), this);
+    restart->setToolTip(i18n("Restart kate-remote-fs, e.g. after an update (close remote projects and documents first)"));
+    connect(restart, &QAction::triggered, this, [this] {
+        m_plugin->restartDaemon(m_mainWindow);
+    });
+    actionCollection()->addAction(QStringLiteral("remote_projects_restart_service"), restart);
+
     m_mainWindow->guiFactory()->addClient(this);
 
     // The Remote Terminal tab appears once a remote folder on an ssh host

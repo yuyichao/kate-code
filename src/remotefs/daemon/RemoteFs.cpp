@@ -767,9 +767,41 @@ void RemoteFs::requestExit()
 {
     if (m_fuse) {
         fuse_exit(m_fuse);
-        // Unmounting wakes the worker threads blocked on /dev/fuse.
-        unmountPath(m_config.mountRoot, true);
+        // Unmounting wakes the worker threads blocked on /dev/fuse (unless
+        // a restart unmounted it already).
+        if (!m_rootUnmounted) {
+            unmountPath(m_config.mountRoot, true);
+        }
     }
+}
+
+QString RemoteFs::unmountRootIfUnused()
+{
+    if (!m_fuse || m_rootUnmounted) {
+        return QStringLiteral("not mounted");
+    }
+    QString output;
+    // Not lazy: the kernel refuses while a process has a file open or its
+    // working directory below the mount root.
+    if (runProgram(QStringLiteral("fusermount3"), {QStringLiteral("-u"), QStringLiteral("-q"), m_config.mountRoot}, 30, &output) != 0) {
+        return output.isEmpty() ? QStringLiteral("in use") : output;
+    }
+    m_rootUnmounted = true;
+    return {};
+}
+
+bool RemoteFs::hasActiveMounts()
+{
+    std::lock_guard lock(m_mountsMutex);
+    for (auto &entry : m_mounts) {
+        Mount *mount = entry.second.get();
+        std::unique_lock stateLock(mount->stateMutex, std::try_to_lock);
+        // Locked: being mounted or unmounted right now.
+        if (!stateLock.owns_lock() || mount->state == Mount::State::Mounted || mount->state == Mount::State::Mounting) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void RemoteFs::unmountAll()
