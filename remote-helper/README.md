@@ -60,10 +60,11 @@ the program inside), `SHA256SUMS` and `manifest.json`:
 
 ### Pinning a release in Kate Code
 
-Kate Code will not trust the release as it is at download time: it will
-install only archives whose SHA-256 is pinned in its own source,
-`src/acp/remote-helper-pin.json` (not there yet: no release so far, and
-Kate Code does not use the helper yet). After the release workflow has run:
+Kate Code does not trust the release as it is at download time: it
+installs only archives whose SHA-256 is pinned in its own source,
+`src/acp/remote-helper-pin.json` (a placeholder without platforms until
+the first release is pinned: Kate Code then runs no helper). After the
+release workflow has run:
 
     remote-helper/pin-release.py 0.1.0
 

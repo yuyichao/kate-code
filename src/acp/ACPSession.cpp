@@ -1,5 +1,6 @@
 #include "ACPSession.h"
 #include "ACPService.h"
+#include "RemoteHelper.h"
 #include "TerminalManager.h"
 #include "../mcp/EditorDBusService.h"
 #include "../util/EditTracker.h"
@@ -181,6 +182,7 @@ void ACPSession::stop()
     m_status = ConnectionStatus::Disconnected;
     resetSessionState();
 
+    stopRemoteHelper();
     m_service->stop();
 
     Q_EMIT statusChanged(m_status);
@@ -1069,6 +1071,7 @@ void ACPSession::onDisconnected(int exitCode)
     qDebug() << "[ACPSession] Disconnected with exit code:" << exitCode;
     bool wasAlreadyDisconnected = (m_status == ConnectionStatus::Disconnected);
     m_status = ConnectionStatus::Disconnected;
+    stopRemoteHelper();
 
     if (wasAlreadyDisconnected) {
         // Deliberate stop(): state was already reset there.
@@ -1239,6 +1242,13 @@ void ACPSession::handleInitializeResponse(int id, const QJsonObject &result)
 {
     Q_UNUSED(id);
     qDebug() << "[ACPSession] Initialize response received:" << result;
+
+    // The agent runs (on its host, when remote): now the helper there, with
+    // the ssh login already done (no prompts side by side), and never on a
+    // host where the agent is missing. Not waited for.
+    if (!m_remoteHelper) {
+        startRemoteHelper();
+    }
 
     // Parse agent prompt capabilities so we can degrade gracefully on servers
     // that don't support all block types (e.g. Codex omits image/embeddedContext).
@@ -2455,6 +2465,11 @@ void ACPSession::checkRemoteDocuments()
     if (!app || !m_service->isRemote()) {
         return;
     }
+    if (m_remoteHelper && m_remoteHelper->isReady()) {
+        // The host's own digests: no waiting for the mount's cache.
+        helperCheckDocuments(openRemoteDocumentPaths(), false);
+        return;
+    }
     const QString prefix = m_service->pathMap().hostDir() + QLatin1Char('/');
     QList<QPointer<KTextEditor::Document>> docs;
     QStringList paths;
@@ -2498,6 +2513,271 @@ void ACPSession::checkRemoteDocuments()
         if (m_remoteCheckPending) {
             m_remoteCheckPending = false;
             checkRemoteDocuments();
+        }
+    });
+    thread->start();
+}
+
+namespace
+{
+// After a change notification: a burst of changes makes one check.
+constexpr int RemoteHelperSettleMs = 1100;
+// A digest that differs is taken again this much later before acting on
+// it: the notification may be Kate's own save, digested mid-way. By then
+// the mount shows the change (about 1 s after kickMount()).
+constexpr int RemoteHelperConfirmMs = 1000;
+// Reading through the mount until it shows the host's contents: interval,
+// and how long before the document is only flagged (sshfs keeps its cache
+// up to 20 s; a file rewritten with the same size within the same second
+// may never show: the cache is checked by mtime (whole seconds) and size).
+constexpr int RemoteHelperVerifyIntervalMs = 250;
+constexpr int RemoteHelperVerifyTimeoutMs = 25000;
+}
+
+void ACPSession::startRemoteHelper()
+{
+    stopRemoteHelper();
+    if (!m_remoteHelperEnabled || !m_service->isRemote() || !RemoteHelper::builtinPin()) {
+        return;
+    }
+    auto *helper = new RemoteHelper(m_workingDir, m_service->pathMap(), this);
+    m_remoteHelper = helper;
+    if (!m_helperSettleTimer) {
+        m_helperSettleTimer = new QTimer(this);
+        m_helperSettleTimer->setSingleShot(true);
+        connect(m_helperSettleTimer, &QTimer::timeout, this, [this] {
+            const QStringList paths(m_helperChangedPaths.begin(), m_helperChangedPaths.end());
+            m_helperChangedPaths.clear();
+            helperCheckDocuments(paths, false);
+        });
+        m_helperWatchTimer = new QTimer(this);
+        m_helperWatchTimer->setSingleShot(true);
+        m_helperWatchTimer->setInterval(200);
+        connect(m_helperWatchTimer, &QTimer::timeout, this, &ACPSession::syncRemoteHelperWatches);
+        m_helperVerifyTimer = new QTimer(this);
+        m_helperVerifyTimer->setSingleShot(true);
+        m_helperVerifyTimer->setInterval(RemoteHelperVerifyIntervalMs);
+        connect(m_helperVerifyTimer, &QTimer::timeout, this, &ACPSession::helperVerifyMount);
+    }
+    connect(helper, &RemoteHelper::progress, this, [](const QString &message) {
+        qDebug() << "[ACPSession]" << message;
+    });
+    connect(helper, &RemoteHelper::stopped, this, [](const QString &message) {
+        qDebug() << "[ACPSession] Without kate-code-helper:" << message;
+    });
+    connect(helper, &RemoteHelper::ready, this, [this] {
+        syncRemoteHelperWatches();
+        // Whatever changed before (or while it restarted).
+        helperCheckDocuments(openRemoteDocumentPaths(), false);
+    });
+    connect(helper, &RemoteHelper::changed, this, [this](const QStringList &paths) {
+        // After the host's last write: the mount shows it about 1 s later.
+        kickMount(paths);
+        for (const QString &path : paths) {
+            m_helperChangedPaths.insert(path);
+        }
+        if (!m_helperSettleTimer->isActive()) {
+            m_helperSettleTimer->start(RemoteHelperSettleMs);
+        }
+    });
+    // The watched set follows the open documents (connections end with the
+    // helper).
+    if (KTextEditor::Application *app = KTextEditor::Editor::instance()->application()) {
+        const auto follow = [this, helper](KTextEditor::Document *doc) {
+            connect(doc, &KTextEditor::Document::documentUrlChanged, helper, [this] {
+                m_helperWatchTimer->start();
+            });
+        };
+        const QList<KTextEditor::Document *> docs = app->documents();
+        for (KTextEditor::Document *doc : docs) {
+            follow(doc);
+        }
+        connect(app, &KTextEditor::Application::documentCreated, helper, [this, follow](KTextEditor::Document *doc) {
+            follow(doc);
+            m_helperWatchTimer->start();
+        });
+        connect(app, &KTextEditor::Application::documentWillBeDeleted, helper, [this] {
+            m_helperWatchTimer->start();
+        });
+    }
+    helper->start();
+}
+
+void ACPSession::stopRemoteHelper()
+{
+    if (!m_remoteHelper) {
+        return;
+    }
+    // Pending digests are answered (empty) by stop(): they see that the
+    // helper is no longer this session's.
+    RemoteHelper *helper = std::exchange(m_remoteHelper, nullptr);
+    helper->stop();
+    helper->deleteLater();
+    m_helperChangedPaths.clear();
+    m_helperVerifying.clear();
+    if (m_helperSettleTimer) {
+        m_helperSettleTimer->stop();
+        m_helperWatchTimer->stop();
+        m_helperVerifyTimer->stop();
+    }
+}
+
+QStringList ACPSession::openRemoteDocumentPaths() const
+{
+    KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
+    if (!app || !m_service->isRemote()) {
+        return {};
+    }
+    const QString prefix = m_service->pathMap().hostDir() + QLatin1Char('/');
+    QStringList paths;
+    const QList<KTextEditor::Document *> docs = app->documents();
+    for (KTextEditor::Document *doc : docs) {
+        const QString path = doc->url().isLocalFile() ? QDir::cleanPath(doc->url().toLocalFile()) : QString();
+        if (path.startsWith(prefix)) {
+            paths << path;
+        }
+    }
+    return paths;
+}
+
+void ACPSession::syncRemoteHelperWatches()
+{
+    if (m_remoteHelper) {
+        m_remoteHelper->setWatched(openRemoteDocumentPaths());
+    }
+}
+
+void ACPSession::helperCheckDocuments(const QStringList &paths, bool confirmed)
+{
+    if (!m_remoteHelper || !m_remoteHelper->isReady() || paths.isEmpty()) {
+        return;
+    }
+    const QPointer<RemoteHelper> helper(m_remoteHelper);
+    m_remoteHelper->digest(paths, [this, helper, paths, confirmed](const QHash<QString, QByteArray> &digests) {
+        KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
+        if (!helper || helper != m_remoteHelper || !app) {
+            return;
+        }
+        QStringList again;
+        bool verify = false;
+        for (const QString &path : paths) {
+            KTextEditor::Document *doc = app->findUrl(QUrl::fromLocalFile(path));
+            const QByteArray digest = digests.value(path);
+            // Closed meanwhile, or unreadable (removed): left to the user.
+            if (!doc || digest.isEmpty()) {
+                continue;
+            }
+            if (digest == doc->checksum()) {
+                m_helperVerifying.remove(path);
+                continue;
+            }
+            if (!confirmed) {
+                again << path;
+                continue;
+            }
+            qDebug() << "[ACPSession] Changed on" << m_service->remoteHost() << ":" << path;
+            if (doc->isModified()) {
+                m_helperVerifying.remove(path);
+                doc->setModifiedOnDisk(KTextEditor::Document::OnDiskModified);
+                continue;
+            }
+            // Reloaded once the mount shows these contents. A later change
+            // replaces the digest and gives the mount more time.
+            m_helperVerifying.insert(path, {digest, QDeadlineTimer(RemoteHelperVerifyTimeoutMs)});
+            verify = true;
+        }
+        if (verify && !m_helperVerifyRunning) {
+            helperVerifyMount();
+        }
+        if (!again.isEmpty()) {
+            // Changes found without a notification (checkRemoteDocuments()).
+            kickMount(again);
+            QTimer::singleShot(RemoteHelperConfirmMs, helper, [this, again] {
+                helperCheckDocuments(again, true);
+            });
+        }
+    });
+}
+
+void ACPSession::kickMount(const QStringList &paths)
+{
+    if (paths.isEmpty()) {
+        return;
+    }
+    // Opening may wait for the network: not in the GUI thread.
+    QThread *thread = QThread::create([paths] {
+        for (const QString &path : paths) {
+            QFile file(path);
+            if (file.open(QIODevice::ReadOnly)) {
+                file.close();
+            }
+        }
+    });
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start();
+}
+
+void ACPSession::helperVerifyMount()
+{
+    m_helperVerifyTimer->stop();
+    if (m_helperVerifying.isEmpty() || m_helperVerifyRunning) {
+        return;
+    }
+    const QStringList paths = m_helperVerifying.keys();
+    auto checksums = std::make_shared<QList<QByteArray>>();
+    // Reading through the mount may wait for the network (and opening the
+    // file again is what makes sshfs look at the host's).
+    QThread *thread = QThread::create([paths, checksums] {
+        for (const QString &path : paths) {
+            checksums->append(EditorDBusService::fileChecksum(path));
+        }
+    });
+    m_helperVerifyRunning = true;
+    const QPointer<RemoteHelper> helper(m_remoteHelper);
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    connect(thread, &QThread::finished, this, [this, helper, paths, checksums] {
+        m_helperVerifyRunning = false;
+        KTextEditor::Application *app = KTextEditor::Editor::instance()->application();
+        if (!helper || helper != m_remoteHelper || !app) {
+            return;
+        }
+        for (qsizetype i = 0; i < paths.size() && i < checksums->size(); ++i) {
+            const QString &path = paths.at(i);
+            const auto it = m_helperVerifying.constFind(path);
+            if (it == m_helperVerifying.constEnd()) {
+                continue; // settled meanwhile
+            }
+            const HelperVerify wanted = it.value();
+            KTextEditor::Document *doc = app->findUrl(QUrl::fromLocalFile(path));
+            if (!doc || doc->checksum() == wanted.digest) {
+                m_helperVerifying.remove(path);
+                continue;
+            }
+            if (doc->isModified()) {
+                // Edited meanwhile: Kate's bar instead.
+                m_helperVerifying.remove(path);
+                doc->setModifiedOnDisk(KTextEditor::Document::OnDiskModified);
+                continue;
+            }
+            if (checksums->at(i) == wanted.digest) {
+                m_helperVerifying.remove(path);
+                doc->documentReload();
+                if (doc->checksum() != wanted.digest) {
+                    // Changed again meanwhile: its notification follows.
+                    qDebug() << "[ACPSession] Reloaded" << path << "but it differs from the host's again";
+                }
+                continue;
+            }
+            if (wanted.deadline.hasExpired()) {
+                // The mount keeps showing other contents: Kate's bar, so
+                // the user decides (rather than reloading stale contents).
+                qDebug() << "[ACPSession] The mount does not show the host's contents of" << path << "- flagged as changed on disk";
+                m_helperVerifying.remove(path);
+                doc->setModifiedOnDisk(KTextEditor::Document::OnDiskModified);
+            }
+        }
+        if (!m_helperVerifying.isEmpty()) {
+            m_helperVerifyTimer->start();
         }
     });
     thread->start();

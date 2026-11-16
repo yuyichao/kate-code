@@ -240,6 +240,21 @@ void KateCodeConfigPage::setupGeneralTab(QWidget *tab)
 
     tabLayout->addWidget(diffGroup);
 
+    // Remote hosts Group
+    auto *remoteGroup = new QGroupBox(i18n("Remote Hosts"), tab);
+    auto *remoteLayout = new QVBoxLayout(remoteGroup);
+    m_remoteHelperCheck = new QCheckBox(i18n("Install and use Kate Code's helper on hosts where agents run"), tab);
+    connect(m_remoteHelperCheck, &QCheckBox::toggled, this, &KateCodeConfigPage::onSettingChanged);
+    remoteLayout->addWidget(m_remoteHelperCheck);
+    auto *remoteNote = new QLabel(i18n("For agents of remote folders: a small program (kate-code-helper, about 1 MB, the version pinned in this "
+                                       "Kate Code) is installed in ~/.local/share/kate-code on the host and tells Kate when open documents "
+                                       "change there, within about 2 seconds instead of 20. Applies to newly connected chats."),
+                                  tab);
+    remoteNote->setWordWrap(true);
+    remoteNote->setStyleSheet(QStringLiteral("color: gray; font-size: small;"));
+    remoteLayout->addWidget(remoteNote);
+    tabLayout->addWidget(remoteGroup);
+
     // Debugging Group
     auto *debugGroup = new QGroupBox(i18n("Debugging"), tab);
     auto *debugLayout = new QVBoxLayout(debugGroup);
@@ -418,6 +433,7 @@ void KateCodeConfigPage::apply()
     m_settings->setAcpLogSubdirectory(m_acpLogSubdirEdit->text().trimmed());
     m_settings->setDiffColorScheme(static_cast<DiffColorScheme>(m_diffColorSchemeCombo->currentData().toInt()));
     m_settings->setDebugLogging(m_debugLoggingCheck->isChecked());
+    m_settings->setRemoteHelperEnabled(m_remoteHelperCheck->isChecked());
 
     // Save allowed command patterns (split on newlines, trim, drop blanks)
     const QStringList rawLines = m_allowedCommandsEdit->toPlainText().split(QLatin1Char('\n'));
@@ -444,6 +460,7 @@ void KateCodeConfigPage::defaults()
     m_acpLogSubdirEdit->setText(QStringLiteral("kate_code_sessions"));
     m_diffColorSchemeCombo->setCurrentIndex(0); // RedGreen (default)
     m_debugLoggingCheck->setChecked(false);
+    m_remoteHelperCheck->setChecked(true);
     m_allowedCommandsEdit->clear();
     m_hasChanges = true;
     Q_EMIT changed();
@@ -471,6 +488,7 @@ void KateCodeConfigPage::reset()
 
     // Load debug setting
     m_debugLoggingCheck->setChecked(m_settings->debugLogging());
+    m_remoteHelperCheck->setChecked(m_settings->remoteHelperEnabled());
 
     // Load allowed command patterns (join with newlines for display)
     m_allowedCommandsEdit->setPlainText(m_settings->allowedCommandPatterns().join(QLatin1Char('\n')));

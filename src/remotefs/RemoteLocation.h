@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QList>
 #include <QString>
 #include <QUrl>
 
@@ -179,6 +180,59 @@ QString remoteAgentInstallScript(bool windows, const RemoteAgentPackage &package
 // Windows hosts PowerShell (-EncodedCommand). Empty when ssh cannot reach
 // the location (as sshAgentCommand()).
 QStringList sshScriptCommand(const Location &location, const QStringList &ssh, const QString &script);
+
+// --- Kate Code's helper on a host (remote-helper/, kate-code-helper) ---
+// Releases are pinned in Kate Code's source (src/acp/remote-helper-pin.json,
+// written by remote-helper/pin-release.py): Kate Code installs and runs only
+// those builds. Installed per version and platform (several Kate Code
+// versions and architectures may share a home directory), run by full path:
+// POSIX ~/.local/share/kate-code/helper/<version>/<platform>/kate-code-helper,
+// Windows %LOCALAPPDATA%\kate-code\helper\<version>\<platform>\kate-code-helper.exe.
+struct RemoteHelperBuild {
+    QString platform; // "linux-x86_64", "linux-arm", "darwin-aarch64", "windows-x86_64", ...
+    QString archive; // file name in the release ("kate-code-helper-linux-x86_64.tar.gz")
+    QString sha256; // the archive's (lower-case hex)
+    qint64 size = 0;
+    QString program; // "kate-code-helper" or "kate-code-helper.exe"
+    QString programSha256; // the program's own, to check an installed copy
+    qint64 programSize = 0;
+};
+struct RemoteHelperPin {
+    QString version; // "0.1.0"
+    int protocol = 0;
+    QUrl baseUrl; // the release's download directory (ends with '/')
+    QList<RemoteHelperBuild> builds; // by platform ("-musl" aliases dropped: the builds are static)
+
+    const RemoteHelperBuild *build(const QString &platform) const;
+    QUrl archiveUrl(const RemoteHelperBuild &build) const;
+};
+// The pin file's contents, validated (names and versions end up in
+// scripts and paths, hashes are hex, the base URL https (or file:// when
+// allowFileUrls, for tests)); nullopt when invalid or without builds
+// (a placeholder: no release pinned yet).
+std::optional<RemoteHelperPin> parseRemoteHelperPin(const QByteArray &json, bool allowFileUrls = false);
+// The script run (through sshHelperCommand()) on the host: finds the
+// host's platform (`uname -s`/`uname -m`: i386-i686 -> linux-x86,
+// armv6l/armv7l/armv8l -> linux-arm; static builds, so no libc
+// distinction; Windows: PROCESSOR_ARCHITECTURE), checks the installed copy of pin's build for it (size,
+// SHA-256 when sha256sum/shasum/openssl/Get-FileHash is there) and execs it
+// (its stdin/stdout are then the protocol); else prints
+// "kate-code-helper: install <platform>" and exits with
+// RemoteHelperInstallNeeded, or "kate-code-helper: unsupported <os> <machine>"
+// and exits with RemoteHelperUnsupported. Empty for an invalid pin.
+constexpr int RemoteHelperInstallNeeded = 97;
+constexpr int RemoteHelperUnsupported = 98;
+QString remoteHelperLaunchScript(bool windows, const RemoteHelperPin &pin);
+// The script installing build (a .tar.gz on its stdin) for pin's version:
+// unpacked next to its place and renamed over it (atomic; a concurrent
+// install of the same version writes the same file); prints "installed".
+// Exit 3: the program is not in the archive. Empty for invalid input.
+QString remoteHelperInstallScript(bool windows, const QString &version, const RemoteHelperBuild &build);
+// The command line (program first) running the helper on location's host
+// through `ssh -T` (keepalive options as sshAgentCommand()): the launch
+// script through sshScriptCommand()'s wrappers. Empty when ssh cannot reach
+// the location.
+QStringList sshHelperCommand(const Location &location, const QStringList &ssh, const RemoteHelperPin &pin);
 
 // 'text' quoted for a POSIX shell.
 QString shellQuote(const QString &text);

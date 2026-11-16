@@ -1,0 +1,106 @@
+{
+  "baseUrl": "https://github.com/yuyichao/kate-code/releases/download/remote-helper-v0.1.0/",
+  "name": "kate-code-helper",
+  "platforms": {
+    "darwin-aarch64": {
+      "archive": "kate-code-helper-darwin-universal.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "74ca800a2c29d42f7c801c414c244ae8e8c2fd8dcd5af4dc787681e8ea3052e7",
+      "programSize": 391216,
+      "sha256": "8d03e22e586bf119e99c0d3634bd3e7ff0420805ea991c4dbe7e8e284d391d2f",
+      "size": 116118
+    },
+    "darwin-x86_64": {
+      "archive": "kate-code-helper-darwin-universal.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "74ca800a2c29d42f7c801c414c244ae8e8c2fd8dcd5af4dc787681e8ea3052e7",
+      "programSize": 391216,
+      "sha256": "8d03e22e586bf119e99c0d3634bd3e7ff0420805ea991c4dbe7e8e284d391d2f",
+      "size": 116118
+    },
+    "linux-aarch64": {
+      "archive": "kate-code-helper-linux-aarch64.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "267c60264a4d7dbb696b8a991280effa350c48ddb6052166b8c7ff7fe7a9f6d3",
+      "programSize": 1247576,
+      "sha256": "9df10f431f4ae6f8a2cb86396d943c330c94503d160fe623860f9c20fa70b670",
+      "size": 463303
+    },
+    "linux-aarch64-musl": {
+      "archive": "kate-code-helper-linux-aarch64.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "267c60264a4d7dbb696b8a991280effa350c48ddb6052166b8c7ff7fe7a9f6d3",
+      "programSize": 1247576,
+      "sha256": "9df10f431f4ae6f8a2cb86396d943c330c94503d160fe623860f9c20fa70b670",
+      "size": 463303
+    },
+    "linux-arm": {
+      "archive": "kate-code-helper-linux-arm.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "5bd6daf97b609d2e136d3dd80f85052d1089e21f1fa48df73472819eef1e22dc",
+      "programSize": 1156728,
+      "sha256": "23c9c845f2b660a6605016ddbbc7d226fdefce1c6790f1d2253be59e820ecf52",
+      "size": 442396
+    },
+    "linux-arm-musl": {
+      "archive": "kate-code-helper-linux-arm.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "5bd6daf97b609d2e136d3dd80f85052d1089e21f1fa48df73472819eef1e22dc",
+      "programSize": 1156728,
+      "sha256": "23c9c845f2b660a6605016ddbbc7d226fdefce1c6790f1d2253be59e820ecf52",
+      "size": 442396
+    },
+    "linux-x86": {
+      "archive": "kate-code-helper-linux-x86.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "735d89d59090db3f04a169dba8bc5cb22ce0c4b6cc207cd3de048963223332b9",
+      "programSize": 1365596,
+      "sha256": "166ef75ef0b1a35188625ff063817442558641c526ded3ea5b04c8c070d54336",
+      "size": 531944
+    },
+    "linux-x86-musl": {
+      "archive": "kate-code-helper-linux-x86.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "735d89d59090db3f04a169dba8bc5cb22ce0c4b6cc207cd3de048963223332b9",
+      "programSize": 1365596,
+      "sha256": "166ef75ef0b1a35188625ff063817442558641c526ded3ea5b04c8c070d54336",
+      "size": 531944
+    },
+    "linux-x86_64": {
+      "archive": "kate-code-helper-linux-x86_64.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "d8d086ac70582c1a9c34c1950ac273219ca4ec7adac79f6fa5bb4f49a6adee59",
+      "programSize": 1255928,
+      "sha256": "bc47e44afefa02152782d3f35ea46c7da0bf9a1a5dbab7efaf2325dc9a9bd751",
+      "size": 473149
+    },
+    "linux-x86_64-musl": {
+      "archive": "kate-code-helper-linux-x86_64.tar.gz",
+      "program": "kate-code-helper",
+      "programSha256": "d8d086ac70582c1a9c34c1950ac273219ca4ec7adac79f6fa5bb4f49a6adee59",
+      "programSize": 1255928,
+      "sha256": "bc47e44afefa02152782d3f35ea46c7da0bf9a1a5dbab7efaf2325dc9a9bd751",
+      "size": 473149
+    },
+    "windows-aarch64": {
+      "archive": "kate-code-helper-windows-aarch64.tar.gz",
+      "program": "kate-code-helper.exe",
+      "programSha256": "09cfc6fc53835474d5f048ace0caee127abf9a7d8781bd6dadb5b7a3dfe6b486",
+      "programSize": 325120,
+      "sha256": "1d939b2915ba66c7bdf17cccbd8b8348bb2a1b1728b7baaf74f0355a922c42ee",
+      "size": 143982
+    },
+    "windows-x86_64": {
+      "archive": "kate-code-helper-windows-x86_64.tar.gz",
+      "program": "kate-code-helper.exe",
+      "programSha256": "d69cd73ba6cabe612ea1c41c2f8629c7ee31ea262947525d7fa93f91bbf2a0c3",
+      "programSize": 330240,
+      "sha256": "361da8a0be1e7d4202c6bf85d012686fec9a56b9ab87a50d0df7c58da2726d27",
+      "size": 161806
+    }
+  },
+  "protocol": 1,
+  "repository": "yuyichao/kate-code",
+  "tag": "remote-helper-v0.1.0",
+  "version": "0.1.0"
+}

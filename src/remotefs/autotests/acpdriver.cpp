@@ -9,9 +9,15 @@
 // acpdriver --install <folder> <registry entry JSON file> <program>
 // runs RemoteAgentInstaller instead:
 //   PROGRESS <text>, then FINISHED <0|1> <message>
+// acpdriver --helper <folder> <pin JSON file> <file>
+// runs RemoteHelper (kate-code-helper on the host; file:// downloads):
+//   PROGRESS <text>, READY, DIGEST <hex> (file's), WATCHING (file is
+//   watched: change it now), CHANGED <paths>; or STOPPED <message>
 #include "ACPService.h"
 #include "RemoteAgentInstaller.h"
+#include "RemoteHelper.h"
 
+#include <QDir>
 #include <QFile>
 
 #include <QCoreApplication>
@@ -50,6 +56,59 @@ int main(int argc, char **argv)
             QCoreApplication::exit(ok ? 0 : 1);
         });
         QTimer::singleShot(0, &installer, &RemoteAgentInstaller::start);
+        return app.exec();
+    }
+    if (args.size() == 5 && args.at(1) == QLatin1String("--helper")) {
+        QFile pinFile(args.at(3));
+        if (!pinFile.open(QIODevice::ReadOnly)) {
+            return 2;
+        }
+        const auto pin = KateRemote::parseRemoteHelperPin(pinFile.readAll(), true);
+        if (!pin) {
+            out(QStringLiteral("STOPPED invalid pin"));
+            return 1;
+        }
+        const QString folder = args.at(2);
+        const QString root = KateRemote::configuredMountRoot();
+        const auto location = KateRemote::locationForPath(folder, root);
+        if (!location) {
+            return 2;
+        }
+        const QString hostDir = QDir::cleanPath(KateRemote::pathForLocation({location->scheme, location->authority, QStringLiteral("/")}, root));
+        const QString file = args.at(4);
+        RemoteHelper helper(folder, KateRemote::RemotePathMap(hostDir));
+        helper.setPin(*pin);
+        helper.setAllowFileUrls(true);
+        if (qEnvironmentVariableIsSet("ACPDRIVER_DOWNLOADS")) {
+            helper.setDownloadDirectory(qEnvironmentVariable("ACPDRIVER_DOWNLOADS"));
+        }
+        QObject::connect(&helper, &RemoteHelper::progress, [](const QString &text) {
+            out(QStringLiteral("PROGRESS ") + text);
+        });
+        QObject::connect(&helper, &RemoteHelper::stopped, [](const QString &message) {
+            out(QStringLiteral("STOPPED ") + QString(message).replace(QLatin1Char('\n'), QLatin1String(" | ")));
+            QCoreApplication::exit(1);
+        });
+        QObject::connect(&helper, &RemoteHelper::changed, [](const QStringList &paths) {
+            out(QStringLiteral("CHANGED ") + paths.join(QLatin1Char(' ')));
+            QCoreApplication::exit(0);
+        });
+        QObject::connect(&helper, &RemoteHelper::ready, &app, [&helper, file] {
+            out(QStringLiteral("READY"));
+            helper.digest({file}, [&helper, file](const QHash<QString, QByteArray> &digests) {
+                out(QStringLiteral("DIGEST ") + QString::fromLatin1(digests.value(file).toHex()));
+                helper.setWatched({file});
+                // Answered after the watch request (the helper answers in order).
+                helper.request(QStringLiteral("stat"), QJsonObject{{QStringLiteral("path"), QStringLiteral("/")}}, [](const QJsonObject &, const QJsonObject &) {
+                    out(QStringLiteral("WATCHING"));
+                });
+            });
+        }, Qt::SingleShotConnection);
+        QTimer::singleShot(40000, &app, [] {
+            out(QStringLiteral("TIMEOUT"));
+            QCoreApplication::exit(3);
+        });
+        QTimer::singleShot(0, &helper, &RemoteHelper::start);
         return app.exec();
     }
     if (args.size() < 3) {

@@ -434,6 +434,18 @@ void SettingsStore::migrateOldBackendSettings()
     qDebug() << "[SettingsStore] Migrated old ACP backend settings to provider:" << newActiveId;
 }
 
+bool SettingsStore::remoteHelperEnabled() const
+{
+    return m_settings.value(QStringLiteral("Remote/useHelper"), true).toBool();
+}
+
+void SettingsStore::setRemoteHelperEnabled(bool enable)
+{
+    m_settings.setValue(QStringLiteral("Remote/useHelper"), enable);
+    m_settings.sync();
+    Q_EMIT settingsChanged();
+}
+
 bool SettingsStore::debugLogging() const
 {
     return m_settings.value(QStringLiteral("Debug/logging"), false).toBool();

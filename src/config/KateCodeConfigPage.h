@@ -82,6 +82,9 @@ private:
     QLineEdit *m_acpLogDirEdit;
     QLineEdit *m_acpLogSubdirEdit;
 
+    // General tab - Remote hosts section
+    QCheckBox *m_remoteHelperCheck;
+
     // General tab - Debug section
     QCheckBox *m_debugLoggingCheck;
 

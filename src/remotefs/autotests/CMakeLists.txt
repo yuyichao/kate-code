@@ -2,6 +2,7 @@ ecm_add_test(RemoteLocationTest.cpp
     TEST_NAME remotelocationtest
     LINK_LIBRARIES kateremotelocation Qt6::Test
 )
+target_compile_definitions(remotelocationtest PRIVATE KATECODE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 if(BUILD_REMOTE_FS)
     add_executable(kpasswdtool kpasswdtool.cpp)
@@ -9,13 +10,16 @@ if(BUILD_REMOTE_FS)
 
     # Kate Code's ACPService with agents on remote hosts, and
     # RemoteAgentInstaller (--install).
-    add_executable(acpdriver acpdriver.cpp ${CMAKE_SOURCE_DIR}/src/acp/ACPService.cpp ${CMAKE_SOURCE_DIR}/src/acp/RemoteAgentInstaller.cpp)
+    add_executable(acpdriver acpdriver.cpp ${CMAKE_SOURCE_DIR}/src/acp/ACPService.cpp ${CMAKE_SOURCE_DIR}/src/acp/RemoteAgentInstaller.cpp ${CMAKE_SOURCE_DIR}/src/acp/RemoteHelper.cpp)
     target_include_directories(acpdriver PRIVATE ${CMAKE_SOURCE_DIR}/src/acp)
     target_link_libraries(acpdriver kateremotelocation KF6::Archive Qt6::Core Qt6::DBus Qt6::Network)
 
     # Mounts a sandboxed local sftp-server through sshfs; skipped (77) when
     # sshfs, bwrap or sftp-server is missing.
+    # kate-code-helper is a project of its own (remote-helper/): give a built
+    # one to test RemoteHelper with it (skipped otherwise).
+    set(KATE_CODE_HELPER_FOR_TESTS "" CACHE FILEPATH "A built kate-code-helper for kateremotefstest (optional)")
     add_test(NAME kateremotefstest
-        COMMAND dbus-run-session -- python3 -I ${CMAKE_CURRENT_SOURCE_DIR}/test_remotefs.py $<TARGET_FILE:kate-remote-fs> $<TARGET_FILE:kpasswdtool> $<TARGET_FILE:acpdriver>)
+        COMMAND dbus-run-session -- python3 -I ${CMAKE_CURRENT_SOURCE_DIR}/test_remotefs.py $<TARGET_FILE:kate-remote-fs> $<TARGET_FILE:kpasswdtool> $<TARGET_FILE:acpdriver> "${KATE_CODE_HELPER_FOR_TESTS}")
     set_tests_properties(kateremotefstest PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()

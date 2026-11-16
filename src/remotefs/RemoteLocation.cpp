@@ -7,6 +7,8 @@
 
 #include <QDir>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QProcessEnvironment>
 #include <QStandardPaths>
 #include <QProcess>
@@ -366,29 +368,18 @@ QStringList sshTerminalCommand(const Location &location, const QStringList &ssh)
     return command;
 }
 
-QString windowsAgentScript(const QString &folder, const QString &program, const QStringList &args)
+// The end of a PowerShell script running the program $f (a path) in the
+// directory $d with arguments (a PowerShell string literal): PowerShell
+// re-encodes a native program's output it passes on, so the program's
+// stdin/stdout/stderr are copied as bytes instead: stdin through an
+// unbuffered stream, closed at end of input (the program then exits); the
+// script exits with the program's code.
+static QString windowsRunProgramScript(const QString &arguments)
 {
-    QStringList quoted;
-    for (const QString &arg : args) {
-        quoted << windowsArgument(arg);
-    }
-    // Run by Windows PowerShell 5.1 or PowerShell 7, whichever shell sshd
-    // uses. PowerShell re-encodes a native program's output it passes on,
-    // so the agent's stdin/stdout/stderr are copied as bytes instead:
-    // stdin through an unbuffered stream, closed at end of input (the agent
-    // then exits); the script exits with the agent's code. Kept short: cmd
-    // limits a command line to 8191 characters.
     return QStringLiteral(
-               "$ProgressPreference='SilentlyContinue'\n"
-               "$d=%1\n"
-               "if(-not(Test-Path -LiteralPath $d -PathType Container)){[Console]::Error.WriteLine(\"No such folder: $d\");exit 1}\n"
-               "$h=$env:USERPROFILE\n"
-               "$env:PATH=\"$env:PATH;$h\\.local\\bin;$h\\bin;$h\\.cargo\\bin;$env:APPDATA\\npm;$env:LOCALAPPDATA\\kate-code\\bin\"\n"
-               "$c=Get-Command -Name %2 -CommandType Application -ErrorAction SilentlyContinue|Select-Object -First 1\n"
-               "if(-not $c){[Console]::Error.WriteLine(%3);exit 127}\n"
                "$i=New-Object Diagnostics.ProcessStartInfo\n"
-               "$i.FileName=$c.Path\n"
-               "$i.Arguments=%4\n"
+               "$i.FileName=$f\n"
+               "$i.Arguments=%1\n"
                "$i.WorkingDirectory=$d\n"
                "$i.UseShellExecute=$false\n"
                "$i.RedirectStandardInput=$true\n"
@@ -402,10 +393,29 @@ QString windowsAgentScript(const QString &folder, const QString &program, const 
                "while(-not $p.HasExited){if($n -and $n.IsCompleted){$w.Close();$n=$null};Start-Sleep -Milliseconds 100}\n"
                "[void]$o.Wait(5000);[void]$e.Wait(5000)\n"
                "exit $p.ExitCode\n")
-        .arg(powershellQuote(folder),
-             powershellQuote(program),
-             powershellQuote(program + QStringLiteral(": not found")),
-             powershellQuote(quoted.join(QLatin1Char(' '))));
+        .arg(arguments);
+}
+
+QString windowsAgentScript(const QString &folder, const QString &program, const QStringList &args)
+{
+    QStringList quoted;
+    for (const QString &arg : args) {
+        quoted << windowsArgument(arg);
+    }
+    // Run by Windows PowerShell 5.1 or PowerShell 7, whichever shell sshd
+    // uses; the agent's stdio copied as bytes (windowsRunProgramScript()).
+    // Kept short: cmd limits a command line to 8191 characters.
+    return QStringLiteral(
+               "$ProgressPreference='SilentlyContinue'\n"
+               "$d=%1\n"
+               "if(-not(Test-Path -LiteralPath $d -PathType Container)){[Console]::Error.WriteLine(\"No such folder: $d\");exit 1}\n"
+               "$h=$env:USERPROFILE\n"
+               "$env:PATH=\"$env:PATH;$h\\.local\\bin;$h\\bin;$h\\.cargo\\bin;$env:APPDATA\\npm;$env:LOCALAPPDATA\\kate-code\\bin\"\n"
+               "$c=Get-Command -Name %2 -CommandType Application -ErrorAction SilentlyContinue|Select-Object -First 1\n"
+               "if(-not $c){[Console]::Error.WriteLine(%3);exit 127}\n"
+               "$f=$c.Path\n")
+        .arg(powershellQuote(folder), powershellQuote(program), powershellQuote(program + QStringLiteral(": not found")))
+        + windowsRunProgramScript(powershellQuote(quoted.join(QLatin1Char(' '))));
 }
 
 bool isValidRemoteAgentPackage(const RemoteAgentPackage &package)
@@ -562,7 +572,9 @@ QString remoteAgentInstallScript(bool windows, const RemoteAgentPackage &package
         .arg(package.id, package.version, cmd, package.name);
 }
 
-QStringList sshScriptCommand(const Location &location, const QStringList &ssh, const QString &script)
+// script on location's host through `ssh -T` with options (see
+// sshScriptCommand()).
+static QStringList sshScriptCommandWith(const Location &location, const QStringList &ssh, const QStringList &options, const QString &script)
 {
     if (!isSshScheme(location.scheme) || ssh.isEmpty() || script.isEmpty()) {
         return {};
@@ -576,7 +588,7 @@ QStringList sshScriptCommand(const Location &location, const QStringList &ssh, c
         return {};
     }
     QStringList command = ssh;
-    command << QStringLiteral("-T") << QStringLiteral("-o") << QStringLiteral("ConnectTimeout=10");
+    command << QStringLiteral("-T") << options;
     appendSshDestination(command, *target);
     if (windows) {
         command << QStringLiteral("powershell -NoLogo -NoProfile -NonInteractive -EncodedCommand %1").arg(powershellEncoded(script));
@@ -584,6 +596,217 @@ QStringList sshScriptCommand(const Location &location, const QStringList &ssh, c
         command << QStringLiteral("exec /bin/sh -c '%1'").arg(script);
     }
     return command;
+}
+
+QStringList sshScriptCommand(const Location &location, const QStringList &ssh, const QString &script)
+{
+    return sshScriptCommandWith(location, ssh, {QStringLiteral("-o"), QStringLiteral("ConnectTimeout=10")}, script);
+}
+
+// --- Kate Code's helper (remote-helper/) ---
+
+static bool isValidHelperVersion(const QString &version)
+{
+    static const QRegularExpression re(QStringLiteral("^[0-9]+(\\.[0-9]+){1,3}$"));
+    return re.match(version).hasMatch();
+}
+
+static bool isValidHelperPlatform(const QString &platform)
+{
+    static const QRegularExpression re(QStringLiteral("^(linux|darwin|windows|freebsd)-[a-z0-9_]+$"));
+    return re.match(platform).hasMatch();
+}
+
+static bool isSha256(const QString &text)
+{
+    static const QRegularExpression re(QStringLiteral("^[0-9a-f]{64}$"));
+    return re.match(text).hasMatch();
+}
+
+static QString helperProgramName(const QString &platform)
+{
+    return platform.startsWith(QLatin1String("windows-")) ? QStringLiteral("kate-code-helper.exe") : QStringLiteral("kate-code-helper");
+}
+
+const RemoteHelperBuild *RemoteHelperPin::build(const QString &platform) const
+{
+    for (const RemoteHelperBuild &b : builds) {
+        if (b.platform == platform) {
+            return &b;
+        }
+    }
+    return nullptr;
+}
+
+QUrl RemoteHelperPin::archiveUrl(const RemoteHelperBuild &build) const
+{
+    return baseUrl.resolved(QUrl(build.archive));
+}
+
+std::optional<RemoteHelperPin> parseRemoteHelperPin(const QByteArray &json, bool allowFileUrls)
+{
+    const QJsonObject root = QJsonDocument::fromJson(json).object();
+    if (root.value(QStringLiteral("name")).toString() != QLatin1String("kate-code-helper")) {
+        return std::nullopt;
+    }
+    RemoteHelperPin pin;
+    pin.version = root.value(QStringLiteral("version")).toString();
+    pin.protocol = root.value(QStringLiteral("protocol")).toInt();
+    pin.baseUrl = QUrl(root.value(QStringLiteral("baseUrl")).toString());
+    if (!isValidHelperVersion(pin.version) || pin.protocol < 1 || !pin.baseUrl.isValid() || !pin.baseUrl.path().endsWith(QLatin1Char('/'))
+        || pin.baseUrl.hasQuery() || pin.baseUrl.hasFragment()
+        || !(pin.baseUrl.scheme() == QLatin1String("https") || (allowFileUrls && pin.baseUrl.scheme() == QLatin1String("file")))) {
+        return std::nullopt;
+    }
+    static const QRegularExpression archiveName(QStringLiteral("^kate-code-helper-[a-z0-9_]+-[a-z0-9_]+\\.tar\\.gz$"));
+    const QJsonObject platforms = root.value(QStringLiteral("platforms")).toObject();
+    for (auto it = platforms.begin(); it != platforms.end(); ++it) {
+        if (it.key().endsWith(QLatin1String("-musl"))) {
+            continue; // the same static build as the plain key
+        }
+        const QJsonObject entry = it.value().toObject();
+        RemoteHelperBuild build;
+        build.platform = it.key();
+        build.archive = entry.value(QStringLiteral("archive")).toString();
+        build.sha256 = entry.value(QStringLiteral("sha256")).toString();
+        build.size = entry.value(QStringLiteral("size")).toInteger(-1);
+        build.program = entry.value(QStringLiteral("program")).toString();
+        build.programSha256 = entry.value(QStringLiteral("programSha256")).toString();
+        build.programSize = entry.value(QStringLiteral("programSize")).toInteger(-1);
+        if (!isValidHelperPlatform(build.platform) || !archiveName.match(build.archive).hasMatch() || !isSha256(build.sha256) || build.size <= 0
+            || build.program != helperProgramName(build.platform) || !isSha256(build.programSha256) || build.programSize <= 0) {
+            return std::nullopt;
+        }
+        pin.builds << build;
+    }
+    if (pin.builds.isEmpty()) {
+        return std::nullopt;
+    }
+    return pin;
+}
+
+static bool isValidHelperPin(const RemoteHelperPin &pin)
+{
+    if (!isValidHelperVersion(pin.version) || pin.builds.isEmpty()) {
+        return false;
+    }
+    return std::all_of(pin.builds.begin(), pin.builds.end(), [](const RemoteHelperBuild &b) {
+        return isValidHelperPlatform(b.platform) && isSha256(b.programSha256) && b.programSize > 0 && b.program == helperProgramName(b.platform);
+    });
+}
+
+QString remoteHelperLaunchScript(bool windows, const RemoteHelperPin &pin)
+{
+    if (!isValidHelperPin(pin)) {
+        return {};
+    }
+    if (windows) {
+        QStringList table;
+        for (const RemoteHelperBuild &b : pin.builds) {
+            if (b.platform.startsWith(QLatin1String("windows-"))) {
+                table << QStringLiteral("'%1'=@('%2',%3)").arg(b.platform, b.programSha256).arg(b.programSize);
+            }
+        }
+        // 64-bit PowerShell (sshd's) reports the machine's architecture.
+        return QStringLiteral(
+                   "$ProgressPreference='SilentlyContinue'\n"
+                   "$a=$env:PROCESSOR_ARCHITECTURE\n"
+                   "$q=switch($a){'AMD64'{'windows-x86_64'}'ARM64'{'windows-aarch64'}default{''}}\n"
+                   "$t=@{%1}\n"
+                   "if(-not $q -or -not $t.ContainsKey($q)){Write-Output \"kate-code-helper: unsupported Windows $a\";exit %2}\n"
+                   "$x=$t[$q]\n"
+                   "$f=Join-Path $env:LOCALAPPDATA ('kate-code\\helper\\%3\\'+$q+'\\kate-code-helper.exe')\n"
+                   "$ok=$false\n"
+                   "if(Test-Path -LiteralPath $f -PathType Leaf){if((Get-Item -LiteralPath $f).Length -eq $x[1]){"
+                   "$ok=((Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower() -eq $x[0])}}\n"
+                   "if(-not $ok){Write-Output ('kate-code-helper: install '+$q);exit %4}\n"
+                   "$d=$env:USERPROFILE\n")
+                   .arg(table.join(QLatin1Char(';')))
+                   .arg(RemoteHelperUnsupported)
+                   .arg(pin.version)
+                   .arg(RemoteHelperInstallNeeded)
+            + windowsRunProgramScript(QStringLiteral("''"));
+    }
+    QStringList expected;
+    for (const RemoteHelperBuild &b : pin.builds) {
+        if (!b.platform.startsWith(QLatin1String("windows-"))) {
+            expected << QStringLiteral("%1) e=%2; n=%3;;").arg(b.platform, b.programSha256).arg(b.programSize);
+        }
+    }
+    // One line, no single quotes or backslashes (sshScriptCommand()). The
+    // size is always checked, the SHA-256 with whichever tool the host has
+    // (else the helper's hello must name the pinned version).
+    return QStringLiteral(
+               "s=$(uname -s); m=$(uname -m); "
+               "case \"$s/$m\" in Linux/x86_64|Linux/amd64) p=linux-x86_64;; Linux/aarch64|Linux/arm64) p=linux-aarch64;; "
+               "Linux/i[3456]86) p=linux-x86;; Linux/armv6l|Linux/armv7l|Linux/armv8l) p=linux-arm;; "
+               "Darwin/x86_64) p=darwin-x86_64;; Darwin/arm64) p=darwin-aarch64;; *) p=;; esac; "
+               "e=; n=; case \"$p\" in %1 esac; "
+               "if test -z \"$e\"; then echo \"kate-code-helper: unsupported $s $m\"; exit %2; fi; "
+               "f=\"$HOME/.local/share/kate-code/helper/%3/$p/kate-code-helper\"; ok=; "
+               "if test -f \"$f\" && test \"$(wc -c < \"$f\" | tr -d \" \")\" = \"$n\"; then "
+               "if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < \"$f\"); "
+               "elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < \"$f\"); "
+               "elif command -v openssl >/dev/null 2>&1; then h=$(openssl dgst -sha256 -r < \"$f\"); else h=$e; fi; "
+               "case \"$h\" in \"$e\"*) ok=1;; esac; fi; "
+               "if test -z \"$ok\"; then echo \"kate-code-helper: install $p\"; exit %4; fi; "
+               "exec \"$f\"")
+        .arg(expected.join(QLatin1Char(' ')))
+        .arg(RemoteHelperUnsupported)
+        .arg(pin.version)
+        .arg(RemoteHelperInstallNeeded);
+}
+
+QString remoteHelperInstallScript(bool windows, const QString &version, const RemoteHelperBuild &build)
+{
+    if (!isValidHelperVersion(version) || !isValidHelperPlatform(build.platform) || build.program != helperProgramName(build.platform)
+        || build.platform.startsWith(QLatin1String("windows-")) != windows) {
+        return {};
+    }
+    if (windows) {
+        return QStringLiteral(
+                   "$ErrorActionPreference='Stop'\n"
+                   "$d=Join-Path $env:LOCALAPPDATA 'kate-code\\helper\\%1\\%2'\n"
+                   "[void](New-Item -ItemType Directory -Force -Path $d)\n"
+                   "$t=Join-Path $d ('.install.'+[guid]::NewGuid().ToString('N'))\n"
+                   "[void](New-Item -ItemType Directory -Path $t)\n"
+                   "try{\n"
+                   "$a=Join-Path $t 'a.tgz'\n"
+                   "$f=[IO.File]::Create($a);[Console]::OpenStandardInput().CopyTo($f);$f.Close()\n"
+                   "$x=Join-Path $t 'x';[void](New-Item -ItemType Directory -Path $x)\n"
+                   "& tar.exe -xzf $a -C $x;if($LASTEXITCODE){exit 2}\n"
+                   "$s=Join-Path $x 'kate-code-helper.exe'\n"
+                   "if(-not(Test-Path -LiteralPath $s -PathType Leaf)){[Console]::Error.WriteLine('kate-code-helper.exe is not in the archive');exit 3}\n"
+                   "Move-Item -LiteralPath $s -Destination (Join-Path $d 'kate-code-helper.exe') -Force\n"
+                   "Write-Output installed\n"
+                   "}finally{Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue}\n")
+            .arg(version, build.platform);
+    }
+    // One line, no single quotes or backslashes (sshScriptCommand()).
+    // Unpacked next to its place and renamed over it: a running helper keeps
+    // its (old) file, a concurrent install of the same version is the same.
+    return QStringLiteral(
+               "set -e; umask 022; d=\"$HOME/.local/share/kate-code/helper/%1/%2\"; mkdir -p \"$d\"; "
+               "t=$(mktemp -d \"$d/.install.XXXXXX\"); c() { rm -rf \"$t\"; }; trap c EXIT; "
+               "cat > \"$t/a.tgz\"; mkdir \"$t/x\"; tar -xzf \"$t/a.tgz\" -C \"$t/x\"; "
+               "if ! test -f \"$t/x/kate-code-helper\"; then echo \"kate-code-helper is not in the archive\" >&2; exit 3; fi; "
+               "chmod 755 \"$t/x/kate-code-helper\"; mv -f \"$t/x/kate-code-helper\" \"$d/kate-code-helper\"; echo installed")
+        .arg(version, build.platform);
+}
+
+QStringList sshHelperCommand(const Location &location, const QStringList &ssh, const RemoteHelperPin &pin)
+{
+    const bool windows = !windowsPathForSftpPath(location.path).isEmpty();
+    // Like the agent's: notice a dead connection.
+    return sshScriptCommandWith(location,
+                                ssh,
+                                {QStringLiteral("-o"),
+                                 QStringLiteral("ServerAliveInterval=15"),
+                                 QStringLiteral("-o"),
+                                 QStringLiteral("ServerAliveCountMax=3"),
+                                 QStringLiteral("-o"),
+                                 QStringLiteral("ConnectTimeout=10")},
+                                remoteHelperLaunchScript(windows, pin));
 }
 
 QStringList sshAgentCommand(const Location &location, const QStringList &ssh, const QString &program, const QStringList &args)

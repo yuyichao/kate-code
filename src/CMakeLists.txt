@@ -14,6 +14,7 @@ set(katecode_SRCS
     acp/ACPSessionDeleter.cpp
     acp/RateLimits.cpp
     acp/RemoteAgentInstaller.cpp
+    acp/RemoteHelper.cpp
     acp/TerminalManager.cpp
 
     # UI layer

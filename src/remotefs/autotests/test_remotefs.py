@@ -28,6 +28,8 @@ SKIP = 77
 DAEMON = os.path.abspath(sys.argv[1])
 KPASSWDTOOL = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else None
 ACPDRIVER = os.path.abspath(sys.argv[3]) if len(sys.argv) > 3 else None
+# A built kate-code-helper (remote-helper/, its own project), optional.
+HELPER = os.path.abspath(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
 
 SFTP_SERVER = next((p for p in ("/usr/lib/ssh/sftp-server", "/usr/libexec/openssh/sftp-server",
                                 "/usr/lib/openssh/sftp-server") if os.path.exists(p)), None)
@@ -844,6 +846,138 @@ def test_remote_agent_install():
     check(code != 0 and "ssh to badagent failed" in output, f"ssh failures reported: {output}")
 
 
+def run_helper(pin, path="/data/sub", file="helper.txt", change=None):
+    """acpdriver --helper (RemoteHelper) with the pin; change() runs once the
+    file is watched. Returns (exit code, output)."""
+    pin_file = os.path.join(TMP, "helper-pin.json")
+    with open(pin_file, "w") as f:
+        json.dump(pin, f)
+    e = env()
+    e["ACPDRIVER_DOWNLOADS"] = os.path.join(TMP, "helper-downloads")
+    folder = os.path.join(ROOT, "sftp", "goodhost") + path
+    process = subprocess.Popen([ACPDRIVER, "--helper", folder, pin_file, os.path.join(folder, file)], env=e,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    output = []
+    for line in process.stdout:
+        output.append(line)
+        if line.startswith("WATCHING") and change:
+            change()
+    process.wait(timeout=60)
+    return process.returncode, "".join(output)
+
+
+def test_remote_helper():
+    print("kate-code-helper on the remote host (RemoteHelper)")
+    if not HELPER:
+        print("  (skipped: no kate-code-helper given)")
+        return
+    import hashlib
+    import tarfile
+    work = os.path.join(TMP, "helper-release")
+    os.makedirs(work, exist_ok=True)
+    archive = os.path.join(work, "kate-code-helper-linux-test.tar.gz")
+    with tarfile.open(archive, "w:gz") as t:
+        t.add(HELPER, arcname="kate-code-helper")
+    with open(archive, "rb") as f:
+        archive_sha = hashlib.sha256(f.read()).hexdigest()
+    with open(HELPER, "rb") as f:
+        program = f.read()
+    version = subprocess.run([HELPER, "--version"], capture_output=True, text=True).stdout.split()[1]
+
+    # The pin as Kate Code's source gets it: pin-release.py --from-dir on a
+    # release-like directory (every required platform; the POSIX ones are
+    # the test's helper, built for this machine, the Windows ones dummies).
+    release = os.path.join(work, "release")
+    os.makedirs(release, exist_ok=True)
+    platforms = {}
+    for p in ("linux-x86_64", "linux-aarch64", "linux-x86", "linux-arm", "darwin-aarch64", "darwin-x86_64"):
+        platforms[p] = (os.path.basename(archive), "kate-code-helper")
+    dummy = os.path.join(work, "dummy")
+    os.makedirs(dummy, exist_ok=True)
+    with open(os.path.join(dummy, "kate-code-helper.exe"), "wb") as f:
+        f.write(b"MZ not a program")
+    for p in ("windows-x86_64", "windows-aarch64"):
+        name = f"kate-code-helper-{p}.tar.gz"
+        with tarfile.open(os.path.join(release, name), "w:gz") as t:
+            t.add(os.path.join(dummy, "kate-code-helper.exe"), arcname="kate-code-helper.exe")
+        platforms[p] = (name, "kate-code-helper.exe")
+    shutil.copy(archive, release)
+    manifest = {"name": "kate-code-helper", "version": version, "protocol": 1, "platforms": {}}
+    for p, (name, prog) in platforms.items():
+        with open(os.path.join(release, name), "rb") as f:
+            data = f.read()
+        manifest["platforms"][p] = {"archive": name, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "program": prog}
+    with open(os.path.join(release, "manifest.json"), "w") as f:
+        json.dump(manifest, f)
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "remote-helper", "pin-release.py")
+    generated = os.path.join(work, "pin.json")
+    result = subprocess.run([sys.executable, "-I", script, version, "--from-dir", release, "--output", generated],
+                            capture_output=True, text=True)
+    check(result.returncode == 0, f"pin-release.py pins the test release: {result.stdout} {result.stderr}")
+    with open(generated) as f:
+        base_pin = json.load(f)
+
+    def pin(sha=None):
+        result = json.loads(json.dumps(base_pin))
+        # Downloaded from the test's directory instead of GitHub.
+        result["baseUrl"] = "file://" + release + "/"
+        if sha:
+            for entry in result["platforms"].values():
+                if entry["archive"] == os.path.basename(archive):
+                    entry["sha256"] = sha
+        return result
+
+    helper_dir = os.path.join(AGENT_HOME, ".local", "share", "kate-code", "helper", version)
+    # A file of its own: later tests read f.txt.
+    target = os.path.join(TREE, "sub", "helper.txt")
+    with open(target, "w") as f:
+        f.write("helper test\n")
+
+    code, output = run_helper(pin(sha="0" * 64))
+    check(code != 0 and "SHA-256" in output and "not installed" in output, f"a wrong archive SHA-256 is refused: {output}")
+    check(not os.path.exists(helper_dir), "nothing reaches the host then")
+
+    counter = [0]
+
+    def change():
+        counter[0] += 1
+        with open(target, "a") as f:
+            f.write(f"changed {counter[0]}\n")
+
+    with open(target, "rb") as f:
+        data = f.read()
+    blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    code, output = run_helper(pin(), change=change)
+    check(code == 0 and "Installing kate-code-helper" in output and "READY" in output, f"installed and started: {output}")
+    check(f"DIGEST {blob}" in output, f"the digest is git's blob hash ({blob}): {output}")
+    check(f"CHANGED {os.path.join(ROOT, 'sftp', 'goodhost', 'data', 'sub', 'helper.txt')}" in output,
+          f"a change on the host is reported with the local path: {output}")
+    platforms = os.listdir(helper_dir) if os.path.isdir(helper_dir) else []
+    check(len(platforms) == 1 and os.listdir(os.path.join(helper_dir, platforms[0])) == ["kate-code-helper"],
+          f"installed per version and platform, nothing else left: {platforms}")
+
+    code, output = run_helper(pin(), change=change)
+    check(code == 0 and "Installing" not in output and "Downloading" not in output and "CHANGED" in output,
+          f"a second start runs the installed copy: {output}")
+
+    installed = os.path.join(helper_dir, platforms[0], "kate-code-helper") if platforms else None
+    if installed:
+        with open(installed, "r+b") as f:  # same size, other contents
+            f.seek(100)
+            f.write(b"\xff\xfe")
+        code, output = run_helper(pin(), change=change)
+        check(code == 0 and "Installing" in output and "Downloading" not in output and "READY" in output,
+              f"a modified copy is replaced (from the cached download): {output}")
+        with open(installed, "rb") as f:
+            check(f.read() == program, "the installed copy is the pinned program again")
+
+    other = pin()
+    other["version"] = "99.0"
+    code, output = run_helper(other)
+    check(code != 0 and "not the pinned 99.0" in output, f"a helper of another version is not used: {output}")
+    os.remove(target)
+
+
 def kio_fuse_pids():
     pids = []
     for pid in os.listdir("/proc"):
@@ -1251,7 +1385,7 @@ def main():
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_kde_passwords, test_remote_agent, test_remote_agent_install, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_remote_agent, test_remote_agent_install, test_remote_helper, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_shutdown_and_restart):
             try:
                 test()

@@ -95,6 +95,11 @@ public:
     // Check if an executable can be found on PATH or common directories
     static bool isExecutableAvailable(const QString &executable);
 
+    // Agents on remote hosts: install and run Kate Code's helper
+    // (kate-code-helper) on the host (default on).
+    bool remoteHelperEnabled() const;
+    void setRemoteHelperEnabled(bool enable);
+
     // Debug settings
     bool debugLogging() const;
     void setDebugLogging(bool enable);

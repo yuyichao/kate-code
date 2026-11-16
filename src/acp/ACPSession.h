@@ -2,6 +2,7 @@
 
 #include "ACPModels.h"
 #include "RateLimits.h"
+#include <QDeadlineTimer>
 #include <QHash>
 #include <QJsonArray>
 #include <QSet>
@@ -17,6 +18,7 @@ class Document;
 }
 
 class ACPService;
+class RemoteHelper;
 class QTimer;
 
 class EditTracker;
@@ -47,6 +49,11 @@ public:
     // DBus object of this chat's editor endpoint, passed to the Kate MCP
     // server as KATECODE_DBUS_PATH (empty: the shared legacy object).
     void setEditorObjectPath(const QString &path) { m_editorObjectPath = path; }
+    // Agents on remote hosts: run Kate Code's helper (kate-code-helper) on
+    // the host too, installing it when missing (default on). Read at start().
+    void setRemoteHelperEnabled(bool enabled) { m_remoteHelperEnabled = enabled; }
+    // The helper of the running remote agent, if any (ready or not).
+    RemoteHelper *remoteHelper() const { return m_remoteHelper; }
     void setSessionConfig(const QJsonObject &config);
     void start(const QString &workingDir, const QString &permissionMode = QStringLiteral("default"));
     void stop();
@@ -236,6 +243,26 @@ private:
     // on disk.
     void scheduleRemoteDocumentCheck();
     void checkRemoteDocuments();
+    // With the helper (kate-code-helper on the host): the host's own
+    // digests, and change notifications for the open documents of the host.
+    // A change is looked at RemoteHelperSettleMs after its notification and
+    // confirmed by a second digest (Kate's own saves notify too), then a
+    // modified document is flagged as changed on disk, and an unmodified one
+    // reloaded once the mount shows the host's contents (helperVerifyMount()).
+    // sshfs shows a host change only about 1 s after the next open of the
+    // file (measured; a stat does not do it, and until then it answers from
+    // its cache for up to 20 s): changed files are opened at once
+    // (kickMount()).
+    void startRemoteHelper();
+    void stopRemoteHelper();
+    QStringList openRemoteDocumentPaths() const;
+    void syncRemoteHelperWatches();
+    void helperCheckDocuments(const QStringList &paths, bool confirmed);
+    void kickMount(const QStringList &paths);
+    // Reads the files of m_helperVerifying through the mount (in a thread):
+    // reloads those that show the host's digest, flags those that do not by
+    // their deadline, polls again for the others.
+    void helperVerifyMount();
 
     // Terminal request handlers
     void handleTerminalCreate(const QJsonObject &params, int requestId);
@@ -346,4 +373,17 @@ private:
     QTimer *m_remoteLateCheckTimer = nullptr;
     bool m_remoteCheckRunning = false;
     bool m_remoteCheckPending = false;
+
+    bool m_remoteHelperEnabled = true;
+    RemoteHelper *m_remoteHelper = nullptr;
+    QTimer *m_helperSettleTimer = nullptr; // changed() -> check
+    QTimer *m_helperWatchTimer = nullptr; // documents opened/closed -> watch set
+    QSet<QString> m_helperChangedPaths;
+    struct HelperVerify {
+        QByteArray digest; // the host's
+        QDeadlineTimer deadline;
+    };
+    QHash<QString, HelperVerify> m_helperVerifying; // unmodified documents to reload when the mount shows the digest
+    bool m_helperVerifyRunning = false;
+    QTimer *m_helperVerifyTimer = nullptr;
 };

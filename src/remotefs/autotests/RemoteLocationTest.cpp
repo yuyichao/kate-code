@@ -5,7 +5,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include <QCryptographicHash>
 #include <QDir>
+#include <QFile>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QStandardPaths>
@@ -697,6 +699,222 @@ private Q_SLOTS:
         QVERIFY(windowsAgentScript(QStringLiteral("C:\\x"), QStringLiteral("goose"), {}).contains(QStringLiteral(";$env:LOCALAPPDATA\\kate-code\\bin\"")));
         const QString probe = remotePlatformScript(true, QStringLiteral("goose"));
         QVERIFY(probe.contains(QStringLiteral("'kate-code\\bin\\goose.cmd'")));
+    }
+
+    // The pin file (pin-release.py's output): validated before anything of
+    // it reaches a script or a download.
+    void remoteHelperPin()
+    {
+        const auto entry = [](const QString &archive, const QString &program) {
+            return QJsonObject{{QStringLiteral("archive"), archive},
+                               {QStringLiteral("sha256"), QString(64, QLatin1Char('a'))},
+                               {QStringLiteral("size"), 100},
+                               {QStringLiteral("program"), program},
+                               {QStringLiteral("programSha256"), QString(64, QLatin1Char('b'))},
+                               {QStringLiteral("programSize"), 50}};
+        };
+        QJsonObject pin{{QStringLiteral("name"), QStringLiteral("kate-code-helper")},
+                        {QStringLiteral("version"), QStringLiteral("0.1.0")},
+                        {QStringLiteral("protocol"), 1},
+                        {QStringLiteral("baseUrl"), QStringLiteral("https://github.com/o/r/releases/download/remote-helper-v0.1.0/")},
+                        {QStringLiteral("platforms"),
+                         QJsonObject{{QStringLiteral("linux-x86_64"), entry(QStringLiteral("kate-code-helper-linux-x86_64.tar.gz"), QStringLiteral("kate-code-helper"))},
+                                     {QStringLiteral("linux-x86_64-musl"), entry(QStringLiteral("kate-code-helper-linux-x86_64.tar.gz"), QStringLiteral("kate-code-helper"))},
+                                     {QStringLiteral("windows-x86_64"),
+                                      entry(QStringLiteral("kate-code-helper-windows-x86_64.tar.gz"), QStringLiteral("kate-code-helper.exe"))}}}};
+        const auto parse = [](const QJsonObject &o, bool allowFile = false) {
+            return parseRemoteHelperPin(QJsonDocument(o).toJson(), allowFile);
+        };
+        const auto parsed = parse(pin);
+        QVERIFY(parsed);
+        QCOMPARE(parsed->version, QStringLiteral("0.1.0"));
+        QCOMPARE(parsed->builds.size(), 2); // the -musl alias dropped
+        QVERIFY(parsed->build(QStringLiteral("linux-x86_64")));
+        QCOMPARE(parsed->archiveUrl(*parsed->build(QStringLiteral("linux-x86_64"))).toString(),
+                 QStringLiteral("https://github.com/o/r/releases/download/remote-helper-v0.1.0/kate-code-helper-linux-x86_64.tar.gz"));
+        QVERIFY(!remoteHelperLaunchScript(false, *parsed).isEmpty());
+        QVERIFY(!remoteHelperLaunchScript(true, *parsed).isEmpty());
+
+        // The placeholder (no release pinned yet), and invalid fields.
+        QVERIFY(!parseRemoteHelperPin(QByteArray()));
+        QVERIFY(!parse(QJsonObject{{QStringLiteral("name"), QStringLiteral("kate-code-helper")}, {QStringLiteral("version"), QJsonValue()}}));
+        const auto with = [&](const QString &key, const QJsonValue &value) {
+            QJsonObject o = pin;
+            o[key] = value;
+            return o;
+        };
+        const auto withEntry = [&](const QString &key, const QJsonValue &value) {
+            QJsonObject platforms = pin[QStringLiteral("platforms")].toObject();
+            QJsonObject e = platforms[QStringLiteral("linux-x86_64")].toObject();
+            e[key] = value;
+            platforms[QStringLiteral("linux-x86_64")] = e;
+            return with(QStringLiteral("platforms"), platforms);
+        };
+        QVERIFY(!parse(with(QStringLiteral("version"), QStringLiteral("0.1.0; rm -rf ~"))));
+        QVERIFY(!parse(with(QStringLiteral("protocol"), 0)));
+        QVERIFY(!parse(with(QStringLiteral("baseUrl"), QStringLiteral("http://example.org/x/"))));
+        QVERIFY(!parse(with(QStringLiteral("baseUrl"), QStringLiteral("https://example.org/x"))));
+        QVERIFY(!parse(with(QStringLiteral("baseUrl"), QStringLiteral("file:///tmp/x/"))));
+        QVERIFY(parse(with(QStringLiteral("baseUrl"), QStringLiteral("file:///tmp/x/")), true));
+        QVERIFY(!parse(withEntry(QStringLiteral("sha256"), QStringLiteral("ABC"))));
+        QVERIFY(!parse(withEntry(QStringLiteral("programSha256"), QString(64, QLatin1Char('A')))));
+        QVERIFY(!parse(withEntry(QStringLiteral("archive"), QStringLiteral("../evil.tar.gz"))));
+        QVERIFY(!parse(withEntry(QStringLiteral("program"), QStringLiteral("sh"))));
+        QVERIFY(!parse(withEntry(QStringLiteral("programSize"), 0)));
+        QJsonObject badPlatform = pin;
+        badPlatform[QStringLiteral("platforms")] = QJsonObject{{QStringLiteral("linux-x86_64;id"), entry(QStringLiteral("kate-code-helper-linux-x86_64.tar.gz"), QStringLiteral("kate-code-helper"))}};
+        QVERIFY(!parse(badPlatform));
+        // Kate Code's own pin parses, or is the placeholder.
+        QFile own(QStringLiteral(KATECODE_SOURCE_DIR "/src/acp/remote-helper-pin.json"));
+        QVERIFY(own.open(QIODevice::ReadOnly));
+        const QJsonObject ownPin = QJsonDocument::fromJson(own.readAll()).object();
+        QCOMPARE(ownPin[QStringLiteral("name")].toString(), QStringLiteral("kate-code-helper"));
+        QCOMPARE(parse(ownPin).has_value(), !ownPin[QStringLiteral("platforms")].toObject().isEmpty());
+    }
+
+    // The helper's launch and install scripts, run as ssh would run them
+    // (the login shell gets sshHelperCommand()'s remote command): a missing
+    // copy asks for an install (exit 97), the installed one is exec'd with
+    // stdin/stdout passed on, a tampered one is reinstalled; nothing else
+    // is left in the helper's directory.
+    void remoteHelperLaunch()
+    {
+        const QString tar = QStandardPaths::findExecutable(QStringLiteral("tar"));
+        if (tar.isEmpty()) {
+            QSKIP("tar not found");
+        }
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString home = dir.path() + QStringLiteral("/my home");
+        QVERIFY(QDir().mkpath(home));
+        // A stand-in helper: echoes its input.
+        const QByteArray program = "#!/bin/sh\necho hello\ncat\n";
+        const QString src = dir.path() + QStringLiteral("/src");
+        QVERIFY(QDir().mkpath(src));
+        QFile file(src + QStringLiteral("/kate-code-helper"));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(program);
+        file.close();
+        const QString archive = dir.path() + QStringLiteral("/helper.tar.gz");
+        QCOMPARE(QProcess::execute(tar, {QStringLiteral("-czf"), archive, QStringLiteral("-C"), src, QStringLiteral("kate-code-helper")}), 0);
+        const QString emptyArchive = dir.path() + QStringLiteral("/empty.tar.gz");
+        QCOMPARE(QProcess::execute(tar, {QStringLiteral("-czf"), emptyArchive, QStringLiteral("-C"), dir.path(), QStringLiteral("my home")}), 0);
+
+        // Every POSIX platform the script knows points at the stand-in, so
+        // the test runs on any host.
+        RemoteHelperPin pin;
+        pin.version = QStringLiteral("0.1.0");
+        pin.protocol = 1;
+        const QString digest = QString::fromLatin1(QCryptographicHash::hash(program, QCryptographicHash::Sha256).toHex());
+        for (const QString &platform : {QStringLiteral("linux-x86_64"), QStringLiteral("linux-aarch64"), QStringLiteral("linux-x86"), QStringLiteral("linux-arm"),
+                                        QStringLiteral("darwin-x86_64"), QStringLiteral("darwin-aarch64")}) {
+            pin.builds << RemoteHelperBuild{platform, QString(), QString(), 0, QStringLiteral("kate-code-helper"), digest, program.size()};
+        }
+        const Location location{QStringLiteral("sftp"), QStringLiteral("h"), QStringLiteral("/home/me/proj")};
+        const QStringList launchCommand = sshHelperCommand(location, {QStringLiteral("ssh")}, pin);
+        QVERIFY(launchCommand.contains(QStringLiteral("ServerAliveInterval=15")));
+        const QString launch = launchCommand.last();
+        QVERIFY(!launch.mid(18, launch.size() - 19).contains(QLatin1Char('\''))); // inside "exec /bin/sh -c '...'"
+
+        const auto shellRun = [&](const QString &shell, const QString &command, const QString &stdinFile, QByteArray *out) {
+            QProcessEnvironment env;
+            env.insert(QStringLiteral("SHELL"), shell);
+            env.insert(QStringLiteral("HOME"), home);
+            env.insert(QStringLiteral("PATH"), QStringLiteral("/usr/bin:/bin"));
+            QProcess process;
+            process.setProcessEnvironment(env);
+            process.setStandardInputFile(stdinFile.isEmpty() ? QProcess::nullDevice() : stdinFile);
+            process.start(shell, {QStringLiteral("-c"), command});
+            process.waitForFinished();
+            *out = process.readAllStandardOutput();
+            return process.exitCode();
+        };
+        const QString input = dir.path() + QStringLiteral("/input");
+        QFile inputFile(input);
+        QVERIFY(inputFile.open(QIODevice::WriteOnly));
+        inputFile.write("request\n");
+        inputFile.close();
+
+        int shells = 0;
+        for (const QString &loginShell : {QStringLiteral("sh"), QStringLiteral("bash"), QStringLiteral("zsh"), QStringLiteral("fish")}) {
+            const QString shell = QStandardPaths::findExecutable(loginShell);
+            if (shell.isEmpty()) {
+                continue;
+            }
+            ++shells;
+            QDir(home + QStringLiteral("/.local")).removeRecursively();
+            QByteArray out;
+            QCOMPARE(shellRun(shell, launch, {}, &out), RemoteHelperInstallNeeded);
+            const QRegularExpression installLine(QStringLiteral("^kate-code-helper: install (linux|darwin)-[a-z0-9_]+\\n$"));
+            QVERIFY2(installLine.match(QString::fromLatin1(out)).hasMatch(), out.constData());
+            const QString platform = QString::fromLatin1(out).trimmed().section(QLatin1Char(' '), 2);
+            const RemoteHelperBuild *build = pin.build(platform);
+            QVERIFY(build);
+            const QString install = sshScriptCommand(location, {QStringLiteral("ssh")}, remoteHelperInstallScript(false, pin.version, *build)).last();
+            QCOMPARE(shellRun(shell, install, emptyArchive, &out), 3);
+            QCOMPARE(shellRun(shell, launch, {}, &out), RemoteHelperInstallNeeded);
+            QCOMPARE(shellRun(shell, install, archive, &out), 0);
+            QCOMPARE(out, QByteArray("installed\n"));
+            const QString installed = home + QStringLiteral("/.local/share/kate-code/helper/0.1.0/") + platform + QStringLiteral("/kate-code-helper");
+            QVERIFY(QFileInfo(installed).isExecutable());
+            // Run, with stdin and stdout passed through.
+            QCOMPARE(shellRun(shell, launch, input, &out), 0);
+            QCOMPARE(out, QByteArray("hello\nrequest\n"));
+            // Same size, other contents: reinstalled, unless the host has no
+            // SHA-256 tool (here it has).
+            QFile tampered(installed);
+            QVERIFY(tampered.open(QIODevice::ReadWrite));
+            tampered.write("#!/bin/sh\necho owned\n#");
+            tampered.close();
+            QCOMPARE(QFileInfo(installed).size(), qint64(program.size()));
+            QCOMPARE(shellRun(shell, launch, input, &out), RemoteHelperInstallNeeded);
+            QCOMPARE(shellRun(shell, install, archive, &out), 0);
+            QCOMPARE(shellRun(shell, launch, input, &out), 0);
+            QCOMPARE(out, QByteArray("hello\nrequest\n"));
+            const QStringList left = QDir(home + QStringLiteral("/.local/share/kate-code/helper/0.1.0/") + platform)
+                                         .entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot);
+            QCOMPARE(left, QStringList{QStringLiteral("kate-code-helper")});
+        }
+        QVERIFY(shells > 0);
+
+        // A platform not pinned: unsupported, not an install.
+        RemoteHelperPin windowsOnly = pin;
+        windowsOnly.builds = {RemoteHelperBuild{QStringLiteral("windows-x86_64"), QString(), QString(), 0, QStringLiteral("kate-code-helper.exe"), digest, 10}};
+        QByteArray out;
+        QCOMPARE(shellRun(QStringLiteral("/bin/sh"), sshHelperCommand(location, {QStringLiteral("ssh")}, windowsOnly).last(), {}, &out), RemoteHelperUnsupported);
+        QVERIFY(out.startsWith("kate-code-helper: unsupported "));
+        // Invalid input makes no script.
+        QVERIFY(remoteHelperInstallScript(false, QStringLiteral("1.0\"; id"), pin.builds.first()).isEmpty());
+        QVERIFY(remoteHelperInstallScript(true, pin.version, pin.builds.first()).isEmpty()); // a POSIX build on Windows
+        RemoteHelperPin badPin = pin;
+        badPin.builds.first().platform = QStringLiteral("linux-$(id)");
+        QVERIFY(remoteHelperLaunchScript(false, badPin).isEmpty());
+    }
+
+    void windowsHelperScripts()
+    {
+        RemoteHelperPin pin;
+        pin.version = QStringLiteral("0.1.0");
+        pin.protocol = 1;
+        pin.builds << RemoteHelperBuild{QStringLiteral("windows-x86_64"), QString(), QString(), 0, QStringLiteral("kate-code-helper.exe"), QString(64, QLatin1Char('c')), 1234}
+                   << RemoteHelperBuild{QStringLiteral("linux-x86_64"), QString(), QString(), 0, QStringLiteral("kate-code-helper"), QString(64, QLatin1Char('d')), 99};
+        const QStringList command = sshHelperCommand(Location{QStringLiteral("sftp"), QStringLiteral("me@win"), QStringLiteral("/C:/Users/me/proj")}, {QStringLiteral("ssh")}, pin);
+        const QString prefix = QStringLiteral("powershell -NoLogo -NoProfile -NonInteractive -EncodedCommand ");
+        QVERIFY(command.last().startsWith(prefix));
+        QVERIFY2(command.last().size() < 7000, qPrintable(QString::number(command.last().size())));
+        const QByteArray utf16 = QByteArray::fromBase64(command.last().mid(prefix.size()).toLatin1());
+        QString script;
+        for (qsizetype i = 0; i + 1 < utf16.size(); i += 2) {
+            script += QChar(char16_t(uchar(utf16.at(i)) | (uchar(utf16.at(i + 1)) << 8)));
+        }
+        QCOMPARE(script, remoteHelperLaunchScript(true, pin));
+        QVERIFY(script.contains(QStringLiteral("$t=@{'windows-x86_64'=@('%1',1234)}").arg(QString(64, QLatin1Char('c')))));
+        QVERIFY(script.contains(QStringLiteral("('kate-code\\helper\\0.1.0\\'+$q+'\\kate-code-helper.exe')")));
+        QVERIFY(script.contains(QStringLiteral("$i.FileName=$f\n")));
+        QVERIFY(!script.contains(QStringLiteral("linux-x86_64")));
+        const QString install = remoteHelperInstallScript(true, pin.version, pin.builds.first());
+        QVERIFY(install.contains(QStringLiteral("'kate-code\\helper\\0.1.0\\windows-x86_64'")));
+        QVERIFY(install.contains(QStringLiteral("Move-Item -LiteralPath $s -Destination (Join-Path $d 'kate-code-helper.exe') -Force")));
     }
 
     void windowsArguments_data()

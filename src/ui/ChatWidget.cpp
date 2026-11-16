@@ -581,6 +581,7 @@ void ChatWidget::startNewSession(bool resetView, const QString &root)
     prepareAgentLocation(projectRoot, sysMsg);
     m_chatWebView->addMessage(sysMsg);
 
+    m_session->setRemoteHelperEnabled(!m_settingsStore || m_settingsStore->remoteHelperEnabled());
     m_session->start(projectRoot);
 }
 
@@ -757,6 +758,7 @@ void ChatWidget::resumeSession(const QString &sessionId, const QString &projectR
     prepareAgentLocation(projectRoot, sysMsg);
     m_chatWebView->addMessage(sysMsg);
 
+    m_session->setRemoteHelperEnabled(!m_settingsStore || m_settingsStore->remoteHelperEnabled());
     m_session->start(projectRoot);
 }
 
