@@ -69,7 +69,8 @@ Kate Code does not use the helper yet). After the release workflow has run:
 downloads the release (`gh release download`), hashes each archive itself,
 checks it against `manifest.json` and `SHA256SUMS` and that it holds only
 the program, and writes the pin (version, protocol, download URL, per
-platform the archive, SHA-256, size and program). Review the diff and
+platform the archive, SHA-256, size and program, and the program's own
+SHA-256 and size, to check a copy installed on a host). Review the diff and
 commit it. A release asset replaced later no longer matches, so the helper
 a Kate Code build installs is exactly the one pinned in its source, and the
 helper is only as trusted as that source. The release job runs the same

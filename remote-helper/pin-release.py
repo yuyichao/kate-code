@@ -11,7 +11,8 @@ Downloads the release remote-helper-v<version> (gh release download), hashes
 every archive itself, checks it against manifest.json and SHA256SUMS and
 checks that each archive holds exactly the program, then writes the pin:
 the version, protocol, download URL and each platform's archive with its
-SHA-256 and size. Kate Code installs only archives matching its pin, so a
+SHA-256 and size, and the program's own SHA-256 and size (to check a copy
+installed on a host). Kate Code installs only archives matching its pin, so a
 release asset replaced later is refused; a new helper release takes a new
 pin (a reviewed commit).
 """
@@ -54,15 +55,25 @@ def sha256_file(path):
 
 
 def check_archive(path, program):
-    """The archive holds exactly one regular file, the program."""
+    """The archive holds exactly one regular file, the program: its SHA-256
+    and size (read from the archive, never unpacked to disk)."""
     try:
         with tarfile.open(path, "r:gz") as tar:
             members = tar.getmembers()
+            names = [m.name for m in members]
+            if len(members) != 1 or members[0].name != program or not members[0].isfile():
+                fail("%s: expected only the file %s, found %s" % (os.path.basename(path), program, names))
+            digest = hashlib.sha256()
+            size = 0
+            f = tar.extractfile(members[0])
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+                size += len(block)
     except (tarfile.TarError, OSError, EOFError) as e:
         fail("%s: not a readable .tar.gz: %s" % (os.path.basename(path), e))
-    names = [m.name for m in members]
-    if len(members) != 1 or members[0].name != program or not members[0].isfile():
-        fail("%s: expected only the file %s, found %s" % (os.path.basename(path), program, names))
+    if size != members[0].size:
+        fail("%s: %s is truncated" % (os.path.basename(path), program))
+    return digest.hexdigest(), size
 
 
 def download(repo, tag, directory):
@@ -123,14 +134,15 @@ def build_pin(version, repo, tag, directory):
                 fail("%s: %s was not downloaded" % (platform, archive))
             digest = sha256_file(path)
             size = os.path.getsize(path)
-            check_archive(path, program)
+            program_digest, program_size = check_archive(path, program)
             if sums and sums.get(archive) != digest:
                 fail("%s: SHA-256 differs from SHA256SUMS" % archive)
-            checked[archive] = (digest, size)
-        digest, size = checked[archive]
+            checked[archive] = (digest, size, program_digest, program_size)
+        digest, size, program_digest, program_size = checked[archive]
         if entry.get("sha256") != digest or entry.get("size") != size:
             fail("%s: %s does not match manifest.json (sha256 %s, size %d)" % (platform, archive, digest, size))
-        pinned[platform] = {"archive": archive, "sha256": digest, "size": size, "program": program}
+        pinned[platform] = {"archive": archive, "sha256": digest, "size": size, "program": program,
+                            "programSha256": program_digest, "programSize": program_size}
 
     return {
         "name": NAME,
