@@ -676,6 +676,105 @@ private Q_SLOTS:
         QVERIFY(shells > 0);
     }
 
+    void npmPackageSpecs()
+    {
+        QCOMPARE(parseNpmPackageSpec(QStringLiteral("@google/gemini-cli@0.68.0")), std::make_optional(std::make_pair(QStringLiteral("@google/gemini-cli"), QStringLiteral("0.68.0"))));
+        QCOMPARE(parseNpmPackageSpec(QStringLiteral("pi-acp@0.0.34")), std::make_optional(std::make_pair(QStringLiteral("pi-acp"), QStringLiteral("0.0.34"))));
+        QCOMPARE(parseNpmPackageSpec(QStringLiteral("a@1.0.0-beta.2+b")), std::make_optional(std::make_pair(QStringLiteral("a"), QStringLiteral("1.0.0-beta.2+b"))));
+        for (const char *bad : {"pi-acp", "pi-acp@latest", "pi-acp@^1.0.0", "pi-acp@1.0", "@scope@1.0.0", "Upper@1.0.0", "-x@1.0.0",
+                                "a/b@1.0.0", "git+https://x/y@1.0.0", "a@1.0.0 && rm", "a@1.0.0\"", "../a@1.0.0", "@s/../a@1.0.0"}) {
+            QVERIFY2(!parseNpmPackageSpec(QString::fromLatin1(bad)), bad);
+        }
+        const NpmAgentPackage good{QStringLiteral("gemini"), QStringLiteral("0.68.0"), QStringLiteral("@google/gemini-cli"), QStringLiteral("0.68.0"), QStringLiteral("gemini")};
+        QVERIFY(isValidNpmAgentPackage(good));
+        QVERIFY(!npmAgentInstallScript(good).contains(QLatin1Char('\'')));
+        QVERIFY(!npmAgentInstallScript(good).contains(QLatin1Char('\\')));
+        NpmAgentPackage bad = good;
+        bad.name = QStringLiteral("a b");
+        QVERIFY(!isValidNpmAgentPackage(bad));
+        QVERIFY(npmAgentInstallScript(bad).isEmpty());
+        bad = good;
+        bad.package = QStringLiteral("@google/gemini-cli\"");
+        QVERIFY(!isValidNpmAgentPackage(bad));
+    }
+
+    void npmAgentInstall()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString home = dir.path() + QStringLiteral("/my home");
+        const QString bin = dir.path() + QStringLiteral("/fake-bin");
+        QVERIFY(QDir().mkpath(home));
+        QVERIFY(QDir().mkpath(bin));
+        // npm as far as the script uses it: install --prefix <dir> ...
+        // <package>@<version> puts the package and its program (a relative
+        // link in node_modules/.bin, as npm makes it) there.
+        QFile npm(bin + QStringLiteral("/npm"));
+        QVERIFY(npm.open(QIODevice::WriteOnly));
+        npm.write("#!/bin/sh\n"
+                  "test \"$1\" = install || exit 9\n"
+                  "test \"$2\" = --prefix || exit 9\n"
+                  "prefix=$3; for a in \"$@\"; do spec=$a; done\n"
+                  "test -n \"$FAKE_NPM_FAIL\" && { echo \"npm ERR! 404\" >&2; exit 1; }\n"
+                  "pkg=${spec%@*}; ver=${spec##*@}\n"
+                  "echo \"added 1 package\"\n"
+                  "mkdir -p \"$prefix/node_modules/$pkg\" \"$prefix/node_modules/.bin\"\n"
+                  "printf \"#!/bin/sh\\necho $pkg $ver\\n\" > \"$prefix/node_modules/$pkg/cli.js\"\n"
+                  "chmod +x \"$prefix/node_modules/$pkg/cli.js\"\n"
+                  "ln -s \"../$pkg/cli.js\" \"$prefix/node_modules/.bin/${FAKE_NPM_BIN:-gemini}\"\n");
+        npm.close();
+        npm.setPermissions(QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        const auto run = [&](const QString &script, QByteArray *out, const QString &fail = QString()) {
+            QProcessEnvironment env;
+            env.insert(QStringLiteral("HOME"), home);
+            env.insert(QStringLiteral("PATH"), bin + QStringLiteral(":/usr/bin:/bin"));
+            if (!fail.isEmpty()) {
+                env.insert(QStringLiteral("FAKE_NPM_FAIL"), fail);
+            }
+            QProcess process;
+            process.setProcessEnvironment(env);
+            process.setStandardInputFile(QProcess::nullDevice());
+            // As AgentInstaller runs it on this computer.
+            process.start(QStringLiteral("/bin/sh"), {QStringLiteral("-c"), script});
+            process.waitForFinished();
+            *out = process.readAllStandardOutput();
+            return process.exitCode();
+        };
+        const QString base = home + QStringLiteral("/.local/share/kate-code");
+        NpmAgentPackage package{QStringLiteral("gemini"), QStringLiteral("0.68.0"), QStringLiteral("@google/gemini-cli"), QStringLiteral("0.68.0"), QStringLiteral("gemini")};
+        QByteArray out;
+        QCOMPARE(run(npmAgentInstallScript(package), &out), 0);
+        // npm's own output is not on stdout.
+        QCOMPARE(out, QByteArray("installed\n"));
+        QCOMPARE(QFile::symLinkTarget(base + QStringLiteral("/bin/gemini")).isEmpty(), false);
+        QCOMPARE(QFileInfo(base + QStringLiteral("/bin/gemini")).symLinkTarget(),
+                 base + QStringLiteral("/agents/gemini/0.68.0/node_modules/.bin/gemini"));
+        QProcess program;
+        program.start(base + QStringLiteral("/bin/gemini"), {});
+        QVERIFY(program.waitForFinished());
+        QCOMPARE(program.readAllStandardOutput(), QByteArray("@google/gemini-cli 0.68.0\n"));
+
+        // A newer version replaces it; a package without the program and a
+        // failing npm leave the installed one.
+        package.version = package.packageVersion = QStringLiteral("0.69.0");
+        QCOMPARE(run(npmAgentInstallScript(package), &out), 0);
+        program.start(base + QStringLiteral("/bin/gemini"), {});
+        QVERIFY(program.waitForFinished());
+        QCOMPARE(program.readAllStandardOutput(), QByteArray("@google/gemini-cli 0.69.0\n"));
+        NpmAgentPackage other = package;
+        other.version = other.packageVersion = QStringLiteral("0.70.0");
+        other.name = QStringLiteral("gemini-cli");
+        QCOMPARE(run(npmAgentInstallScript(other), &out), 3);
+        QCOMPARE(run(npmAgentInstallScript(other), &out, QStringLiteral("1")), 1);
+        QVERIFY(!QFileInfo::exists(base + QStringLiteral("/bin/gemini-cli")));
+        QVERIFY(!QFileInfo::exists(base + QStringLiteral("/agents/gemini/0.70.0")));
+        program.start(base + QStringLiteral("/bin/gemini"), {});
+        QVERIFY(program.waitForFinished());
+        QCOMPARE(program.readAllStandardOutput(), QByteArray("@google/gemini-cli 0.69.0\n"));
+        // No temporary directories left.
+        QCOMPARE(QDir(base).entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot), (QStringList{QStringLiteral("agents"), QStringLiteral("bin")}));
+    }
+
     void windowsAgentInstall()
     {
         const RemoteAgentPackage package{QStringLiteral("goose"), QStringLiteral("1.59.0"), QStringLiteral("./goose-package\\goose.exe"), QStringLiteral("goose")};

@@ -7,8 +7,11 @@
 //   DISCONNECTED <n> the agent exited
 //   MISSING          remoteAgentMissing()
 // acpdriver --install <folder> <registry entry JSON file> <program>
-// runs RemoteAgentInstaller instead:
+// runs AgentInstaller instead (an empty folder: on this computer):
+//   CANINSTALL <0|1> (remote), CANINSTALLLOCALLY <0|1> <reason>,
 //   PROGRESS <text>, then FINISHED <0|1> <message>
+// acpdriver --find <program>
+//   FOUND <path> (AgentInstaller::findLocalExecutable(), empty if none)
 // acpdriver --helper <folder> <pin JSON file> <file>
 // runs RemoteHelper (kate-code-helper on the host; file:// downloads):
 //   PROGRESS <text>, READY, DIGEST <hex> (file's), WATCHING (file is
@@ -19,7 +22,7 @@
 // empty line: none) and prints REPORTED; silent only calls mountRoot() (as
 // an older Remote Projects plugin) and prints CONNECTED
 #include "ACPService.h"
-#include "RemoteAgentInstaller.h"
+#include "AgentInstaller.h"
 #include "RemoteHelper.h"
 
 #include <QDir>
@@ -73,21 +76,30 @@ int main(int argc, char **argv)
         if (!entry.open(QIODevice::ReadOnly)) {
             return 2;
         }
-        RemoteAgentInstaller installer(QJsonDocument::fromJson(entry.readAll()).object(), args.at(2), args.at(4));
+        AgentInstaller installer(QJsonDocument::fromJson(entry.readAll()).object(), args.at(2), args.at(4));
         installer.setAllowFileUrls(true);
         if (qEnvironmentVariableIsSet("ACPDRIVER_DOWNLOADS")) {
             installer.setDownloadDirectory(qEnvironmentVariable("ACPDRIVER_DOWNLOADS"));
         }
-        out(QStringLiteral("CANINSTALL %1").arg(RemoteAgentInstaller::canInstall(QJsonDocument::fromJson((entry.seek(0), entry.readAll())).object(), args.at(4)) ? 1 : 0));
-        QObject::connect(&installer, &RemoteAgentInstaller::progress, [](const QString &text) {
+        entry.seek(0);
+        const QJsonObject agent = QJsonDocument::fromJson(entry.readAll()).object();
+        out(QStringLiteral("CANINSTALL %1").arg(AgentInstaller::canInstall(agent, args.at(4)) ? 1 : 0));
+        QString reason;
+        const bool local = AgentInstaller::canInstallLocally(agent, args.at(4), &reason);
+        out(QStringLiteral("CANINSTALLLOCALLY %1 %2").arg(local ? 1 : 0).arg(reason));
+        QObject::connect(&installer, &AgentInstaller::progress, [](const QString &text) {
             out(QStringLiteral("PROGRESS ") + text);
         });
-        QObject::connect(&installer, &RemoteAgentInstaller::finished, [](bool ok, const QString &message) {
+        QObject::connect(&installer, &AgentInstaller::finished, [](bool ok, const QString &message) {
             out(QStringLiteral("FINISHED %1 %2").arg(ok ? 1 : 0).arg(QString(message).replace(QLatin1Char('\n'), QLatin1String(" | "))));
             QCoreApplication::exit(ok ? 0 : 1);
         });
-        QTimer::singleShot(0, &installer, &RemoteAgentInstaller::start);
+        QTimer::singleShot(0, &installer, &AgentInstaller::start);
         return app.exec();
+    }
+    if (args.size() == 3 && args.at(1) == QLatin1String("--find")) {
+        out(QStringLiteral("FOUND ") + AgentInstaller::findLocalExecutable(args.at(2)));
+        return 0;
     }
     if (args.size() == 5 && args.at(1) == QLatin1String("--helper")) {
         QFile pinFile(args.at(3));

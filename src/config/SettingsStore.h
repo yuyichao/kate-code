@@ -91,6 +91,12 @@ public:
     void updateCustomProvider(const QString &id, const ACPProvider &provider);
     void removeCustomProvider(const QString &id);
     void setProviderOrder(const QStringList &providerIds);
+    // Agents were installed or removed outside the settings (AgentInstaller):
+    // settingsChanged(), so chats list what is installed now.
+    void notifyAgentsChanged()
+    {
+        Q_EMIT settingsChanged();
+    }
 
     // Check if an executable can be found on PATH or common directories
     static bool isExecutableAvailable(const QString &executable);

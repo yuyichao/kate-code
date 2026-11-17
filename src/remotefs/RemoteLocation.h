@@ -174,6 +174,28 @@ std::optional<RemotePlatform> parseRemotePlatform(const QString &output);
 // The script installing package from a .tar.gz on its stdin; prints
 // "installed" at the end. Exit 3: cmd is not in the archive.
 QString remoteAgentInstallScript(bool windows, const RemoteAgentPackage &package);
+// Agents the registry runs with npx, installed by Kate Code on this
+// computer: `npm install` of the registry's exact version into
+// ~/.local/share/kate-code/agents/<id>/<version> (node_modules), run
+// through the symlink ~/.local/share/kate-code/bin/<name> to the package's
+// program in node_modules/.bin.
+struct NpmAgentPackage {
+    QString id; // registry id
+    QString version; // the registry's version of the agent (the directory)
+    QString package; // npm package name ("@scope/name" or "name")
+    QString packageVersion; // its exact version
+    QString name; // what the provider runs (the package's program)
+};
+// The registry's npx "package" ("@scope/name@1.2.3", "name@1.2.3") as
+// package and version; nullopt without an exact version or when the name is
+// not a plain npm package name (no URLs, paths, tags or ranges).
+std::optional<std::pair<QString, QString>> parseNpmPackageSpec(const QString &spec);
+bool isValidNpmAgentPackage(const NpmAgentPackage &package);
+// The POSIX script installing package with npm; prints "installed" at the
+// end. Exit 3: the package has no program 'name'. Same rules as
+// remoteAgentInstallScript() (one line, no single quotes or backslashes).
+QString npmAgentInstallScript(const NpmAgentPackage &package);
+
 // The command line (program first) running script on location's host
 // through `ssh -T`: POSIX hosts "/bin/sh -c" (the script must be one line
 // without single quotes or backslashes: any login shell passes it on),

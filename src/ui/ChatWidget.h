@@ -9,7 +9,7 @@
 #include <QWidget>
 #include <functional>
 
-class RemoteAgentInstaller;
+class AgentInstaller;
 
 namespace KTextEditor {
 class Document;
@@ -296,10 +296,10 @@ private:
     bool m_shutdownDone = false;
 
     QPointer<EditorSession> m_editorSession;
-    // Installing the agent on a remote host (RemoteAgentInstaller): offered
+    // Installing the agent on a remote host (AgentInstaller): offered
     // when the remote agent was not found (exit 127) and the provider's
     // registry entry has a build that runs its executable.
-    QPointer<RemoteAgentInstaller> m_agentInstaller;
+    QPointer<AgentInstaller> m_agentInstaller;
     QString m_agentInstallProviderId; // the provider it installs for
     bool m_remoteAgentMissing = false;
     QString m_installedAgentHost; // where this chat installed it (no second offer)
@@ -312,6 +312,10 @@ private:
     // choosing one here also makes it the default for new chats, but never
     // changes another chat's provider.
     QString m_providerId;
+    // m_providerId stands in for the default for new chats, which is not
+    // installed on this computer (populateProviderCombo()): a chat that
+    // turns out to run on a remote host uses the default again.
+    bool m_providerIsFallback = false;
     ACPProvider currentProvider() const;
 
     // @-completion file list. Large trees are scanned on worker threads so

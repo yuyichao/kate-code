@@ -760,7 +760,7 @@ def test_remote_agent():
 
 
 def run_install(entry, program, authority="goodhost", path="/data/sub"):
-    """acpdriver --install (RemoteAgentInstaller) with the registry entry;
+    """acpdriver --install (AgentInstaller) with the registry entry;
     returns (exit code, output)."""
     entry_file = os.path.join(TMP, "registry-entry.json")
     with open(entry_file, "w") as f:
@@ -844,6 +844,90 @@ def test_remote_agent_install():
 
     code, output = run_install(entry(tgz_path, "3.0"), "fake-installed", authority="badagent")
     check(code != 0 and "ssh to badagent failed" in output, f"ssh failures reported: {output}")
+
+
+def test_local_agent_install():
+    print("installing an agent from the ACP registry on this computer")
+    import hashlib
+    import zipfile
+    machine = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(os.uname().machine)
+    if not machine:
+        print("  (skipped: unknown machine)")
+        return
+    musl = any(os.path.exists(p) for p in __import__("glob").glob("/lib/ld-musl-*"))
+    platform = f"linux-{machine}" + ("-musl" if musl else "")
+    home = os.path.join(TMP, "local-home")
+    os.makedirs(home, exist_ok=True)
+    fake_bin = os.path.join(TMP, "local-fake-bin")
+    os.makedirs(fake_bin, exist_ok=True)
+    os.makedirs(os.path.join(TMP, "local-empty-bin"), exist_ok=True)
+    # npm as the install script uses it (see RemoteLocationTest).
+    with open(os.path.join(fake_bin, "npm"), "w") as f:
+        f.write("#!/bin/sh\n"
+                "prefix=$3; for a in \"$@\"; do spec=$a; done\n"
+                "pkg=${spec%@*}; ver=${spec##*@}\n"
+                "mkdir -p \"$prefix/node_modules/$pkg\" \"$prefix/node_modules/.bin\"\n"
+                "printf \"#!/bin/sh\\necho $pkg $ver\\n\" > \"$prefix/node_modules/$pkg/cli.js\"\n"
+                "chmod +x \"$prefix/node_modules/$pkg/cli.js\"\n"
+                "ln -s \"../$pkg/cli.js\" \"$prefix/node_modules/.bin/npm-agent\"\n")
+    os.chmod(os.path.join(fake_bin, "npm"), 0o755)
+    archive = os.path.join(TMP, "local-agent.zip")
+    with zipfile.ZipFile(archive, "w") as z:
+        info = zipfile.ZipInfo("pkg/local-agent")
+        info.external_attr = 0o755 << 16
+        z.writestr(info, "#!/bin/sh\necho binary agent\n")
+    with open(archive, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+
+    def run(entry, program, with_npm=True):
+        entry_file = os.path.join(TMP, "local-entry.json")
+        with open(entry_file, "w") as f:
+            json.dump(entry, f)
+        e = env()
+        e["HOME"] = home
+        e["ACPDRIVER_DOWNLOADS"] = os.path.join(TMP, "agent-downloads")
+        # Without npm: nothing (the real npm must never run here).
+        e["PATH"] = fake_bin + ":/usr/bin:/bin" if with_npm else os.path.join(TMP, "local-empty-bin")
+        result = subprocess.run([ACPDRIVER, "--install", "", entry_file, program], env=e, capture_output=True, text=True, timeout=60)
+        found = subprocess.run([ACPDRIVER, "--find", program], env=e, capture_output=True, text=True, timeout=60).stdout
+        return result.returncode, result.stdout + result.stderr, found.strip()
+
+    base = os.path.join(home, ".local", "share", "kate-code")
+    binary = {"id": "local-agent", "name": "Local Agent", "version": "1.0",
+              "distribution": {"binary": {platform: {"archive": "file://" + archive, "cmd": "./pkg/local-agent", "sha256": digest}}}}
+    code, output, found = run(binary, "local-agent")
+    check(code == 0 and "CANINSTALLLOCALLY 1" in output and "FINISHED 1 Installed Local Agent 1.0 on this computer" in output,
+          f"binary build installed here: {output}")
+    check(found == "FOUND " + os.path.join(base, "bin", "local-agent"), f"found in Kate Code's bin directory: {found}")
+    check(subprocess.run([os.path.join(base, "bin", "local-agent")], capture_output=True, text=True).stdout == "binary agent\n",
+          "the installed program runs")
+
+    wrong = dict(binary, distribution={"binary": {platform: {"archive": "file://" + archive, "cmd": "./pkg/local-agent", "sha256": "0" * 64}}})
+    code, output, found = run(dict(wrong, id="other-agent"), "local-agent")
+    check(code != 0 and "SHA-256" in output, f"a wrong SHA-256 is refused here too: {output}")
+
+    npm = {"id": "npm-agent", "name": "Npm Agent", "version": "2.0",
+           "distribution": {"npx": {"package": "@scope/npm-agent@2.0.1", "args": ["--acp"]}}}
+    code, output, found = run(npm, "npm-agent", with_npm=False)
+    check(code != 0 and "CANINSTALLLOCALLY 0 Installing Npm Agent needs npm" in output, f"without npm: {output}")
+    check(found == "FOUND", f"nothing installed: {found}")
+    code, output, found = run(npm, "npm-agent")
+    check(code == 0 and "CANINSTALL 0" in output and "CANINSTALLLOCALLY 1" in output and "with npm (@scope/npm-agent@2.0.1)" in output
+          and "FINISHED 1" in output, f"npx agent installed with npm: {output}")
+    check(found == "FOUND " + os.path.join(base, "bin", "npm-agent"), f"found: {found}")
+    check(subprocess.run([os.path.join(base, "bin", "npm-agent")], capture_output=True, text=True).stdout == "@scope/npm-agent 2.0.1\n",
+          "the npm package's program runs")
+    code, output, found = run(dict(npm, id="npm-other"), "other-name")
+    check(code != 0 and "has no program other-name" in output, f"a package without the program: {output}")
+    # A binary build for another platform only: npm instead.
+    both = dict(npm, id="both-agent", distribution=dict(npm["distribution"], binary={"linux-riscv64": binary["distribution"]["binary"][platform]}))
+    code, output, found = run(both, "npm-agent")
+    check(code == 0 and "with npm" in output, f"npm when no build fits this computer: {output}")
+    uvx = {"id": "uv-agent", "name": "Uv Agent", "version": "1", "distribution": {"uvx": {"package": "uv-agent==1"}}}
+    code, output, found = run(uvx, "uvx")
+    check("CANINSTALLLOCALLY 0 Uv Agent runs with uvx" in output and "FINISHED 0 Uv Agent runs with uvx" in output,
+          f"uvx agents are not installed: {output}")
+    check(sorted(os.listdir(base)) == ["agents", "bin"], f"no temporary files left: {os.listdir(base)}")
 
 
 def run_helper(pin, path="/data/sub", file="helper.txt", change=None):
@@ -1496,7 +1580,7 @@ def main():
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_kde_passwords, test_remote_agent, test_remote_agent_install, test_remote_helper, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_remote_agent, test_remote_agent_install, test_local_agent_install, test_remote_helper, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_restart, test_shutdown_and_restart):
             try:
                 test()

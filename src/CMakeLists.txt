@@ -2,6 +2,9 @@ add_definitions(-DTRANSLATION_DOMAIN=\"katecode\")
 
 add_subdirectory(remotefs)
 add_subdirectory(remoteprojects)
+if(BUILD_TESTING)
+    add_subdirectory(autotests)
+endif()
 
 set(katecode_SRCS
     # Plugin layer
@@ -13,7 +16,7 @@ set(katecode_SRCS
     acp/ACPSession.cpp
     acp/ACPSessionDeleter.cpp
     acp/RateLimits.cpp
-    acp/RemoteAgentInstaller.cpp
+    acp/AgentInstaller.cpp
     acp/RemoteHelper.cpp
     acp/TerminalManager.cpp
 

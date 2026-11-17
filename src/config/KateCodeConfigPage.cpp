@@ -1,5 +1,6 @@
 #include "KateCodeConfigPage.h"
 #include "SettingsStore.h"
+#include "../acp/AgentInstaller.h"
 #include "../util/AgentIcons.h"
 
 #include <KLocalizedString>
@@ -23,6 +24,11 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QProgressDialog>
+#include <QSysInfo>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSignalBlocker>
@@ -180,19 +186,28 @@ void KateCodeConfigPage::setupGeneralTab(QWidget *tab)
     m_removeProviderButton = new QPushButton(i18n("Remove"), tab);
     m_moveProviderUpButton = new QPushButton(i18n("Move Up"), tab);
     m_moveProviderDownButton = new QPushButton(i18n("Move Down"), tab);
+    m_addFromRegistryButton = new QPushButton(i18n("Add from Registry..."), tab);
+    m_addFromRegistryButton->setToolTip(i18n("Add an agent listed in the ACP registry (agentclientprotocol.com)"));
+    m_installProviderButton = new QPushButton(i18n("Install..."), tab);
+    m_installProviderButton->setToolTip(i18n("Install the selected agent on this computer from the ACP registry"));
+    m_installProviderButton->setEnabled(false);
     m_editProviderButton->setEnabled(false);
     m_removeProviderButton->setEnabled(false);
     m_moveProviderUpButton->setEnabled(false);
     m_moveProviderDownButton->setEnabled(false);
     buttonLayout->addWidget(m_addProviderButton);
+    buttonLayout->addWidget(m_addFromRegistryButton);
     buttonLayout->addWidget(m_editProviderButton);
     buttonLayout->addWidget(m_removeProviderButton);
     buttonLayout->addWidget(m_moveProviderUpButton);
     buttonLayout->addWidget(m_moveProviderDownButton);
+    buttonLayout->addWidget(m_installProviderButton);
     buttonLayout->addStretch();
     providerLayout->addLayout(buttonLayout);
 
     connect(m_addProviderButton, &QPushButton::clicked, this, &KateCodeConfigPage::onAddProvider);
+    connect(m_addFromRegistryButton, &QPushButton::clicked, this, &KateCodeConfigPage::onAddFromRegistry);
+    connect(m_installProviderButton, &QPushButton::clicked, this, &KateCodeConfigPage::onInstallProvider);
     connect(m_editProviderButton, &QPushButton::clicked, this, &KateCodeConfigPage::onEditProvider);
     connect(m_removeProviderButton, &QPushButton::clicked, this, &KateCodeConfigPage::onRemoveProvider);
     connect(m_moveProviderUpButton, &QPushButton::clicked, this, &KateCodeConfigPage::onMoveProviderUp);
@@ -208,7 +223,7 @@ void KateCodeConfigPage::setupGeneralTab(QWidget *tab)
         updateProviderButtons();
     });
 
-    auto *providerNote = new QLabel(i18n("Drag providers to set their order; only descriptions are shown here. Edit a provider to see its full launch, MCP, resume, and ACP session configuration. At least one provider must remain."), tab);
+    auto *providerNote = new QLabel(i18n("Drag providers to set their order; only descriptions are shown here. Edit a provider to see its full launch, MCP, resume, and ACP session configuration. At least one provider must remain. Agents that are not installed on this computer are not offered in chats (except for remote folders); Install... installs them from the ACP registry."), tab);
     providerNote->setWordWrap(true);
     providerNote->setStyleSheet(QStringLiteral("color: gray; font-size: small;"));
     providerLayout->addWidget(providerNote);
@@ -386,8 +401,12 @@ void KateCodeConfigPage::populateProviderList()
     m_providerList->clear();
     const auto providerList = m_settings->providers();
     for (const auto &p : providerList) {
-        auto *item = new QListWidgetItem(m_settings->agentIcons()->iconFor(p), p.description, m_providerList);
+        const bool installed = SettingsStore::isExecutableAvailable(p.executable);
+        auto *item = new QListWidgetItem(m_settings->agentIcons()->iconFor(p),
+                                         installed ? p.description : i18n("%1 (not installed)", p.description),
+                                         m_providerList);
         item->setData(Qt::UserRole, p.id);
+        item->setData(Qt::UserRole + 1, installed);
         item->setToolTip(providerToolTip(p));
         if (p.id == selectedId) {
             m_providerList->setCurrentItem(item);
@@ -614,6 +633,7 @@ void KateCodeConfigPage::updateProviderButtons()
     m_removeProviderButton->setEnabled(hasSelection && m_providerList->count() > 1);
     m_moveProviderUpButton->setEnabled(hasSelection && row > 0);
     m_moveProviderDownButton->setEnabled(hasSelection && row < m_providerList->count() - 1);
+    m_installProviderButton->setEnabled(hasSelection && !m_installer && !m_providerList->currentItem()->data(Qt::UserRole + 1).toBool());
 }
 
 void KateCodeConfigPage::saveProviderOrder()
@@ -624,6 +644,340 @@ void KateCodeConfigPage::saveProviderOrder()
         ids.append(m_providerList->item(row)->data(Qt::UserRole).toString());
     }
     m_settings->setProviderOrder(ids);
+}
+
+// An argument for ACPProvider::options (split by QProcess::splitCommand()).
+static QString commandArgument(QString arg)
+{
+    static const QRegularExpression special(QStringLiteral("[\\s\"]"));
+    if (!arg.isEmpty() && !arg.contains(special)) {
+        return arg;
+    }
+    // Inside quotes, a literal quote is three quotes.
+    return QLatin1Char('"') + arg.replace(QLatin1Char('"'), QStringLiteral("\"\"\"")) + QLatin1Char('"');
+}
+
+static QString commandOptions(const QStringList &args)
+{
+    QStringList quoted;
+    for (const QString &arg : args) {
+        quoted.append(commandArgument(arg));
+    }
+    return quoted.join(QLatin1Char(' '));
+}
+
+static QStringList stringList(const QJsonValue &value)
+{
+    QStringList list;
+    for (const QJsonValue &item : value.toArray()) {
+        list.append(item.toString());
+    }
+    return list;
+}
+
+// The registry's build for this computer ("linux-x86_64", "darwin-aarch64";
+// the program name is the same in every build of an agent, so a near miss
+// such as musl does not matter here).
+static QJsonObject localBinaryBuild(const QJsonObject &builds)
+{
+    QString arch = QSysInfo::currentCpuArchitecture();
+    if (arch == QLatin1String("arm64")) {
+        arch = QStringLiteral("aarch64");
+    }
+    const QString key = QSysInfo::kernelType() + QLatin1Char('-') + arch;
+    if (builds.contains(key)) {
+        return builds.value(key).toObject();
+    }
+    return builds.isEmpty() ? QJsonObject() : builds.begin().value().toObject();
+}
+
+bool KateCodeConfigPage::pickRegistryAgent(QJsonObject *agent)
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle(i18n("Add Agent from the ACP Registry"));
+    dialog.resize(640, 520);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *filter = new QLineEdit(&dialog);
+    filter->setPlaceholderText(i18n("Search"));
+    filter->setClearButtonEnabled(true);
+    layout->addWidget(filter);
+    auto *list = new QListWidget(&dialog);
+    layout->addWidget(list, 1);
+    auto *status = new QLabel(&dialog);
+    status->setWordWrap(true);
+    layout->addWidget(status);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText(i18n("Add"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    AgentIcons *icons = m_settings->agentIcons();
+    auto fill = [this, list, status, icons]() {
+        QSet<QString> added;
+        for (const ACPProvider &provider : m_settings->providers()) {
+            added.insert(provider.registryId.trimmed());
+        }
+        auto agents = icons->registryAgents();
+        std::sort(agents.begin(), agents.end(), [](const auto &a, const auto &b) {
+            return a.second.compare(b.second, Qt::CaseInsensitive) < 0;
+        });
+        list->clear();
+        for (const auto &[id, name] : agents) {
+            const QJsonObject entry = icons->registryEntry(id);
+            ACPProvider forIcon;
+            forIcon.registryId = id;
+            const bool isAdded = added.contains(id);
+            auto *item = new QListWidgetItem(icons->iconFor(forIcon),
+                                             isAdded ? i18n("%1 %2 (added)", name, entry.value(QStringLiteral("version")).toString())
+                                                     : i18n("%1 %2", name, entry.value(QStringLiteral("version")).toString()),
+                                             list);
+            item->setData(Qt::UserRole, id);
+            QStringList tip{entry.value(QStringLiteral("description")).toString()};
+            tip << i18n("Runs as: %1", entry.value(QStringLiteral("distribution")).toObject().keys().join(QStringLiteral(", ")));
+            if (const QString license = entry.value(QStringLiteral("license")).toString(); !license.isEmpty()) {
+                tip << i18n("License: %1", license);
+            }
+            if (const QString repository = entry.value(QStringLiteral("repository")).toString(); !repository.isEmpty()) {
+                tip << i18n("Repository: %1", repository);
+            }
+            item->setToolTip(tip.join(QLatin1Char('\n')));
+            if (isAdded) {
+                item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+            }
+        }
+        status->setText(agents.isEmpty() ? i18n("Loading the ACP registry…")
+                                         : i18n("%1 agents. Agents already added are greyed out; hover over an agent for details.", agents.size()));
+    };
+    fill();
+    // Without a cached registry the list fills in once it is fetched;
+    // logos arrive one by one.
+    connect(icons, &AgentIcons::iconsChanged, &dialog, [list, fill, icons]() {
+        if (list->count() == 0) {
+            fill();
+            return;
+        }
+        for (int row = 0; row < list->count(); ++row) {
+            ACPProvider forIcon;
+            forIcon.registryId = list->item(row)->data(Qt::UserRole).toString();
+            list->item(row)->setIcon(icons->iconFor(forIcon));
+        }
+    });
+    connect(filter, &QLineEdit::textChanged, &dialog, [list](const QString &text) {
+        for (int row = 0; row < list->count(); ++row) {
+            QListWidgetItem *item = list->item(row);
+            item->setHidden(!text.isEmpty() && !item->text().contains(text, Qt::CaseInsensitive)
+                            && !item->toolTip().contains(text, Qt::CaseInsensitive));
+        }
+    });
+    auto updateOk = [list, buttons]() {
+        QListWidgetItem *item = list->currentItem();
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(item && (item->flags() & Qt::ItemIsEnabled) && !item->isHidden());
+    };
+    connect(list, &QListWidget::currentItemChanged, &dialog, updateOk);
+    connect(list, &QListWidget::itemDoubleClicked, &dialog, [&dialog](QListWidgetItem *item) {
+        if (item->flags() & Qt::ItemIsEnabled) {
+            dialog.accept();
+        }
+    });
+    updateOk();
+    if (dialog.exec() != QDialog::Accepted || !list->currentItem()) {
+        return false;
+    }
+    *agent = icons->registryEntry(list->currentItem()->data(Qt::UserRole).toString());
+    return !agent->isEmpty();
+}
+
+void KateCodeConfigPage::onAddFromRegistry()
+{
+    QJsonObject agent;
+    if (pickRegistryAgent(&agent)) {
+        addRegistryAgent(agent);
+    }
+}
+
+void KateCodeConfigPage::addRegistryAgent(const QJsonObject &agent)
+{
+    const QString name = agent.value(QStringLiteral("name")).toString(agent.value(QStringLiteral("id")).toString());
+    const QJsonObject distribution = agent.value(QStringLiteral("distribution")).toObject();
+    // A binary build: its program (the same name on every platform), which
+    // the install puts into Kate Code's bin directory.
+    if (const QJsonObject builds = distribution.value(QStringLiteral("binary")).toObject(); !builds.isEmpty()) {
+        const QJsonObject build = localBinaryBuild(builds);
+        QString cmd = build.value(QStringLiteral("cmd")).toString();
+        cmd.replace(QLatin1Char('\\'), QLatin1Char('/'));
+        QString program = QFileInfo(cmd).fileName();
+        if (program.endsWith(QLatin1String(".exe"), Qt::CaseInsensitive)) {
+            program.chop(4);
+        }
+        if (!program.isEmpty()) {
+            finishAddingRegistryAgent(agent, program, stringList(build.value(QStringLiteral("args"))));
+            return;
+        }
+    }
+    // npx: the package's program, from npm's metadata of that version (the
+    // name npx would run).
+    if (const QJsonObject npx = distribution.value(QStringLiteral("npx")).toObject(); !npx.isEmpty()) {
+        const auto spec = KateRemote::parseNpmPackageSpec(npx.value(QStringLiteral("package")).toString());
+        if (!spec) {
+            QMessageBox::warning(this, i18n("Add Agent"), i18n("The ACP registry gives no exact npm package version for %1.", name));
+            return;
+        }
+        if (!m_network) {
+            m_network = new QNetworkAccessManager(this);
+        }
+        QNetworkRequest request(QUrl(QStringLiteral("https://registry.npmjs.org/%1/%2").arg(spec->first, spec->second)));
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
+        request.setTransferTimeout(30000);
+        QNetworkReply *reply = m_network->get(request);
+        auto *progress = new QProgressDialog(i18n("Looking up the npm package %1…", spec->first), i18n("Cancel"), 0, 0, this);
+        progress->setWindowTitle(i18n("Add Agent"));
+        progress->setAttribute(Qt::WA_DeleteOnClose);
+        connect(progress, &QProgressDialog::canceled, reply, &QNetworkReply::abort);
+        progress->open();
+        const QStringList args = stringList(npx.value(QStringLiteral("args")));
+        const QString package = spec->first;
+        connect(reply, &QNetworkReply::finished, this, [this, reply, progress, agent, args, package, name]() {
+            reply->deleteLater();
+            const bool canceled = progress->wasCanceled();
+            progress->close();
+            if (canceled) {
+                return;
+            }
+            const QJsonObject metadata = QJsonDocument::fromJson(reply->readAll()).object();
+            // npm's rule: a single program, or the one named after the
+            // package (without its scope).
+            const QString unscoped = package.mid(package.lastIndexOf(QLatin1Char('/')) + 1);
+            const QJsonValue bin = metadata.value(QStringLiteral("bin"));
+            QString program;
+            if (bin.isString()) {
+                program = unscoped;
+            } else if (const QJsonObject bins = bin.toObject(); bins.size() == 1) {
+                program = bins.begin().key();
+            } else if (bins.contains(unscoped)) {
+                program = unscoped;
+            }
+            if (reply->error() != QNetworkReply::NoError || program.isEmpty()) {
+                QMessageBox::warning(this,
+                                     i18n("Add Agent"),
+                                     reply->error() != QNetworkReply::NoError
+                                         ? i18n("Cannot look up the npm package %1: %2", package, reply->errorString())
+                                         : i18n("The npm package %1 has no program that npx would run.", package));
+                return;
+            }
+            finishAddingRegistryAgent(agent, program, args);
+        });
+        return;
+    }
+    // uvx: run through uv (nothing to install here).
+    if (const QJsonObject uvx = distribution.value(QStringLiteral("uvx")).toObject(); !uvx.isEmpty()) {
+        finishAddingRegistryAgent(agent,
+                                  QStringLiteral("uvx"),
+                                  QStringList{uvx.value(QStringLiteral("package")).toString()} + stringList(uvx.value(QStringLiteral("args"))));
+        return;
+    }
+    QMessageBox::warning(this, i18n("Add Agent"), i18n("The ACP registry does not say how to run %1.", name));
+}
+
+void KateCodeConfigPage::finishAddingRegistryAgent(const QJsonObject &agent, const QString &program, const QStringList &args)
+{
+    ACPProvider provider;
+    provider.id = QStringLiteral("custom-%1").arg(QDateTime::currentMSecsSinceEpoch());
+    provider.description = agent.value(QStringLiteral("name")).toString(agent.value(QStringLiteral("id")).toString());
+    provider.executable = program;
+    provider.options = commandOptions(args);
+    provider.registryId = agent.value(QStringLiteral("id")).toString();
+    // Added first: declining or a failed install leaves it there, with the
+    // Install button.
+    m_settings->addCustomProvider(provider);
+    populateProviderList();
+    for (int row = 0; row < m_providerList->count(); ++row) {
+        if (m_providerList->item(row)->data(Qt::UserRole).toString() == provider.id) {
+            m_providerList->setCurrentRow(row);
+            break;
+        }
+    }
+    if (!SettingsStore::isExecutableAvailable(provider.executable)) {
+        installProvider(provider.id, true);
+    }
+}
+
+void KateCodeConfigPage::onInstallProvider()
+{
+    if (QListWidgetItem *item = m_providerList->currentItem()) {
+        installProvider(item->data(Qt::UserRole).toString(), false);
+    }
+}
+
+void KateCodeConfigPage::installProvider(const QString &providerId, bool offer)
+{
+    if (m_installer) {
+        return;
+    }
+    const ACPProvider provider = m_settings->providerById(providerId);
+    const QString registryId = provider.registryId.trimmed();
+    const QJsonObject agent = registryId.isEmpty() ? QJsonObject() : m_settings->agentIcons()->registryEntry(registryId);
+    QString reason;
+    if (registryId.isEmpty()) {
+        reason = i18n("%1 has no ACP registry id: set one (Edit...) to install it from the registry.", provider.description);
+    } else if (agent.isEmpty()) {
+        reason = i18n("The ACP registry has no agent %1 (or it could not be fetched yet).", registryId);
+    } else {
+        AgentInstaller::canInstallLocally(agent, provider.executable, &reason);
+    }
+    if (!reason.isEmpty()) {
+        if (offer) {
+            QMessageBox::information(this, i18n("Agent Added"), i18n("%1 was added but is not installed on this computer.\n\n%2", provider.description, reason));
+        } else {
+            QMessageBox::warning(this, i18n("Install Agent"), reason);
+        }
+        return;
+    }
+    QString question = AgentInstaller::localInstallQuestion(agent, provider.executable);
+    if (offer) {
+        question = i18n("%1 was added. It is not installed on this computer.", provider.description) + QStringLiteral("\n\n") + question
+            + QStringLiteral("\n\n") + i18n("If you do not install it now, Install... in the settings does it later.");
+    }
+    if (QMessageBox::question(this, i18n("Install Agent"), question, QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes) != QMessageBox::Yes) {
+        return;
+    }
+
+    m_installer = new AgentInstaller(agent, QString(), provider.executable, this);
+    auto *progress = new QProgressDialog(i18n("Installing %1…", provider.description), i18n("Cancel"), 0, 0, this);
+    m_installProgress = progress;
+    progress->setWindowTitle(i18n("Install Agent"));
+    progress->setMinimumWidth(480);
+    progress->setAttribute(Qt::WA_DeleteOnClose);
+    connect(progress, &QProgressDialog::canceled, this, [this]() {
+        if (m_installer) {
+            m_installer->cancel();
+            m_installer->deleteLater();
+            m_installer = nullptr;
+        }
+        updateProviderButtons();
+    });
+    connect(m_installer, &AgentInstaller::progress, progress, &QProgressDialog::setLabelText);
+    connect(m_installer, &AgentInstaller::finished, this, [this, installer = m_installer.data()](bool ok, const QString &message) {
+        installer->deleteLater();
+        m_installer = nullptr;
+        if (m_installProgress) {
+            // Not "canceled": the install is over.
+            m_installProgress->disconnect(this);
+            m_installProgress->close();
+        }
+        populateProviderList();
+        updateProviderButtons();
+        // Chats list the agents installed here.
+        m_settings->notifyAgentsChanged();
+        if (ok) {
+            QMessageBox::information(this, i18n("Install Agent"), message);
+        } else {
+            QMessageBox::warning(this, i18n("Install Agent"), message);
+        }
+    });
+    updateProviderButtons();
+    progress->open();
+    m_installer->start();
 }
 
 bool KateCodeConfigPage::editProviderDialog(ACPProvider &provider, const QString &title)

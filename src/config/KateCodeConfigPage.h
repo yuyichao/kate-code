@@ -2,6 +2,12 @@
 
 #include <KTextEditor/ConfigPage>
 
+#include <QJsonObject>
+#include <QPointer>
+
+class AgentInstaller;
+class QNetworkAccessManager;
+class QProgressDialog;
 class SettingsStore;
 struct ACPProvider;
 class QLineEdit;
@@ -41,6 +47,8 @@ private Q_SLOTS:
     void onRemoveProvider();
     void onMoveProviderUp();
     void onMoveProviderDown();
+    void onAddFromRegistry();
+    void onInstallProvider();
 
 private:
     void setupUi();
@@ -52,6 +60,15 @@ private:
     ACPProvider providerForItem(const QListWidgetItem *item) const;
     void updateProviderButtons();
     void saveProviderOrder();
+    // The ACP registry's agents to choose from; false when cancelled.
+    bool pickRegistryAgent(QJsonObject *agent);
+    // Adds agent as a provider (its npm program looked up first when it
+    // runs with npx), then offers to install it when it is not installed.
+    void addRegistryAgent(const QJsonObject &agent);
+    void finishAddingRegistryAgent(const QJsonObject &agent, const QString &program, const QStringList &args);
+    // Installs the provider's agent on this computer after asking (offer:
+    // asked right after adding it; otherwise from the Install button).
+    void installProvider(const QString &providerId, bool offer);
 
     SettingsStore *m_settings;
 
@@ -65,6 +82,11 @@ private:
     QPushButton *m_removeProviderButton;
     QPushButton *m_moveProviderUpButton;
     QPushButton *m_moveProviderDownButton;
+    QPushButton *m_addFromRegistryButton;
+    QPushButton *m_installProviderButton;
+    QPointer<AgentInstaller> m_installer;
+    QPointer<QProgressDialog> m_installProgress;
+    QNetworkAccessManager *m_network = nullptr;
 
     // General tab - Diff colors section
     QComboBox *m_diffColorSchemeCombo;

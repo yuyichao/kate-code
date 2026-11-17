@@ -3,7 +3,7 @@
     SPDX-FileCopyrightText: 2026 Kate Code contributors
 */
 
-#include "RemoteAgentInstaller.h"
+#include "AgentInstaller.h"
 
 #include "ACPService.h"
 
@@ -14,6 +14,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -23,9 +24,14 @@
 #include <QStandardPaths>
 #include <QTemporaryFile>
 #include <QThread>
+#include <QTimer>
 #include <QUuid>
 
 #include <memory>
+
+#include <csignal>
+#include <sys/types.h>
+#include <unistd.h>
 
 namespace
 {
@@ -171,25 +177,29 @@ QString sha256Of(const QString &path)
 }
 }
 
-RemoteAgentInstaller::RemoteAgentInstaller(const QJsonObject &agent, const QString &workingDir, const QString &program, QObject *parent)
+AgentInstaller::AgentInstaller(const QJsonObject &agent, const QString &workingDir, const QString &program, QObject *parent)
     : QObject(parent)
     , m_agent(agent)
     , m_workingDir(workingDir)
     , m_program(program)
     , m_downloadDir(QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation) + QStringLiteral("/kate-code/agent-downloads"))
 {
+    m_local = workingDir.isEmpty();
+    if (m_local) {
+        return;
+    }
     m_location = KateRemote::locationForPath(workingDir, KateRemote::configuredMountRoot());
     if (m_location) {
         m_windows = !KateRemote::windowsPathForSftpPath(m_location->path).isEmpty();
     }
 }
 
-RemoteAgentInstaller::~RemoteAgentInstaller()
+AgentInstaller::~AgentInstaller()
 {
     cancel();
 }
 
-bool RemoteAgentInstaller::canInstall(const QJsonObject &agent, const QString &program)
+bool AgentInstaller::canInstall(const QJsonObject &agent, const QString &program)
 {
     const QJsonObject builds = agent.value(QStringLiteral("distribution")).toObject().value(QStringLiteral("binary")).toObject();
     const QString name = programName(program);
@@ -205,28 +215,156 @@ bool RemoteAgentInstaller::canInstall(const QJsonObject &agent, const QString &p
     return false;
 }
 
-void RemoteAgentInstaller::setDownloadDirectory(const QString &directory)
+// The registry's npx package of agent ("@scope/name@1.2.3"), if any.
+static QString npxPackage(const QJsonObject &agent)
+{
+    return agent.value(QStringLiteral("distribution")).toObject().value(QStringLiteral("npx")).toObject().value(QStringLiteral("package")).toString();
+}
+
+bool AgentInstaller::canInstallLocally(const QJsonObject &agent, const QString &program, QString *reason)
+{
+    const auto no = [reason](const QString &why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+    const QString name = agent.value(QStringLiteral("name")).toString(agent.value(QStringLiteral("id")).toString());
+    if (program.isEmpty() || QFileInfo(program).isAbsolute()) {
+        return no(QStringLiteral("Only agents run by a program name (not a path) can be installed."));
+    }
+    if (canInstall(agent, program)) {
+        return true;
+    }
+    const QJsonObject distribution = agent.value(QStringLiteral("distribution")).toObject();
+    if (distribution.contains(QStringLiteral("npx"))) {
+        if (!KateRemote::parseNpmPackageSpec(npxPackage(agent))) {
+            return no(QStringLiteral("The ACP registry gives no exact npm package version for %1.").arg(name));
+        }
+        if (QStandardPaths::findExecutable(QStringLiteral("npm")).isEmpty()) {
+            return no(QStringLiteral("Installing %1 needs npm (Node.js), which is not installed.").arg(name));
+        }
+        return true;
+    }
+    if (distribution.contains(QStringLiteral("binary"))) {
+        return no(QStringLiteral("The ACP registry has no build of %1 that runs %2.").arg(name, program));
+    }
+    if (distribution.contains(QStringLiteral("uvx"))) {
+        return no(QStringLiteral("%1 runs with uvx (uv): install uv, or the agent with uv.").arg(name));
+    }
+    return no(QStringLiteral("The ACP registry has no build of %1 that Kate Code can install.").arg(name));
+}
+
+QString AgentInstaller::localInstallQuestion(const QJsonObject &agent, const QString &program)
+{
+    const QString name = agent.value(QStringLiteral("name")).toString(agent.value(QStringLiteral("id")).toString());
+    const QString version = agent.value(QStringLiteral("version")).toString();
+    QString text;
+    const bool binary = canInstall(agent, program);
+    const QString package = npxPackage(agent);
+    if (binary) {
+        text = QStringLiteral("Download %1 %2 from the ACP registry (agentclientprotocol.com) and install it on this computer?\n\n"
+                              "The build for this computer's platform is checked against the registry's SHA-256 and unpacked "
+                              "into Kate Code's own folder (~/.local/share/kate-code), where Kate Code finds it after the "
+                              "agents you installed yourself.")
+                   .arg(name, version);
+        if (!package.isEmpty()) {
+            text += QStringLiteral(" Without such a build, the npm package %1 is installed instead.").arg(package);
+        }
+    } else {
+        text = QStringLiteral("Install %1 %2 from npm (package %3, as listed in the ACP registry) on this computer?\n\n"
+                              "npm installs it into Kate Code's own folder (~/.local/share/kate-code), where Kate Code finds it "
+                              "after the agents you installed yourself; npm checks the package, Kate Code has no hash of its own "
+                              "for it. Running it needs Node.js.")
+                   .arg(name, version, package);
+    }
+    QStringList authors;
+    for (const QJsonValue &author : agent.value(QStringLiteral("authors")).toArray()) {
+        authors << author.toString();
+    }
+    if (!authors.isEmpty()) {
+        text += QStringLiteral("\n\nAuthors: %1").arg(authors.join(QStringLiteral(", ")));
+    }
+    if (const QString license = agent.value(QStringLiteral("license")).toString(); !license.isEmpty()) {
+        text += QStringLiteral("\nLicense: %1").arg(license);
+    }
+    if (const QString repository = agent.value(QStringLiteral("repository")).toString(); !repository.isEmpty()) {
+        text += QStringLiteral("\nRepository: %1").arg(repository);
+    }
+    return text;
+}
+
+QString AgentInstaller::localAgentsDirectory()
+{
+    // The literal path the install scripts use ($HOME, not XDG_DATA_HOME):
+    // the same on hosts, where sshAgentCommand() searches it.
+    return QDir::homePath() + QStringLiteral("/.local/share/kate-code/agents");
+}
+
+QString AgentInstaller::localBinDirectory()
+{
+    return QDir::homePath() + QStringLiteral("/.local/share/kate-code/bin");
+}
+
+QString AgentInstaller::findLocalExecutable(const QString &executable)
+{
+    if (executable.isEmpty()) {
+        return {};
+    }
+    if (QFileInfo(executable).isAbsolute()) {
+        return QFileInfo::exists(executable) ? executable : QString();
+    }
+    if (const QString found = QStandardPaths::findExecutable(executable); !found.isEmpty()) {
+        return found;
+    }
+    const QString home = QDir::homePath();
+    return QStandardPaths::findExecutable(executable,
+                                          {home + QStringLiteral("/.local/bin"),
+                                           home + QStringLiteral("/bin"),
+                                           home + QStringLiteral("/.cargo/bin"),
+                                           localBinDirectory()});
+}
+
+QString AgentInstaller::where() const
+{
+    return m_local ? QStringLiteral("this computer") : m_location->authority;
+}
+
+void AgentInstaller::setDownloadDirectory(const QString &directory)
 {
     m_downloadDir = directory;
 }
 
-void RemoteAgentInstaller::setAllowFileUrls(bool allow)
+void AgentInstaller::setAllowFileUrls(bool allow)
 {
     m_allowFileUrls = allow;
 }
 
-QString RemoteAgentInstaller::agentName() const
+QString AgentInstaller::agentName() const
 {
     return m_agent.value(QStringLiteral("name")).toString(m_agent.value(QStringLiteral("id")).toString());
 }
 
-QString RemoteAgentInstaller::host() const
+QString AgentInstaller::host() const
 {
     return m_location ? m_location->authority : QString();
 }
 
-void RemoteAgentInstaller::start()
+void AgentInstaller::start()
 {
+    if (m_local) {
+        if (QString reason; !canInstallLocally(m_agent, m_program, &reason)) {
+            fail(reason);
+            return;
+        }
+        // Without a binary build running the program: npm.
+        if (canInstall(m_agent, m_program)) {
+            probePlatform();
+        } else {
+            installWithNpm();
+        }
+        return;
+    }
     if (!m_location || !KateRemote::isSshScheme(m_location->scheme)) {
         fail(QStringLiteral("%1 is not a folder on an ssh host.").arg(m_workingDir));
         return;
@@ -234,7 +372,7 @@ void RemoteAgentInstaller::start()
     probePlatform();
 }
 
-void RemoteAgentInstaller::cancel()
+void AgentInstaller::cancel()
 {
     m_done = true;
     if (m_reply) {
@@ -243,8 +381,31 @@ void RemoteAgentInstaller::cancel()
     if (m_process) {
         // May be called from the process's own signal handlers.
         m_process->disconnect(this);
-        m_process->kill();
-        m_process->deleteLater();
+        if (m_local && m_process->state() != QProcess::NotRunning) {
+            // The script's process group (npm, tar...): TERM ends them all
+            // and lets the script's traps remove its temporary directory, so
+            // the process object stays (no SIGKILL from its destructor)
+            // until it ends; SIGKILL after 10 s.
+            QProcess *process = m_process;
+            const qint64 pid = process->processId();
+            process->setParent(nullptr);
+            connect(process, &QProcess::finished, process, &QObject::deleteLater);
+            if (pid > 0) {
+                ::kill(-pid_t(pid), SIGTERM);
+                QTimer::singleShot(10000, process, [process, pid] {
+                    if (process->state() != QProcess::NotRunning) {
+                        ::kill(-pid_t(pid), SIGKILL);
+                    }
+                    process->deleteLater();
+                });
+            } else {
+                process->kill();
+                process->deleteLater();
+            }
+        } else {
+            m_process->kill();
+            m_process->deleteLater();
+        }
         m_process = nullptr;
     }
     delete m_downloadFile; // QSaveFile: discarded without commit()
@@ -258,7 +419,7 @@ void RemoteAgentInstaller::cancel()
     }
 }
 
-void RemoteAgentInstaller::fail(const QString &message)
+void AgentInstaller::fail(const QString &message)
 {
     if (m_done) {
         return;
@@ -267,7 +428,7 @@ void RemoteAgentInstaller::fail(const QString &message)
     Q_EMIT finished(false, message);
 }
 
-void RemoteAgentInstaller::succeed(const QString &message)
+void AgentInstaller::succeed(const QString &message)
 {
     if (m_done) {
         return;
@@ -276,7 +437,7 @@ void RemoteAgentInstaller::succeed(const QString &message)
     Q_EMIT finished(true, message);
 }
 
-void RemoteAgentInstaller::removeAskpassState()
+void AgentInstaller::removeAskpassState()
 {
     if (!m_askpassState.isEmpty()) {
         QFile::remove(m_askpassState);
@@ -284,26 +445,43 @@ void RemoteAgentInstaller::removeAskpassState()
     }
 }
 
-void RemoteAgentInstaller::runScript(const QString &script, const QString &stdinFile, std::function<void(int, const QByteArray &, const QByteArray &)> done)
+void AgentInstaller::runScript(const QString &script, const QString &stdinFile, std::function<void(int, const QByteArray &, const QByteArray &)> done)
 {
-    const QStringList command = KateRemote::sshScriptCommand(*m_location, KateRemote::configuredSshCommand(), script);
-    if (command.isEmpty()) {
-        fail(QStringLiteral("Cannot run commands on %1 through ssh.").arg(m_location->authority));
-        return;
-    }
-    removeAskpassState();
-    // Like the agent's ssh (ACPService::start()): passwords from KDE's
-    // cache, else a dialog.
+    QStringList command;
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    const QString state = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/kate-code-askpass-")
-        + QUuid::createUuid().toString(QUuid::Id128);
-    if (KateRemote::setSshAskpassEnvironment(env, ACPService::remoteFsAskpassProgram(), m_location->authority, state)) {
-        m_askpassState = state;
+    removeAskpassState();
+    if (m_local) {
+        if (!script.isEmpty()) {
+            command = QStringList{QStringLiteral("/bin/sh"), QStringLiteral("-c"), script};
+        }
+    } else {
+        command = KateRemote::sshScriptCommand(*m_location, KateRemote::configuredSshCommand(), script);
+        if (command.isEmpty()) {
+            fail(QStringLiteral("Cannot run commands on %1 through ssh.").arg(m_location->authority));
+            return;
+        }
+        // Like the agent's ssh (ACPService::start()): passwords from KDE's
+        // cache, else a dialog.
+        const QString state = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/kate-code-askpass-")
+            + QUuid::createUuid().toString(QUuid::Id128);
+        if (KateRemote::setSshAskpassEnvironment(env, ACPService::remoteFsAskpassProgram(), m_location->authority, state)) {
+            m_askpassState = state;
+        }
+    }
+    if (command.isEmpty()) {
+        fail(QStringLiteral("Cannot install %1.").arg(agentName()));
+        return;
     }
     auto *process = new QProcess(this);
     m_process = process;
     process->setProcessEnvironment(env);
     process->setWorkingDirectory(QDir::homePath());
+    if (m_local) {
+        // Its own process group: cancel() ends npm and tar with it.
+        process->setChildProcessModifier([] {
+            ::setpgid(0, 0);
+        });
+    }
     if (!stdinFile.isEmpty()) {
         process->setStandardInputFile(stdinFile);
     } else {
@@ -319,7 +497,7 @@ void RemoteAgentInstaller::runScript(const QString &script, const QString &stdin
     });
     connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError error) {
         if (error == QProcess::FailedToStart) {
-            fail(QStringLiteral("Cannot start ssh: %1").arg(process->errorString()));
+            fail(QStringLiteral("Cannot start %1: %2").arg(m_local ? QStringLiteral("/bin/sh") : QStringLiteral("ssh"), process->errorString()));
         }
     });
     process->start(command.constFirst(), command.mid(1));
@@ -331,7 +509,7 @@ static QString lastLines(const QByteArray &text)
     return lines.mid(std::max<qsizetype>(0, lines.size() - 3)).join(QLatin1Char('\n')).trimmed();
 }
 
-void RemoteAgentInstaller::probePlatform()
+void AgentInstaller::probePlatform()
 {
     const QString name = programName(m_program);
     // The name goes into the scripts: validated first.
@@ -339,13 +517,15 @@ void RemoteAgentInstaller::probePlatform()
         fail(QStringLiteral("Cannot install an agent run as %1.").arg(m_program));
         return;
     }
-    Q_EMIT progress(QStringLiteral("Checking %1's platform…").arg(m_location->authority));
+    if (!m_local) {
+        Q_EMIT progress(QStringLiteral("Checking %1's platform…").arg(m_location->authority));
+    }
     runScript(KateRemote::remotePlatformScript(m_windows, name), QString(), [this, name](int exitCode, const QByteArray &out, const QByteArray &err) {
         const auto platform = KateRemote::parseRemotePlatform(QString::fromLocal8Bit(out));
         if (exitCode != 0 || !platform) {
             const QString details = lastLines(err);
-            fail(exitCode == 255 ? QStringLiteral("ssh to %1 failed.%2").arg(m_location->authority, details.isEmpty() ? QString() : QLatin1Char('\n') + details)
-                                 : QStringLiteral("Cannot tell %1's platform.%2").arg(m_location->authority, details.isEmpty() ? QString() : QLatin1Char('\n') + details));
+            fail(exitCode == 255 && !m_local ? QStringLiteral("ssh to %1 failed.%2").arg(m_location->authority, details.isEmpty() ? QString() : QLatin1Char('\n') + details)
+                                             : QStringLiteral("Cannot tell %1's platform.%2").arg(m_local ? QStringLiteral("this computer") : m_location->authority, details.isEmpty() ? QString() : QLatin1Char('\n') + details));
             return;
         }
         const QJsonObject build = m_agent.value(QStringLiteral("distribution"))
@@ -354,12 +534,17 @@ void RemoteAgentInstaller::probePlatform()
                                       .toObject()
                                       .value(platform->key)
                                       .toObject();
+        const bool npm = m_local && m_agent.value(QStringLiteral("distribution")).toObject().contains(QStringLiteral("npx"));
         if (build.isEmpty()) {
-            fail(QStringLiteral("The ACP registry has no %1 build for %2 (%3).").arg(agentName(), m_location->authority, platform->key));
+            if (npm) {
+                installWithNpm();
+                return;
+            }
+            fail(QStringLiteral("The ACP registry has no %1 build for %2 (%3).").arg(agentName(), where(), platform->key));
             return;
         }
         if (platform->installed) {
-            Q_EMIT progress(QStringLiteral("A copy Kate Code installed earlier is on %1; it is replaced.").arg(m_location->authority));
+            Q_EMIT progress(QStringLiteral("A copy Kate Code installed earlier is on %1; it is replaced.").arg(where()));
         }
         m_package.id = m_agent.value(QStringLiteral("id")).toString();
         m_package.version = m_agent.value(QStringLiteral("version")).toString();
@@ -367,6 +552,10 @@ void RemoteAgentInstaller::probePlatform()
         m_package.name = name;
         if (!KateRemote::isValidRemoteAgentPackage(m_package)
             || programName(cmdPath(m_package.cmd)).compare(name, m_windows ? Qt::CaseInsensitive : Qt::CaseSensitive) != 0) {
+            if (npm) {
+                installWithNpm();
+                return;
+            }
             fail(QStringLiteral("The ACP registry's %1 build for %2 does not run %3.").arg(agentName(), platform->key, name));
             return;
         }
@@ -374,7 +563,7 @@ void RemoteAgentInstaller::probePlatform()
     });
 }
 
-void RemoteAgentInstaller::download(const QJsonObject &build)
+void AgentInstaller::download(const QJsonObject &build)
 {
     const QUrl url(build.value(QStringLiteral("archive")).toString());
     m_expectedSha256 = build.value(QStringLiteral("sha256")).toString().toLower();
@@ -457,7 +646,7 @@ void RemoteAgentInstaller::download(const QJsonObject &build)
     });
 }
 
-void RemoteAgentInstaller::prepareArchive()
+void AgentInstaller::prepareArchive()
 {
     if (isTarGz(QFileInfo(m_archive).fileName())) {
         m_sendFile = m_archive;
@@ -466,7 +655,7 @@ void RemoteAgentInstaller::prepareArchive()
     }
     // The host gets a .tar.gz whatever the download is (zip, .tar.bz2, a
     // bare program): only tar (and gzip) are needed there.
-    Q_EMIT progress(QStringLiteral("Re-packing %1 for %2…").arg(QFileInfo(m_archive).fileName(), m_location->authority));
+    Q_EMIT progress(QStringLiteral("Re-packing %1…").arg(QFileInfo(m_archive).fileName()));
     QTemporaryFile temp(QDir::tempPath() + QStringLiteral("/kate-code-agent-XXXXXX.tar.gz"));
     temp.setAutoRemove(false);
     if (!temp.open()) {
@@ -483,7 +672,7 @@ void RemoteAgentInstaller::prepareArchive()
         *result = repack(source, cmd, target);
     });
     connect(thread, &QThread::finished, thread, &QObject::deleteLater);
-    const QPointer<RemoteAgentInstaller> self(this);
+    const QPointer<AgentInstaller> self(this);
     connect(thread, &QThread::finished, this, [self, result, target] {
         if (!self || self->m_done || self->m_tempArchive != target) {
             QFile::remove(target);
@@ -499,19 +688,55 @@ void RemoteAgentInstaller::prepareArchive()
     thread->start();
 }
 
-void RemoteAgentInstaller::install()
+void AgentInstaller::install()
 {
-    Q_EMIT progress(QStringLiteral("Installing %1 %2 on %3…").arg(agentName(), m_package.version, m_location->authority));
+    Q_EMIT progress(QStringLiteral("Installing %1 %2 on %3…").arg(agentName(), m_package.version, where()));
     runScript(KateRemote::remoteAgentInstallScript(m_windows, m_package), m_sendFile, [this](int exitCode, const QByteArray &out, const QByteArray &err) {
         if (exitCode == 0 && out.contains("installed")) {
             succeed(QStringLiteral("Installed %1 %2 on %3 (%4).")
                         .arg(agentName(),
                              m_package.version,
-                             m_location->authority,
+                             where(),
                              m_windows ? QStringLiteral("%LOCALAPPDATA%\\kate-code") : QStringLiteral("~/.local/share/kate-code")));
             return;
         }
         const QString details = lastLines(err);
-        fail(QStringLiteral("Installing on %1 failed (exit code %2).%3").arg(m_location->authority).arg(exitCode).arg(details.isEmpty() ? QString() : QLatin1Char('\n') + details));
+        fail(QStringLiteral("Installing on %1 failed (exit code %2).%3").arg(where()).arg(exitCode).arg(details.isEmpty() ? QString() : QLatin1Char('\n') + details));
+    });
+}
+
+void AgentInstaller::installWithNpm()
+{
+    const QString name = programName(m_program);
+    const auto spec = KateRemote::parseNpmPackageSpec(npxPackage(m_agent));
+    if (!spec) {
+        fail(QStringLiteral("The ACP registry gives no exact npm package version for %1.").arg(agentName()));
+        return;
+    }
+    const KateRemote::NpmAgentPackage package{m_agent.value(QStringLiteral("id")).toString(),
+                                              m_agent.value(QStringLiteral("version")).toString(),
+                                              spec->first,
+                                              spec->second,
+                                              name};
+    if (!KateRemote::isValidNpmAgentPackage(package)) {
+        fail(QStringLiteral("Cannot install %1 (npm package %2) as %3.").arg(agentName(), npxPackage(m_agent), name));
+        return;
+    }
+    if (QStandardPaths::findExecutable(QStringLiteral("npm")).isEmpty()) {
+        fail(QStringLiteral("Installing %1 needs npm (Node.js), which is not installed.").arg(agentName()));
+        return;
+    }
+    Q_EMIT progress(QStringLiteral("Installing %1 %2 with npm (%3@%4)…").arg(agentName(), package.version, package.package, package.packageVersion));
+    runScript(KateRemote::npmAgentInstallScript(package), QString(), [this, package](int exitCode, const QByteArray &out, const QByteArray &err) {
+        if (exitCode == 0 && out.contains("installed")) {
+            succeed(QStringLiteral("Installed %1 %2 on this computer (~/.local/share/kate-code).").arg(agentName(), package.version));
+            return;
+        }
+        const QString details = lastLines(err);
+        fail(exitCode == 3 ? QStringLiteral("The npm package %1 has no program %2: not installed.").arg(package.package, package.name)
+                           : QStringLiteral("npm could not install %1 (exit code %2).%3")
+                                 .arg(package.package)
+                                 .arg(exitCode)
+                                 .arg(details.isEmpty() ? QString() : QLatin1Char('\n') + details));
     });
 }

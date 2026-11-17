@@ -564,12 +564,49 @@ QString remoteAgentInstallScript(bool windows, const RemoteAgentPackage &package
     const QString cmd = agentCmdPath(package.cmd, QLatin1Char('/'));
     return QStringLiteral(
                "set -e; umask 022; b=\"$HOME/.local/share/kate-code\"; mkdir -p \"$b/agents/%1\" \"$b/bin\"; "
-               "t=$(mktemp -d \"$b/.install.XXXXXX\"); c() { rm -rf \"$t\"; }; trap c EXIT; "
+               "t=$(mktemp -d \"$b/.install.XXXXXX\"); c() { rm -rf \"$t\"; }; trap c EXIT; trap \"exit 1\" HUP INT TERM; "
                "cat > \"$t/a.tgz\"; mkdir \"$t/x\"; tar -xzf \"$t/a.tgz\" -C \"$t/x\"; "
                "if ! test -f \"$t/x/%3\"; then echo \"%3 is not in the archive\" >&2; exit 3; fi; "
                "chmod +x \"$t/x/%3\"; rm -rf \"$b/agents/%1/%2\"; mv \"$t/x\" \"$b/agents/%1/%2\"; "
                "ln -sfn \"../agents/%1/%2/%3\" \"$b/bin/%4\"; echo installed")
         .arg(package.id, package.version, cmd, package.name);
+}
+
+std::optional<std::pair<QString, QString>> parseNpmPackageSpec(const QString &spec)
+{
+    // npm's rules for new package names (lower case, URL-safe), and an exact
+    // semver version (no ranges or tags: what the registry lists).
+    static const QRegularExpression re(QStringLiteral("^((?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*)@([0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.+-]+)?)$"));
+    const QRegularExpressionMatch match = re.match(spec);
+    if (!match.hasMatch() || match.captured(1).size() > 214) {
+        return std::nullopt;
+    }
+    return std::make_pair(match.captured(1), match.captured(2));
+}
+
+bool isValidNpmAgentPackage(const NpmAgentPackage &package)
+{
+    const auto spec = parseNpmPackageSpec(package.package + QLatin1Char('@') + package.packageVersion);
+    return spec && spec->first == package.package
+        && isValidRemoteAgentPackage({package.id, package.version, QStringLiteral("./a"), package.name});
+}
+
+QString npmAgentInstallScript(const NpmAgentPackage &package)
+{
+    if (!isValidNpmAgentPackage(package)) {
+        return {};
+    }
+    // Into a fresh directory, moved into place (as remoteAgentInstallScript()).
+    // npm's output goes to stderr: stdout says "installed" only. The .bin
+    // links are relative, so moving the directory keeps them working.
+    return QStringLiteral(
+               "set -e; umask 022; b=\"$HOME/.local/share/kate-code\"; mkdir -p \"$b/agents/%1\" \"$b/bin\"; "
+               "t=$(mktemp -d \"$b/.install.XXXXXX\"); c() { rm -rf \"$t\"; }; trap c EXIT; trap \"exit 1\" HUP INT TERM; mkdir \"$t/x\"; "
+               "npm install --prefix \"$t/x\" --no-save --no-package-lock --no-fund --no-audit \"%3@%4\" >&2; "
+               "if ! test -e \"$t/x/node_modules/.bin/%5\"; then echo \"%3 has no program %5\" >&2; exit 3; fi; "
+               "rm -rf \"$b/agents/%1/%2\"; mv \"$t/x\" \"$b/agents/%1/%2\"; "
+               "ln -sfn \"../agents/%1/%2/node_modules/.bin/%5\" \"$b/bin/%5\"; echo installed")
+        .arg(package.id, package.version, package.package, package.packageVersion, package.name);
 }
 
 // script on location's host through `ssh -T` with options (see

@@ -1,5 +1,7 @@
 #include "ACPService.h"
 
+#include "AgentInstaller.h"
+
 #include "RemoteLocation.h"
 
 #include <QDBusConnection>
@@ -240,31 +242,11 @@ bool ACPService::start(const QString &workingDir)
     } else {
         m_process->setWorkingDirectory(workingDir);
 
-        // Resolve executable path - when launched from desktop environments,
-        // user-local paths like ~/.local/bin may not be on PATH
-        QString resolvedExecutable = m_executable;
-        if (!QFileInfo(resolvedExecutable).isAbsolute()) {
-            QString found = QStandardPaths::findExecutable(resolvedExecutable);
-            if (found.isEmpty()) {
-                // Fallback: check common user-local directories where curl|bash
-                // installers and package managers typically place binaries
-                const QString home = QDir::homePath();
-                const QStringList fallbackDirs = {
-                    home + QStringLiteral("/.local/bin"),
-                    home + QStringLiteral("/bin"),
-                    home + QStringLiteral("/.cargo/bin"),
-                };
-                for (const QString &dir : fallbackDirs) {
-                    QString candidate = dir + QLatin1Char('/') + resolvedExecutable;
-                    if (QFileInfo::exists(candidate)) {
-                        found = candidate;
-                        break;
-                    }
-                }
-            }
-            if (!found.isEmpty()) {
-                resolvedExecutable = found;
-            }
+        // PATH, then per-user directories desktop sessions may lack in PATH,
+        // then the agents Kate Code installed (AgentInstaller).
+        QString resolvedExecutable = AgentInstaller::findLocalExecutable(m_executable);
+        if (resolvedExecutable.isEmpty()) {
+            resolvedExecutable = m_executable;
         }
 
         qDebug() << "[ACPService] Starting process:" << resolvedExecutable << m_executableArgs;
@@ -275,7 +257,9 @@ bool ACPService::start(const QString &workingDir)
     if (!m_process->waitForStarted(5000)) {
         qDebug() << "[ACPService] Process failed to start";
         Q_EMIT errorOccurred(isRemote() ? QStringLiteral("Failed to start ssh for the agent on %1").arg(m_remoteHost)
-                                        : QStringLiteral("Failed to start %1").arg(m_executable));
+                             : AgentInstaller::findLocalExecutable(m_executable).isEmpty()
+                             ? QStringLiteral("%1 is not installed on this computer (Settings > Configure Kate > Kate Code: Install...)").arg(m_executable)
+                             : QStringLiteral("Failed to start %1").arg(m_executable));
         return false;
     }
 

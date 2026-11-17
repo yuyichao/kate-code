@@ -1,6 +1,6 @@
 #include "ChatWidget.h"
 #include <QUuid>
-#include "../acp/RemoteAgentInstaller.h"
+#include "../acp/AgentInstaller.h"
 #include "ChatWebView.h"
 #include "ChatInputWidget.h"
 #include "PermissionDialog.h"
@@ -114,7 +114,8 @@ ChatWidget::ChatWidget(QWidget *parent)
 
     // ACP Provider selector
     m_providerCombo = new QComboBox(this);
-    m_providerCombo->setToolTip(QStringLiteral("Select ACP Provider"));
+    m_providerCombo->setToolTip(QStringLiteral("Select the agent. Agents that are not installed on this computer are not listed; "
+                                               "Settings > Configure Kate > Kate Code installs them."));
     m_providerCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     headerLayout->addWidget(m_providerCombo);
     connect(m_providerCombo, &QComboBox::currentIndexChanged, this, &ChatWidget::onProviderComboChanged);
@@ -605,7 +606,7 @@ QString ChatWidget::agentInstallLabel() const
         return {};
     }
     const QJsonObject entry = m_settingsStore->agentIcons()->registryEntry(provider.registryId.trimmed());
-    if (entry.isEmpty() || !RemoteAgentInstaller::canInstall(entry, provider.executable)) {
+    if (entry.isEmpty() || !AgentInstaller::canInstall(entry, provider.executable)) {
         return {};
     }
     const QString host = ACPService::remoteHostFor(m_session->workingDir());
@@ -648,10 +649,10 @@ void ChatWidget::onAgentInstallRequested()
         return;
     }
     m_chatWebView->disableReconnectPrompts();
-    m_agentInstaller = new RemoteAgentInstaller(entry, m_session->workingDir(), provider.executable, this);
+    m_agentInstaller = new AgentInstaller(entry, m_session->workingDir(), provider.executable, this);
     m_agentInstallProviderId = m_providerId;
-    connect(m_agentInstaller, &RemoteAgentInstaller::progress, this, &ChatWidget::addSystemNote);
-    connect(m_agentInstaller, &RemoteAgentInstaller::finished, this, [this, host, installer = m_agentInstaller](bool ok, const QString &message) {
+    connect(m_agentInstaller, &AgentInstaller::progress, this, &ChatWidget::addSystemNote);
+    connect(m_agentInstaller, &AgentInstaller::finished, this, [this, host, installer = m_agentInstaller](bool ok, const QString &message) {
         installer->deleteLater();
         m_agentInstaller = nullptr;
         if (ok) {
@@ -689,6 +690,7 @@ void ChatWidget::resumeSavedSession(const QString &sessionId, const QString &pro
         && !m_settingsStore->providerById(providerId).executable.isEmpty()
         && providerId != m_providerId) {
         m_providerId = providerId;
+        m_providerIsFallback = false;
         populateProviderCombo();
         applyACPBackend();
     }
@@ -1829,7 +1831,13 @@ void ChatWidget::prepareAgentLocation(const QString &root, Message &msg)
     }
     if (m_remoteProviders != !host.isEmpty()) {
         m_remoteProviders = !host.isEmpty();
-        populateProviderCombo();
+        if (m_remoteProviders && m_providerIsFallback) {
+            m_providerId.clear();
+            populateProviderCombo();
+            applyACPBackend();
+        } else {
+            populateProviderCombo();
+        }
     }
 }
 
@@ -1844,37 +1852,48 @@ void ChatWidget::populateProviderCombo()
     m_providerCombo->clear();
 
     const auto providerList = m_settingsStore->providers();
+    // On a remote host: whether it is installed there is not known.
+    const auto available = [this](const ACPProvider &p) {
+        return m_remoteProviders || SettingsStore::isExecutableAvailable(p.executable);
+    };
     // This chat's provider; adopt the global default when it is unset or has
-    // been removed from the settings.
+    // been removed from the settings, on this computer an installed agent
+    // if the default is not installed.
     if (m_providerId.isEmpty() || m_settingsStore->providerById(m_providerId).executable.isEmpty()) {
         m_providerId = m_settingsStore->activeProviderId();
+        m_providerIsFallback = false;
+        if (!available(m_settingsStore->providerById(m_providerId))) {
+            for (const ACPProvider &p : providerList) {
+                if (available(p)) {
+                    m_providerId = p.id;
+                    m_providerIsFallback = true;
+                    break;
+                }
+            }
+        }
+        if (m_settingsStore->providerById(m_providerId).executable.isEmpty() && !providerList.isEmpty()) {
+            m_providerId = providerList.constFirst().id;
+        }
     }
-    const QString activeId = m_providerId;
     int activeIndex = 0;
 
-    for (int i = 0; i < providerList.size(); ++i) {
-        const auto &p = providerList[i];
-        // On a remote host: whether it is installed there is not known.
-        bool available = m_remoteProviders || SettingsStore::isExecutableAvailable(p.executable);
-
-        QString displayText = p.description;
-        if (!available) {
-            displayText += QStringLiteral(" (not found)");
+    for (const ACPProvider &p : providerList) {
+        const bool installed = available(p);
+        // Agents not installed here are not offered (the settings install
+        // them); this chat's own stays visible, greyed out.
+        if (!installed && p.id != m_providerId) {
+            continue;
         }
-
-        m_providerCombo->addItem(displayText, p.id);
-
-        // Gray out unavailable providers
-        if (!available) {
-            auto *model = qobject_cast<QStandardItemModel *>(m_providerCombo->model());
-            if (model) {
-                QStandardItem *item = model->item(i);
+        m_providerCombo->addItem(installed ? p.description : p.description + QStringLiteral(" (not installed)"), p.id);
+        const int row = m_providerCombo->count() - 1;
+        if (!installed) {
+            if (auto *model = qobject_cast<QStandardItemModel *>(m_providerCombo->model())) {
+                QStandardItem *item = model->item(row);
                 item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
             }
         }
-
-        if (p.id == activeId) {
-            activeIndex = i;
+        if (p.id == m_providerId) {
+            activeIndex = row;
         }
     }
 
@@ -1907,6 +1926,7 @@ void ChatWidget::onProviderComboChanged(int index)
     }
 
     m_providerId = providerId;
+    m_providerIsFallback = false;
     applyACPBackend();
     // Remember the choice as the default for new chats. This notifies every
     // chat (settingsChanged), but each keeps its own m_providerId.

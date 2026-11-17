@@ -1,5 +1,6 @@
 #include "SettingsStore.h"
 
+#include "../acp/AgentInstaller.h"
 #include "../util/AgentIcons.h"
 
 #include <QDir>
@@ -122,11 +123,28 @@ void SettingsStore::setAcpLogSubdirectory(const QString &name)
 
 QList<ACPProvider> SettingsStore::defaultProviders() const
 {
-    // Seed providers offered on first run. They are fully editable and removable
-    // afterwards, so this list is only used to populate empty storage.
-    ACPProvider claude{QStringLiteral("claude-code"), QStringLiteral("Claude Code"), QStringLiteral("claude-agent-acp"), QString(), QString(), {}, true, true, QStringLiteral("claude-acp"), QString()};
-    ACPProvider vibe{QStringLiteral("vibe-mistral"), QStringLiteral("Vibe (Mistral)"), QStringLiteral("vibe-acp"), QString(), QString(), {}, true, true, QStringLiteral("mistral-vibe"), QString()};
-    return {claude, vibe};
+    // Providers offered by default (seedDefaultProvidersIfNeeded()): fully
+    // editable and removable afterwards. Run by program name with the ACP
+    // registry's arguments (installed by the user or from the settings,
+    // AgentInstaller); never reuse an id for another agent.
+    auto provider = [](const char *id, const char *description, const char *executable, const char *options, const char *registryId) {
+        ACPProvider p;
+        p.id = QLatin1String(id);
+        p.description = QLatin1String(description);
+        p.executable = QLatin1String(executable);
+        p.options = QLatin1String(options);
+        p.builtin = true;
+        p.registryId = QLatin1String(registryId);
+        return p;
+    };
+    return {
+        provider("claude-code", "Claude Code", "claude-agent-acp", "", "claude-acp"),
+        provider("vibe-mistral", "Vibe (Mistral)", "vibe-acp", "", "mistral-vibe"),
+        provider("codex", "Codex", "codex-acp", "", "codex-acp"),
+        provider("github-copilot", "GitHub Copilot", "copilot", "--acp", "github-copilot-cli"),
+        provider("gemini-cli", "Gemini CLI", "gemini", "--acp", "gemini"),
+        provider("opencode", "OpenCode", "opencode", "acp", "opencode"),
+    };
 }
 
 QList<ACPProvider> SettingsStore::storedProviders() const
@@ -187,29 +205,65 @@ void SettingsStore::writeProviders(const QList<ACPProvider> &list)
 
 void SettingsStore::seedDefaultProvidersIfNeeded()
 {
-    if (m_settings.value(QStringLiteral("ACP/seeded"), false).toBool()) {
+    // ACP/offeredDefaults: the default providers this configuration has had
+    // (added, or skipped as already there). Each default is added once; one
+    // offered but missing was removed by the user and stays removed.
+    const QString offeredKey = QStringLiteral("ACP/offeredDefaults");
+    const QList<ACPProvider> defaults = defaultProviders();
+    QList<ACPProvider> existing = storedProviders();
+
+    if (!m_settings.value(QStringLiteral("ACP/seeded"), false).toBool()) {
+        // First run: the defaults ahead of any pre-existing custom entries,
+        // skipping ids that somehow already exist.
+        QList<ACPProvider> merged;
+        QStringList offered;
+        for (const ACPProvider &seed : defaults) {
+            offered.append(seed.id);
+            if (std::none_of(existing.cbegin(), existing.cend(), [&seed](const ACPProvider &e) { return e.id == seed.id; })) {
+                merged.append(seed);
+            }
+        }
+        merged.append(existing);
+        writeProviders(merged);
+        m_settings.setValue(offeredKey, offered);
+        m_settings.setValue(QStringLiteral("ACP/seeded"), true);
+        m_settings.sync();
+        qDebug() << "[SettingsStore] Seeded default providers, total:" << merged.size();
         return;
     }
 
-    // Prepend the default providers ahead of any pre-existing custom entries,
-    // skipping ids that somehow already exist so upgrades stay idempotent.
-    QList<ACPProvider> existing = storedProviders();
-    QList<ACPProvider> merged;
-    for (const ACPProvider &seed : defaultProviders()) {
-        bool present = false;
-        for (const ACPProvider &e : existing) {
-            if (e.id == seed.id) { present = true; break; }
+    QStringList offered;
+    if (m_settings.contains(offeredKey)) {
+        offered = m_settings.value(offeredKey).toStringList();
+    } else {
+        // Seeded before the list existed: with the first two defaults, so a
+        // missing one was removed by the user.
+        offered = {QStringLiteral("claude-code"), QStringLiteral("vibe-mistral")};
+    }
+    bool added = false;
+    for (const ACPProvider &seed : defaults) {
+        if (offered.contains(seed.id)) {
+            continue;
         }
+        offered.append(seed.id);
+        // Not twice: an agent the user added already (same id, registry id
+        // or program) counts as this default.
+        const bool present = std::any_of(existing.cbegin(), existing.cend(), [&seed](const ACPProvider &e) {
+            return e.id == seed.id || (!e.registryId.isEmpty() && e.registryId == seed.registryId) || e.executable == seed.executable;
+        });
         if (!present) {
-            merged.append(seed);
+            existing.append(seed);
+            added = true;
         }
     }
-    merged.append(existing);
-
-    writeProviders(merged);
-    m_settings.setValue(QStringLiteral("ACP/seeded"), true);
-    m_settings.sync();
-    qDebug() << "[SettingsStore] Seeded default providers, total:" << merged.size();
+    if (added) {
+        writeProviders(existing);
+        qDebug() << "[SettingsStore] Added new default providers, total:" << existing.size();
+    }
+    if (m_settings.value(offeredKey).toStringList() != offered) {
+        m_settings.setValue(offeredKey, offered);
+        m_settings.sync();
+    }
 }
 
 void SettingsStore::backfillRegistryIds()
@@ -384,33 +438,8 @@ void SettingsStore::setProviderOrder(const QStringList &providerIds)
 
 bool SettingsStore::isExecutableAvailable(const QString &executable)
 {
-    if (executable.isEmpty()) {
-        return false;
-    }
-
-    // Absolute path: just check existence
-    if (QFileInfo(executable).isAbsolute()) {
-        return QFileInfo::exists(executable);
-    }
-
-    // Search PATH
-    if (!QStandardPaths::findExecutable(executable).isEmpty()) {
-        return true;
-    }
-
-    // Fallback: common user-local directories
-    const QString home = QDir::homePath();
-    const QStringList fallbackDirs = {
-        home + QStringLiteral("/.local/bin"),
-        home + QStringLiteral("/bin"),
-        home + QStringLiteral("/.cargo/bin"),
-    };
-    for (const QString &dir : fallbackDirs) {
-        if (QFileInfo::exists(dir + QLatin1Char('/') + executable)) {
-            return true;
-        }
-    }
-    return false;
+    // As ACPService::start() finds it.
+    return !AgentInstaller::findLocalExecutable(executable).isEmpty();
 }
 
 void SettingsStore::migrateOldBackendSettings()
