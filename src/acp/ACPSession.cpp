@@ -1168,6 +1168,73 @@ void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject
         return;
     }
 
+    // Handle session/load errors specially - we want to fall back to new session
+    if (id == m_sessionLoadRequestId) {
+        handleSessionLoadResponse(id, result, error);
+        return;
+    }
+
+    // Configuration errors are non-fatal: report the failed option and keep
+    // applying any remaining per-provider session settings.
+    if (id == m_sessionConfigRequestId) {
+        handleSessionConfigResponse(result, error);
+        return;
+    }
+
+    // Interactive mode-change response (distinct from the startup config flow).
+    if (id == m_interactiveModeRequestId) {
+        handleInteractiveModeResponse(result, error);
+        return;
+    }
+
+    // Interactive change of another config option (model, effort, ...).
+    if (m_configRequestOption.contains(id)) {
+        handleInteractiveConfigResponse(id, result, error);
+        return;
+    }
+
+    // A prompt cancelled on behalf of requestSummary() has now fully finished
+    // (this is its response), so no further chunks from the old turn can
+    // arrive: it is safe to send the parked summary prompt.
+    if (id == m_summaryAfterPromptId) {
+        m_summaryAfterPromptId = -1;
+        const QString prompt = m_pendingSummaryPrompt;
+        m_pendingSummaryPrompt.clear();
+        sendSummaryPrompt(prompt);
+        return;
+    }
+
+    // Silent summary prompt (requestSummary): resolve it without touching the
+    // chat state, and before the generic error handling below.
+    if (m_setTitleRequestIds.remove(id)) {
+        if (!error.isEmpty()) {
+            Q_EMIT errorOccurred(QStringLiteral("Could not rename the session: %1").arg(describeACPError(error)));
+            return;
+        }
+        // The agent answers with the title as it stored it (sanitised).
+        const QString stored = result[QStringLiteral("title")].toString();
+        if (!stored.isEmpty() && stored != m_title) {
+            m_title = stored;
+            Q_EMIT titleChanged(m_title);
+        }
+        return;
+    }
+
+    if (id == m_summaryRequestId) {
+        const QString collected = m_summaryCollected.trimmed();
+        m_summaryRequestId = -1;
+        m_summaryCollected.clear();
+        if (!error.isEmpty()) {
+            Q_EMIT summaryResult(QString(),
+                                 error[QStringLiteral("message")].toString(QStringLiteral("agent error")));
+        } else if (collected.isEmpty()) {
+            Q_EMIT summaryResult(QString(), QStringLiteral("Agent returned an empty summary"));
+        } else {
+            Q_EMIT summaryResult(collected, QString());
+        }
+        return;
+    }
+
     if (!error.isEmpty()) {
         qWarning() << "[ACPSession] Error response for id" << id << ":" << error;
         Q_EMIT errorOccurred(describeACPError(error));
