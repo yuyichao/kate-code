@@ -336,6 +336,10 @@ void AgentIcons::parseRegistry(const QByteArray &json)
 QList<QPair<QString, QString>> AgentIcons::registryAgents()
 {
     ensureRegistry();
+    if (!m_registryLoaded) {
+        // As registryEntry(): an older copy while the fresh one is fetched.
+        loadRegistryFromDisk(false);
+    }
     return m_registryAgents;
 }
 

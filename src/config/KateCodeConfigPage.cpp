@@ -659,12 +659,27 @@ bool KateCodeConfigPage::editProviderDialog(ACPProvider &provider, const QString
     auto *registryCombo = new QComboBox(&dialog);
     registryCombo->setEditable(true);
     registryCombo->setInsertPolicy(QComboBox::NoInsert);
-    registryCombo->addItem(QString());
-    for (const auto &agent : m_settings->agentIcons()->registryAgents()) {
-        registryCombo->addItem(agent.first);
-        registryCombo->setItemData(registryCombo->count() - 1, agent.second, Qt::ToolTipRole);
-    }
+    // Full width like the line edits (form layouts in Breeze only stretch
+    // expanding fields; a combo box would keep its short contents' width).
+    registryCombo->setSizePolicy(QSizePolicy::Expanding, registryCombo->sizePolicy().verticalPolicy());
+    auto fillRegistryCombo = [this, registryCombo]() {
+        const QString text = registryCombo->currentText();
+        registryCombo->clear();
+        registryCombo->addItem(QString());
+        for (const auto &agent : m_settings->agentIcons()->registryAgents()) {
+            registryCombo->addItem(agent.first);
+            registryCombo->setItemData(registryCombo->count() - 1, agent.second, Qt::ToolTipRole);
+        }
+        registryCombo->setCurrentText(text);
+    };
     registryCombo->setCurrentText(provider.registryId);
+    fillRegistryCombo();
+    // Without a cached registry the list fills in once it is fetched.
+    connect(m_settings->agentIcons(), &AgentIcons::iconsChanged, registryCombo, [registryCombo, fillRegistryCombo]() {
+        if (registryCombo->count() <= 1) {
+            fillRegistryCombo();
+        }
+    });
     registryCombo->lineEdit()->setPlaceholderText(i18n("e.g. claude-acp, codex-acp, gemini (optional)"));
     registryCombo->setToolTip(i18n("Id of the agent in the ACP registry (agentclientprotocol.com); its icon is used for this provider."));
     formLayout->addRow(i18n("ACP registry id:"), registryCombo);
