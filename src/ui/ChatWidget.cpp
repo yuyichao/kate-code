@@ -1186,6 +1186,15 @@ void ChatWidget::onInitializeComplete()
 
     switch (m_pendingAction) {
     case PendingAction::LoadSession:
+        // True resume is on by default, also for agents without session/load:
+        // they get the prior context at once (a failed load would also drop
+        // the session's stored title and marks).
+        if (!m_session->supportsLoadSession()) {
+            qDebug() << "[ChatWidget] The agent cannot load sessions; resuming with prior context";
+            m_injectContextOnConnect = true;
+            m_session->createNewSession();
+            break;
+        }
         m_loadingSessionId = m_pendingSessionId;
         m_session->loadSession(m_pendingSessionId);
         break;

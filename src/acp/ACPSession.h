@@ -98,6 +98,8 @@ public:
     bool supportsImage() const { return m_supportsImage; }
     bool supportsEmbeddedContext() const { return m_supportsEmbeddedContext; }
     bool supportsPromptQueueing() const { return m_supportsPromptQueueing; }
+    // agentCapabilities.loadSession: session/load is available.
+    bool supportsLoadSession() const { return m_supportsLoadSession; }
     // A slash command ("/name" or "/name args"): sent alone, exactly as
     // typed, since agents only recognise a command that is the whole prompt.
     // Once the agent has listed its commands (available_commands_update),
@@ -356,6 +358,7 @@ private:
     bool m_supportsPromptQueueing = false;
     bool m_supportsSetTitle = false;
     bool m_supportsMcpHttp = false;
+    bool m_supportsLoadSession = false;
     // Tool calls of a remote agent that change nothing on its host (Kate's
     // own tools, reads, searches).
     QSet<QString> m_harmlessToolCalls;

@@ -17,7 +17,7 @@ struct ACPProvider {
     QString mcpConfigPath; // Path to MCP server config JSON file (e.g. ~/.cursor/mcp.json)
     QJsonObject sessionConfig; // ACP session config option id -> desired JSON value
     bool builtin = false; // true for the default-seeded providers (kept for reference only)
-    bool trueResume = false; // try ACP session/load (option B) before falling back to context injection (option A)
+    bool trueResume = true; // try ACP session/load (option B) before falling back to context injection (option A)
     QString registryId;   // ACP registry id (e.g. "claude-acp"), used for the icon
     QString icon;         // Explicit icon: theme icon name or image file (overrides the registry icon)
 };
@@ -126,6 +126,7 @@ private:
     void migrateOldBackendSettings();
     void seedDefaultProvidersIfNeeded();
     void backfillRegistryIds();
+    void enableTrueResumeOnce();
     QList<ACPProvider> defaultProviders() const;
     QList<ACPProvider> storedProviders() const;
     void writeProviders(const QList<ACPProvider> &list);

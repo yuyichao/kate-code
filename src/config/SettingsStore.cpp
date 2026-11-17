@@ -24,6 +24,7 @@ SettingsStore::SettingsStore(QObject *parent)
     m_settings.remove(QStringLiteral("Summaries/model"));
     seedDefaultProvidersIfNeeded();
     backfillRegistryIds();
+    enableTrueResumeOnce();
 }
 
 SettingsStore::~SettingsStore() = default;
@@ -123,8 +124,8 @@ QList<ACPProvider> SettingsStore::defaultProviders() const
 {
     // Seed providers offered on first run. They are fully editable and removable
     // afterwards, so this list is only used to populate empty storage.
-    ACPProvider claude{QStringLiteral("claude-code"), QStringLiteral("Claude Code"), QStringLiteral("claude-agent-acp"), QString(), QString(), {}, true, false, QStringLiteral("claude-acp"), QString()};
-    ACPProvider vibe{QStringLiteral("vibe-mistral"), QStringLiteral("Vibe (Mistral)"), QStringLiteral("vibe-acp"), QString(), QString(), {}, true, false, QStringLiteral("mistral-vibe"), QString()};
+    ACPProvider claude{QStringLiteral("claude-code"), QStringLiteral("Claude Code"), QStringLiteral("claude-agent-acp"), QString(), QString(), {}, true, true, QStringLiteral("claude-acp"), QString()};
+    ACPProvider vibe{QStringLiteral("vibe-mistral"), QStringLiteral("Vibe (Mistral)"), QStringLiteral("vibe-acp"), QString(), QString(), {}, true, true, QStringLiteral("mistral-vibe"), QString()};
     return {claude, vibe};
 }
 
@@ -151,7 +152,7 @@ QList<ACPProvider> SettingsStore::storedProviders() const
                            << parseError.errorString();
             }
         }
-        p.trueResume = m_settings.value(QStringLiteral("trueResume"), false).toBool();
+        p.trueResume = m_settings.value(QStringLiteral("trueResume"), true).toBool();
         p.registryId = m_settings.value(QStringLiteral("registryId")).toString();
         p.icon = m_settings.value(QStringLiteral("icon")).toString();
         p.builtin = false;
@@ -236,6 +237,29 @@ void SettingsStore::backfillRegistryIds()
         writeProviders(list);
     }
     m_settings.setValue(QStringLiteral("ACP/registryIdsSeeded"), true);
+    m_settings.sync();
+}
+
+void SettingsStore::enableTrueResumeOnce()
+{
+    // True resume was off by default, and every provider was stored with that
+    // value; turn it on once for them all. A value the user turns off
+    // afterwards stays off.
+    if (m_settings.value(QStringLiteral("ACP/trueResumeDefaultOn"), false).toBool()) {
+        return;
+    }
+    QList<ACPProvider> list = storedProviders();
+    bool changed = false;
+    for (ACPProvider &p : list) {
+        if (!p.trueResume) {
+            p.trueResume = true;
+            changed = true;
+        }
+    }
+    if (changed) {
+        writeProviders(list);
+    }
+    m_settings.setValue(QStringLiteral("ACP/trueResumeDefaultOn"), true);
     m_settings.sync();
 }
 

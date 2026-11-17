@@ -228,6 +228,7 @@ void ACPSession::resetSessionState()
     m_supportsEmbeddedContext = false;
     m_supportsPromptQueueing = false;
     m_supportsSetTitle = false;
+    m_supportsLoadSession = false;
     m_midTurnPromptIds.clear();
     // The next session (possibly another agent) lists its own commands.
     if (!m_availableCommands.isEmpty()) {
@@ -1263,13 +1264,15 @@ void ACPSession::handleInitializeResponse(int id, const QJsonObject &result)
     m_supportsSetTitle = agentCaps[QStringLiteral("sessionCapabilities")].toObject()
                              [QStringLiteral("title")].isObject();
     m_supportsMcpHttp = agentCaps[QStringLiteral("mcpCapabilities")].toObject()[QStringLiteral("http")].toBool(false);
+    m_supportsLoadSession = agentCaps[QStringLiteral("loadSession")].toBool(false);
 
     qDebug() << "[ACPSession] Agent capabilities:"
              << "image=" << m_supportsImage
              << "embeddedContext=" << m_supportsEmbeddedContext
              << "promptQueueing=" << m_supportsPromptQueueing
 
-             << "setTitle=" << m_supportsSetTitle;
+             << "setTitle=" << m_supportsSetTitle
+             << "loadSession=" << m_supportsLoadSession;
 
     // Don't automatically create session - let ChatWidget decide
     // whether to load an existing session or create a new one. A remote
