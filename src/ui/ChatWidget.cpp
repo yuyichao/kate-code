@@ -684,7 +684,7 @@ void ChatWidget::onReconnectRequested()
 }
 
 void ChatWidget::resumeSavedSession(const QString &sessionId, const QString &projectRoot,
-                                    const QString &providerId)
+                                    const QString &providerId, bool load, const QString &listedTitle)
 {
     if (m_settingsStore && !providerId.isEmpty()
         && !m_settingsStore->providerById(providerId).executable.isEmpty()
@@ -694,11 +694,16 @@ void ChatWidget::resumeSavedSession(const QString &sessionId, const QString &pro
         populateProviderCombo();
         applyACPBackend();
     }
-    resumeSession(sessionId, projectRoot);
+    if (load) {
+        m_loadOnlySessionId = sessionId;
+        m_loadOnlyTitle = listedTitle.trimmed();
+    }
+    resumeSession(sessionId, projectRoot, load);
 }
 
-void ChatWidget::resumeSession(const QString &sessionId, const QString &projectRoot)
+void ChatWidget::resumeSession(const QString &sessionId, const QString &projectRoot, bool load)
 {
+    load = load || (!sessionId.isEmpty() && sessionId == m_loadOnlySessionId);
     // The same agent session must not be loaded into two chats (they would
     // write one transcript); switch to the chat that has it instead.
     if (m_openSessionLocator && !hasAgentSession(sessionId) && m_openSessionLocator(sessionId)) {
@@ -729,6 +734,9 @@ void ChatWidget::resumeSession(const QString &sessionId, const QString &projectR
     // reports it again; another session starts with its stored one.
     if (sessionId != m_lastSessionId) {
         m_chatTitle = m_sessionStore->findSession(projectRoot, sessionId).title;
+        if (m_chatTitle.isEmpty() && sessionId == m_loadOnlySessionId) {
+            m_chatTitle = m_loadOnlyTitle;
+        }
     }
 
     // Option B (per-provider): try a real ACP session/load, falling back to
@@ -737,13 +745,13 @@ void ChatWidget::resumeSession(const QString &sessionId, const QString &projectR
     // A true resume replays the history into the view, so start from an
     // empty one; context injection keeps what is shown (e.g. after the agent
     // died) unless another session was live.
-    if (provider.trueResume || wasConnected) {
+    if ((provider.trueResume || load) || wasConnected) {
         resetWebView();
     }
     m_pendingSummaryContext = resumeContext;
     m_reconnectSessionId = sessionId;
     m_resumedFromSessionId = sessionId;
-    if (provider.trueResume) {
+    if ((provider.trueResume || load)) {
         m_pendingAction = PendingAction::LoadSession;
         m_pendingSessionId = sessionId;
         m_injectContextOnConnect = false;  // set on load failure (see onSessionLoadFailed)
@@ -938,6 +946,12 @@ void ChatWidget::onStatusChanged(ConnectionStatus status)
         {
             const QString projectRoot = m_session->workingDir();
             m_sessionStore->recordSession(projectRoot, m_session->sessionId(), m_providerId);
+            // A session started elsewhere keeps the title it was listed with
+            // (the agent may not send one when loading it).
+            if (m_session->sessionId() == m_loadOnlySessionId && !m_chatTitle.isEmpty()
+                && m_sessionStore->findSession(projectRoot, m_session->sessionId()).title.isEmpty()) {
+                m_sessionStore->setSessionTitle(projectRoot, m_session->sessionId(), m_chatTitle);
+            }
             m_lastSessionId = m_session->sessionId();
             m_lastProjectRoot = projectRoot;
             m_reconnectSessionId = m_session->sessionId();
@@ -1032,8 +1046,9 @@ void ChatWidget::onToolCallAdded(const QString &messageId, const ToolCall &toolC
 {
     m_chatWebView->addToolCall(messageId, toolCall);
 
-    // Request diff highlighting for edits (Edit tool)
-    if (!toolCall.edits.isEmpty()) {
+    // Request diff highlighting for edits (Edit tool); not for the edits of
+    // a loaded session's history.
+    if (!toolCall.edits.isEmpty() && !m_session->isReplaying()) {
         Q_EMIT toolCallHighlightRequested(toolCall.id, toolCall);
     }
 }

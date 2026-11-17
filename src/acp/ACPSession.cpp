@@ -195,6 +195,7 @@ void ACPSession::resetSessionState()
     m_initializeRequestId = -1;
     m_sessionNewRequestId = -1;
     m_sessionLoadRequestId = -1;
+    m_replayUserChunks.clear();
     m_sessionConfigRequestId = -1;
     m_pendingSessionConfigKeys.clear();
     m_currentSessionConfigKey.clear();
@@ -1386,9 +1387,68 @@ void ACPSession::handleSessionNewResponse(int id, const QJsonObject &result)
     beginSessionConfiguration(false);
 }
 
+void ACPSession::flushReplayedUserMessage()
+{
+    // Each chunk is a content block of the prompt (a command, an editor's
+    // context, the text): context blocks other clients and Kate Code add
+    // are left out, the rest is shown as one message.
+    static const QRegularExpression context(QStringLiteral("<(system-reminder|ide_[a-z_]+)>.*?</\\1>"),
+                                            QRegularExpression::DotMatchesEverythingOption);
+    QStringList parts;
+    for (QString chunk : std::as_const(m_replayUserChunks)) {
+        chunk.remove(context);
+        chunk = chunk.trimmed();
+        if (chunk.startsWith(QLatin1String("--- Previous session record ---"))) {
+            // Kate Code's context injection (ChatWidget).
+            chunk = QStringLiteral("(The record of an earlier session, given as context)");
+        }
+        if (!chunk.isEmpty()) {
+            parts.append(chunk);
+        }
+    }
+    m_replayUserChunks.clear();
+    if (parts.isEmpty()) {
+        return;
+    }
+    Message userMsg;
+    userMsg.id = QStringLiteral("replay_%1").arg(++m_replayCounter);
+    userMsg.role = QStringLiteral("user");
+    userMsg.timestamp = QDateTime::currentDateTime();
+    userMsg.content = parts.join(QStringLiteral("\n\n"));
+    Q_EMIT messageAdded(userMsg);
+}
+
+void ACPSession::startReplayedAssistantMessage()
+{
+    // Own ids: m_messageCounter counts this connection's prompts (the first
+    // one gets the editor reminder, which a loaded session needs too).
+    Message assistantMsg;
+    assistantMsg.id = QStringLiteral("replay_%1").arg(++m_replayCounter);
+    assistantMsg.role = QStringLiteral("assistant");
+    assistantMsg.timestamp = QDateTime::currentDateTime();
+    assistantMsg.isStreaming = true;
+    m_currentMessageId = assistantMsg.id;
+    m_currentMessageContent.clear();
+    m_currentMessageTimestamp = assistantMsg.timestamp;
+    Q_EMIT messageAdded(assistantMsg);
+}
+
+void ACPSession::finishReplayedMessage()
+{
+    // Not recorded: the transcript starts once the session is loaded.
+    if (!m_currentMessageId.isEmpty()) {
+        Q_EMIT messageFinished(m_currentMessageId);
+        m_currentMessageId.clear();
+        m_currentMessageContent.clear();
+    }
+}
+
 void ACPSession::handleSessionLoadResponse(int id, const QJsonObject &result, const QJsonObject &error)
 {
     Q_UNUSED(id);
+    // The end of the replayed history.
+    flushReplayedUserMessage();
+    finishReplayedMessage();
     const QString requestedSessionId = m_sessionLoadId;
     m_sessionLoadId.clear();
     m_sessionLoadRequestId = -1;
@@ -1715,7 +1775,29 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
     QJsonObject update = params[QStringLiteral("update")].toObject();
     QString updateType = update[QStringLiteral("sessionUpdate")].toString();
 
-    if (m_service->isRemote() && (updateType == QStringLiteral("tool_call") || updateType == QStringLiteral("tool_call_update"))) {
+    const bool replaying = isReplaying();
+    if (replaying) {
+        // A replayed turn: the user's messages, then the agent's text and
+        // tool calls (into one assistant message until the next user one).
+        if (updateType == QStringLiteral("user_message_chunk")) {
+            if (!m_currentMessageId.isEmpty()) {
+                finishReplayedMessage();
+            }
+            const QJsonObject content = update[QStringLiteral("content")].toObject();
+            if (content[QStringLiteral("type")].toString() == QLatin1String("text")) {
+                m_replayUserChunks.append(content[QStringLiteral("text")].toString());
+            }
+            return;
+        }
+        if (updateType == QStringLiteral("agent_message_chunk") || updateType == QStringLiteral("tool_call")) {
+            flushReplayedUserMessage();
+            if (m_currentMessageId.isEmpty()) {
+                startReplayedAssistantMessage();
+            }
+        }
+    }
+
+    if (!replaying && m_service->isRemote() && (updateType == QStringLiteral("tool_call") || updateType == QStringLiteral("tool_call_update"))) {
         const QString toolCallId = update[QStringLiteral("toolCallId")].toString();
         if (updateType == QStringLiteral("tool_call")) {
             const QString name = update[QStringLiteral("_meta")].toObject()[QStringLiteral("claudeCode")].toObject()[QStringLiteral("toolName")].toString()
@@ -1729,7 +1811,7 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
             Q_EMIT remoteHostActivity(m_service->pathMap().hostDir());
         }
     }
-    if (updateType == QStringLiteral("tool_call_update")) {
+    if (updateType == QStringLiteral("tool_call_update") && !replaying) {
         const QString toolStatus = update[QStringLiteral("status")].toString();
         if (toolStatus == QStringLiteral("completed") || toolStatus == QStringLiteral("failed")) {
             scheduleRemoteDocumentCheck();

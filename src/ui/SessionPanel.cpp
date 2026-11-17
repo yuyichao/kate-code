@@ -19,6 +19,7 @@ constexpr int KindRole = Qt::UserRole;
 constexpr int KeyRole = Qt::UserRole + 1; // open: index, resumable: session id
 constexpr int RootRole = Qt::UserRole + 2; // resumable: project root
 constexpr int PathRole = Qt::UserRole + 3; // resumable: transcript path
+constexpr int ProviderRole = Qt::UserRole + 4; // started elsewhere: provider id
 }
 
 SessionPanel::SessionPanel(QWidget *parent)
@@ -41,6 +42,7 @@ SessionPanel::SessionPanel(QWidget *parent)
     refreshButton->setIcon(QIcon::fromTheme(QStringLiteral("view-refresh")));
     refreshButton->setToolTip(QStringLiteral("Reload the list of previous sessions"));
     connect(refreshButton, &QToolButton::clicked, this, &SessionPanel::refreshRequested);
+    connect(refreshButton, &QToolButton::clicked, this, &SessionPanel::reloadRequested);
     buttons->addWidget(refreshButton);
 
     auto *browseButton = new QToolButton(this);
@@ -69,17 +71,31 @@ SessionPanel::SessionPanel(QWidget *parent)
     // starts an agent in a new tab, so it takes an activation (double-click
     // or Enter).
     connect(m_list, &QListWidget::itemClicked, this, [this](QListWidgetItem *item) {
+        if (!item) {
+            return;
+        }
         if (item->data(KindRole).toInt() == OpenItem) {
             Q_EMIT entryActivated(item->data(KeyRole).toInt());
+        } else if (item->data(KindRole).toInt() == ElsewhereHeadingItem) {
+            // Not inside the view's click handling: the rebuild deletes the
+            // items (and Qt may still activate the clicked one).
+            QMetaObject::invokeMethod(this, &SessionPanel::toggleElsewhere, Qt::QueuedConnection);
         }
     });
     connect(m_list, &QListWidget::itemActivated, this, [this](QListWidgetItem *item) {
+        if (!item) {
+            return;
+        }
         switch (item->data(KindRole).toInt()) {
         case OpenItem:
             Q_EMIT entryActivated(item->data(KeyRole).toInt());
             break;
         case ResumableItem:
             Q_EMIT resumeRequested(item->data(KeyRole).toString(), item->data(RootRole).toString());
+            break;
+        case ElsewhereItem:
+            Q_EMIT resumeElsewhereRequested(item->data(KeyRole).toString(), item->data(RootRole).toString(),
+                                            item->data(ProviderRole).toString());
             break;
         }
     });
@@ -105,6 +121,20 @@ void SessionPanel::setResumable(const QString &heading, const QString &headingTo
     m_resumableHeadingToolTip = headingToolTip;
     m_resumable = entries;
     rebuild();
+}
+
+void SessionPanel::setElsewhere(const QList<ResumableEntry> &entries, const QString &status)
+{
+    m_elsewhere = entries;
+    m_elsewhereStatus = status;
+    rebuild();
+}
+
+void SessionPanel::toggleElsewhere()
+{
+    m_elsewhereExpanded = !m_elsewhereExpanded;
+    rebuild();
+    Q_EMIT elsewhereExpandedChanged(m_elsewhereExpanded);
 }
 
 QListWidgetItem *SessionPanel::addHeading(const QString &text, const QString &toolTip, bool divider)
@@ -141,6 +171,17 @@ void SessionPanel::addHint(const QString &text)
 void SessionPanel::showContextMenu(const QPoint &pos)
 {
     QListWidgetItem *item = m_list->itemAt(pos);
+    if (item && item->data(KindRole).toInt() == ElsewhereItem) {
+        const QString sessionId = item->data(KeyRole).toString();
+        const QString root = item->data(RootRole).toString();
+        const QString providerId = item->data(ProviderRole).toString();
+        QMenu menu(this);
+        QAction *resume = menu.addAction(QIcon::fromTheme(QStringLiteral("media-playback-start")), QStringLiteral("Open in New Chat"));
+        if (menu.exec(m_list->viewport()->mapToGlobal(pos)) == resume) {
+            Q_EMIT resumeElsewhereRequested(sessionId, root, providerId);
+        }
+        return;
+    }
     if (!item || item->data(KindRole).toInt() != ResumableItem) {
         return;
     }
@@ -235,6 +276,7 @@ void SessionPanel::rebuild()
 
     if (!m_resumableHeading.isEmpty()) {
         addResumable();
+        addElsewhere();
     }
     for (int i = 0; currentKind != 0 && i < m_list->count(); ++i) {
         QListWidgetItem *item = m_list->item(i);
@@ -263,6 +305,42 @@ void SessionPanel::addResumable()
     }
     if (m_resumable.isEmpty()) {
         addHint(QStringLiteral("No previous sessions to resume here."));
+    }
+}
+
+void SessionPanel::addElsewhere()
+{
+    // A disclosure heading: collapsed by default (listing starts agents).
+    QListWidgetItem *heading = addHeading(QStringLiteral("%1 Started elsewhere%2")
+                                              .arg(m_elsewhereExpanded ? QChar(0x25BE) : QChar(0x25B8))
+                                              .arg(m_elsewhereExpanded && !m_elsewhere.isEmpty()
+                                                       ? QStringLiteral(" (%1)").arg(m_elsewhere.size())
+                                                       : QString()),
+                                          QStringLiteral("Sessions the agents keep that were not started in Kate Code (another editor, "
+                                                         "a terminal). Click to %1; listing them starts the agents.")
+                                              .arg(m_elsewhereExpanded ? QStringLiteral("collapse") : QStringLiteral("expand")),
+                                          true);
+    heading->setData(KindRole, ElsewhereHeadingItem);
+    heading->setData(KeyRole, QStringLiteral("elsewhere"));
+    if (!m_elsewhereExpanded) {
+        return;
+    }
+    for (const ResumableEntry &entry : std::as_const(m_elsewhere)) {
+        QString text = entry.title;
+        if (!entry.detail.isEmpty()) {
+            text += QLatin1Char('\n') + entry.detail;
+        }
+        auto *item = new QListWidgetItem(entry.icon, text, m_list);
+        item->setData(KindRole, ElsewhereItem);
+        item->setData(KeyRole, entry.sessionId);
+        item->setData(RootRole, entry.projectRoot);
+        item->setData(ProviderRole, entry.providerId);
+        item->setToolTip(entry.toolTip.isEmpty() ? text : entry.toolTip);
+    }
+    if (!m_elsewhereStatus.isEmpty()) {
+        addHint(m_elsewhereStatus);
+    } else if (m_elsewhere.isEmpty()) {
+        addHint(QStringLiteral("No sessions started elsewhere here."));
     }
 }
 

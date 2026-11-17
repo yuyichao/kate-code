@@ -15,6 +15,7 @@ set(katecode_SRCS
     acp/ACPService.cpp
     acp/ACPSession.cpp
     acp/ACPSessionDeleter.cpp
+    acp/ACPSessionLister.cpp
     acp/RateLimits.cpp
     acp/AgentInstaller.cpp
     acp/RemoteHelper.cpp

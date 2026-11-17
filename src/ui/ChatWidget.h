@@ -63,9 +63,14 @@ public:
 
     // Resume a saved session in this chat with the provider it ran with
     // (the default provider if empty or no longer configured). Use instead
-    // of startSession() on a new chat.
+    // of startSession() on a new chat. load: always session/load, whatever
+    // the provider's true resume setting (a session started elsewhere, of
+    // which Kate Code has no transcript for context injection); listedTitle:
+    // the title the agent listed it with, shown until the agent sends one
+    // (when Kate Code has none stored).
     void resumeSavedSession(const QString &sessionId, const QString &projectRoot,
-                            const QString &providerId);
+                            const QString &providerId, bool load = false,
+                            const QString &listedTitle = QString());
     // Called before resuming a saved session: returns true (after switching
     // to it) when another chat already has that session open.
     void setOpenSessionLocator(std::function<bool(const QString &sessionId)> locator)
@@ -192,7 +197,10 @@ private:
     void startNewSession(bool resetView, const QString &projectRoot = QString());
     // Stop any session and resume the given one of projectRoot (true resume
     // or context injection, depending on the provider).
-    void resumeSession(const QString &sessionId, const QString &projectRoot);
+    void resumeSession(const QString &sessionId, const QString &projectRoot, bool load = false);
+    // A session resumed with load: reconnecting loads it again too.
+    QString m_loadOnlySessionId;
+    QString m_loadOnlyTitle; // its listed title
     // Stop the agent without the "Disconnected" notice (the caller starts
     // another session right after).
     void stopSessionQuietly();

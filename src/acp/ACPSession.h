@@ -98,6 +98,18 @@ public:
     bool supportsImage() const { return m_supportsImage; }
     bool supportsEmbeddedContext() const { return m_supportsEmbeddedContext; }
     bool supportsPromptQueueing() const { return m_supportsPromptQueueing; }
+    // session/load is replaying the session's history (session/update
+    // notifications before its response): shown in the chat, without the
+    // side effects of a live turn (diff highlights, remote host holds,
+    // document checks).
+    bool isReplaying() const { return m_sessionLoadRequestId >= 0; }
+    // History replayed by session/load: the user message being collected
+    // (shown when it ends), and helpers ending the replayed messages.
+    QStringList m_replayUserChunks; // content blocks of the user message
+    int m_replayCounter = 0;
+    void flushReplayedUserMessage();
+    void finishReplayedMessage();
+    void startReplayedAssistantMessage();
     // agentCapabilities.loadSession: session/load is available.
     bool supportsLoadSession() const { return m_supportsLoadSession; }
     // A slash command ("/name" or "/name args"): sent alone, exactly as

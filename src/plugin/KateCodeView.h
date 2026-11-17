@@ -59,6 +59,9 @@ public Q_SLOTS:
                             const QString &transcriptPath);
     // The session browser with summaries, for the current project.
     void browseSessions();
+    // Open a session started elsewhere (listed by the provider's agent) in a
+    // new chat: always session/load (Kate Code has no transcript of it).
+    void resumeElsewhereSession(const QString &sessionId, const QString &projectRoot, const QString &providerId);
 
 public:
     // Switch to the chat (other than exclude) that has the given agent
@@ -97,6 +100,14 @@ private:
     KTextEditor::View *editorView() const;
     void refreshSessionPanel();
     void refreshResumableSessions();
+    // The "started elsewhere" section: asks the agents (session/list) when
+    // it is expanded and the location changed, or when forced (refresh
+    // button); otherwise filters the last answers again (sessions resumed
+    // since then drop out).
+    void refreshElsewhere(bool force);
+    // Starts the next queued listing (a remote folder: one at a time).
+    void startNextElsewhereLister(int generation);
+    void showElsewhere();
     bool isSessionOpen(const QString &sessionId) const;
     QList<ChatWidget *> liveChats() const;
 
@@ -119,5 +130,29 @@ private:
         QString firstPrompt;
     };
     QHash<QString, TranscriptInfo> m_transcriptInfo;
+    // Sessions started elsewhere, as the agents listed them for
+    // m_elsewhereKey (a directory, or "*" for all).
+    struct ElsewhereSession {
+        QString sessionId;
+        QString cwd;
+        QString title;
+        QDateTime updatedAt;
+        QString providerId;
+    };
+    bool m_elsewhereExpanded = false;
+    QString m_elsewhereKey;
+    int m_elsewhereGeneration = 0;
+    int m_elsewherePending = 0;
+    QList<ElsewhereSession> m_elsewhereSessions;
+    QStringList m_elsewhereErrors;
+    struct ElsewhereLister {
+        QString providerId;
+        QString agentName;
+        QString executable;
+        QStringList args;
+    };
+    QList<ElsewhereLister> m_elsewhereQueue;
+    QString m_elsewhereWorkingDir;
+    QString m_elsewhereFilter;
     DiffHighlightManager *m_diffHighlightManager;
 };

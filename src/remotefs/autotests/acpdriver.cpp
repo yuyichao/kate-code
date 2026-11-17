@@ -10,6 +10,9 @@
 // runs AgentInstaller instead (an empty folder: on this computer):
 //   CANINSTALL <0|1> (remote), CANINSTALLLOCALLY <0|1> <reason>,
 //   PROGRESS <text>, then FINISHED <0|1> <message>
+// acpdriver --list <working dir> <cwd filter, or - for none> <program>
+// runs ACPSessionLister: SESSION <id>|<cwd>|<title>|<updatedAt>, then
+//   LISTED <unavailable 0|1> <error>
 // acpdriver --find <program>
 //   FOUND <path> (AgentInstaller::findLocalExecutable(), empty if none)
 // acpdriver --helper <folder> <pin JSON file> <file>
@@ -22,6 +25,7 @@
 // empty line: none) and prints REPORTED; silent only calls mountRoot() (as
 // an older Remote Projects plugin) and prints CONNECTED
 #include "ACPService.h"
+#include "ACPSessionLister.h"
 #include "AgentInstaller.h"
 #include "RemoteHelper.h"
 
@@ -95,6 +99,19 @@ int main(int argc, char **argv)
             QCoreApplication::exit(ok ? 0 : 1);
         });
         QTimer::singleShot(0, &installer, &AgentInstaller::start);
+        return app.exec();
+    }
+    if (args.size() == 5 && args.at(1) == QLatin1String("--list")) {
+        auto *lister = new ACPSessionLister(args.at(4), {}, args.at(2), args.at(3) == QLatin1String("-") ? QString() : args.at(3));
+        lister->setMaxSessions(3);
+        QObject::connect(lister, &ACPSessionLister::finished, [](const QList<ACPSessionLister::Session> &sessions, const QString &error, bool unavailable) {
+            for (const ACPSessionLister::Session &s : sessions) {
+                out(QStringLiteral("SESSION %1|%2|%3|%4").arg(s.sessionId, s.cwd, s.title, s.updatedAt.toUTC().toString(Qt::ISODate)));
+            }
+            out(QStringLiteral("LISTED %1 %2").arg(unavailable ? 1 : 0).arg(QString(error).replace(QLatin1Char('\n'), QLatin1String(" | "))));
+            QCoreApplication::exit(error.isEmpty() ? 0 : 1);
+        });
+        QTimer::singleShot(0, lister, &ACPSessionLister::start);
         return app.exec();
     }
     if (args.size() == 3 && args.at(1) == QLatin1String("--find")) {

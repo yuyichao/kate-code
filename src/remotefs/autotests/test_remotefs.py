@@ -346,7 +346,19 @@ for line in sys.stdin:
     log.flush()
     method = message.get("method")
     if method == "initialize":
-        send({"jsonrpc": "2.0", "id": message["id"], "result": {"protocolVersion": 1, "agentCapabilities": {}}})
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"protocolVersion": 1, "agentCapabilities": {
+            "loadSession": True, "sessionCapabilities": {"list": {}}}}})
+    elif method == "session/list":
+        # Two pages; sessions of the asked directory (host paths).
+        where = message["params"].get("cwd", "/data")
+        page = [{"sessionId": "e1", "cwd": where, "title": "From a terminal", "updatedAt": "2026-11-01T10:00:00.000Z"},
+                {"sessionId": "e2", "cwd": where + "/deeper", "title": "In " + where, "updatedAt": "2026-11-02T10:00:00.000Z"}]
+        if message["params"].get("cursor") == "p2":
+            page = [{"sessionId": "e3", "cwd": where, "title": "Second page", "updatedAt": "2026-11-03T10:00:00.000Z"},
+                    {"sessionId": "e4", "cwd": where, "title": "Over the limit", "updatedAt": "2026-11-04T10:00:00.000Z"}]
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"sessions": page, "nextCursor": "p3"}})
+        else:
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"sessions": page, "nextCursor": "p2"}})
     elif method == "session/new":
         cwd = message["params"]["cwd"]
         for server in message["params"]["mcpServers"]:
@@ -928,6 +940,43 @@ def test_local_agent_install():
     check("CANINSTALLLOCALLY 0 Uv Agent runs with uvx" in output and "FINISHED 0 Uv Agent runs with uvx" in output,
           f"uvx agents are not installed: {output}")
     check(sorted(os.listdir(base)) == ["agents", "bin"], f"no temporary files left: {os.listdir(base)}")
+
+
+def test_session_list():
+    print("listing an agent's sessions (ACPSessionLister)")
+    def run(workdir, cwd, program, extra_env=None):
+        e = env()
+        e.update(extra_env or {})
+        result = subprocess.run([ACPDRIVER, "--list", workdir, cwd, program], env=e, capture_output=True, text=True, timeout=60)
+        sessions = [line[8:].split("|") for line in result.stdout.splitlines() if line.startswith("SESSION ")]
+        listed = next((line for line in result.stdout.splitlines() if line.startswith("LISTED ")), "")
+        return result.returncode, sessions, listed, result.stdout + result.stderr
+    local = os.path.join(ROOT, "sftp", "goodhost") + "/data/sub"
+    if os.path.exists(AGENT_LOG):
+        os.remove(AGENT_LOG)
+    code, sessions, listed, output = run(local, local, "fake-acp")
+    check(code == 0 and listed == "LISTED 0 ", f"listed on the host: {output}")
+    # Pages followed up to the limit (3); paths both ways translated.
+    check([s[0] for s in sessions] == ["e1", "e2", "e3"], f"two pages, up to the limit: {sessions}")
+    check(sessions[0][1] == local and sessions[1][1] == local + "/deeper", f"cwd as local paths: {sessions}")
+    check(sessions[1][2] == "In /data/sub" and sessions[0][3] == "2026-11-01T10:00:00Z", f"titles as the agent wrote them, times: {sessions}")
+    requests = [m for m in agent_log() if m.get("method") == "session/list"]
+    check([r["params"] for r in requests] == [{"cwd": "/data/sub"}, {"cwd": "/data/sub", "cursor": "p2"}],
+          f"the host's path asked for, then the next page: {requests}")
+    code, sessions, listed, output = run(local, "-", "no-such-agent")
+    check(code != 0 and listed.startswith("LISTED 1 ") and not sessions, f"a missing agent is unavailable, not an error: {output}")
+    # On this computer: an agent without session/list is unavailable; a
+    # program that is not installed too.
+    plain = os.path.join(TMP, "plain-agent")
+    with open(plain, "w") as f:
+        f.write("#!/usr/bin/python3\nimport json, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n"
+                "    if m.get('method') == 'initialize':\n"
+                "        print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': {'protocolVersion': 1, 'agentCapabilities': {}}}), flush=True)\n")
+    os.chmod(plain, 0o755)
+    code, sessions, listed, output = run(TMP, TMP, plain)
+    check(listed.startswith("LISTED 1 the agent cannot list"), f"an agent without session/list: {output}")
+    code, sessions, listed, output = run(TMP, TMP, os.path.join(TMP, "not-installed-agent"))
+    check(listed.startswith("LISTED 1 "), f"a local agent that is not installed: {output}")
 
 
 def run_helper(pin, path="/data/sub", file="helper.txt", change=None):
@@ -1580,7 +1629,7 @@ def main():
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_kde_passwords, test_remote_agent, test_remote_agent_install, test_local_agent_install, test_remote_helper, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_remote_agent, test_remote_agent_install, test_local_agent_install, test_session_list, test_remote_helper, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_restart, test_shutdown_and_restart):
             try:
                 test()

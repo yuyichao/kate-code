@@ -10,7 +10,7 @@ if(BUILD_REMOTE_FS)
 
     # Kate Code's ACPService with agents on remote hosts, and
     # AgentInstaller (--install).
-    add_executable(acpdriver acpdriver.cpp ${CMAKE_SOURCE_DIR}/src/acp/ACPService.cpp ${CMAKE_SOURCE_DIR}/src/acp/AgentInstaller.cpp ${CMAKE_SOURCE_DIR}/src/acp/RemoteHelper.cpp)
+    add_executable(acpdriver acpdriver.cpp ${CMAKE_SOURCE_DIR}/src/acp/ACPService.cpp ${CMAKE_SOURCE_DIR}/src/acp/ACPSessionLister.cpp ${CMAKE_SOURCE_DIR}/src/acp/AgentInstaller.cpp ${CMAKE_SOURCE_DIR}/src/acp/RemoteHelper.cpp)
     target_include_directories(acpdriver PRIVATE ${CMAKE_SOURCE_DIR}/src/acp)
     target_link_libraries(acpdriver kateremotelocation KF6::Archive Qt6::Core Qt6::DBus Qt6::Network)
 

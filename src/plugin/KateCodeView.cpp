@@ -2,6 +2,7 @@
 #include "KateCodePlugin.h"
 #include "../acp/ACPModels.h"
 #include "../acp/ACPSessionDeleter.h"
+#include "../acp/ACPSessionLister.h"
 #include "../config/SettingsStore.h"
 #include "../mcp/EditorDBusService.h"
 #include "../mcp/EditorSession.h"
@@ -10,6 +11,7 @@
 #include "../ui/SessionSelectionDialog.h"
 #include "../util/AgentIcons.h"
 #include "../util/SessionStore.h"
+#include "../util/SummaryGenerator.h"
 #include "../util/SummaryStore.h"
 #include "../util/DiffHighlightManager.h"
 #include "RemoteLocation.h"
@@ -33,6 +35,7 @@
 #include <QPointer>
 #include <QProcess>
 #include <QPushButton>
+#include <QSet>
 #include <QTextStream>
 #include <QVBoxLayout>
 #include <functional>
@@ -228,6 +231,14 @@ void KateCodeView::createToolView()
     connect(m_sessionPanel, &SessionPanel::refreshRequested, this, &KateCodeView::scheduleSessionPanelRefresh);
     connect(m_sessionPanel, &SessionPanel::resumeRequested, this, &KateCodeView::resumeSavedSession);
     connect(m_sessionPanel, &SessionPanel::deleteRequested, this, &KateCodeView::deleteSavedSession);
+    connect(m_sessionPanel, &SessionPanel::resumeElsewhereRequested, this, &KateCodeView::resumeElsewhereSession);
+    connect(m_sessionPanel, &SessionPanel::elsewhereExpandedChanged, this, [this](bool expanded) {
+        m_elsewhereExpanded = expanded;
+        refreshElsewhere(false);
+    });
+    connect(m_sessionPanel, &SessionPanel::reloadRequested, this, [this]() {
+        refreshElsewhere(true);
+    });
     connect(m_sessionPanel, &SessionPanel::showAllDirectoriesChanged, this, [this](bool showAll) {
         m_showAllSessions = showAll;
         scheduleSessionPanelRefresh();
@@ -329,6 +340,207 @@ void KateCodeView::resumeSavedSession(const QString &sessionId, const QString &p
         activateChat(chat);
         chat->resumeSavedSession(sessionId, projectRoot, providerId);
     }
+}
+
+// Defined below (the start of a Kate Code transcript).
+static void readTranscriptStart(const QString &path, QString &projectRoot, bool &hasUserMessage, QString &firstPrompt);
+
+void KateCodeView::resumeElsewhereSession(const QString &sessionId, const QString &projectRoot, const QString &providerId)
+{
+    if (sessionId.isEmpty() || projectRoot.isEmpty()) {
+        return;
+    }
+    for (KateCodeView *view : m_plugin->views()) {
+        if (view->activateChatWithSession(sessionId, nullptr)) {
+            return;
+        }
+    }
+    if (ChatWidget *chat = createChat(false)) {
+        activateChat(chat);
+        QString title;
+        for (const ElsewhereSession &session : std::as_const(m_elsewhereSessions)) {
+            if (session.sessionId == sessionId && !session.title.trimmed().isEmpty()) {
+                title = session.title;
+                break;
+            }
+        }
+        chat->resumeSavedSession(sessionId, projectRoot, providerId, true, title);
+    }
+}
+
+void KateCodeView::refreshElsewhere(bool force)
+{
+    if (!m_sessionPanel || !m_elsewhereExpanded) {
+        return;
+    }
+    const QString key = m_showAllSessions ? QStringLiteral("*") : getProjectRoot();
+    if (!force && key == m_elsewhereKey) {
+        showElsewhere();
+        return;
+    }
+    // Ask every agent that can run there: on this computer the installed
+    // ones, all at once; for a remote folder all (they run on its host),
+    // one after another (one login at a time; an ssh failure ends it).
+    // Agents missing there or unable to list are skipped quietly.
+    m_elsewhereKey = key;
+    const int generation = ++m_elsewhereGeneration;
+    m_elsewhereSessions.clear();
+    m_elsewhereErrors.clear();
+    m_elsewhereQueue.clear();
+    m_elsewherePending = 0;
+    const bool all = key == QLatin1String("*");
+    const bool remote = !all && KateRemote::locationForPath(key, KateRemote::configuredMountRoot()).has_value();
+    // All directories: the agents of this computer, from the home
+    // directory. A remote folder's run on its host; not stat-ed here.
+    m_elsewhereWorkingDir = all ? QDir::homePath() : (remote || QFileInfo(key).isDir() ? key : QDir::homePath());
+    m_elsewhereFilter = all ? QString() : key;
+    for (const ACPProvider &provider : m_plugin->settings()->providers()) {
+        if (!remote && !SettingsStore::isExecutableAvailable(provider.executable)) {
+            continue;
+        }
+        m_elsewhereQueue.append({provider.id,
+                                 provider.description,
+                                 provider.executable,
+                                 provider.options.isEmpty() ? QStringList() : QProcess::splitCommand(provider.options)});
+    }
+    m_elsewherePending = m_elsewhereQueue.size();
+    const int parallel = remote ? 1 : m_elsewhereQueue.size();
+    for (int i = 0; i < parallel; ++i) {
+        startNextElsewhereLister(generation);
+    }
+    showElsewhere();
+}
+
+void KateCodeView::startNextElsewhereLister(int generation)
+{
+    if (generation != m_elsewhereGeneration || m_elsewhereQueue.isEmpty()) {
+        return;
+    }
+    const ElsewhereLister job = m_elsewhereQueue.takeFirst();
+    auto *lister = new ACPSessionLister(job.executable, job.args, m_elsewhereWorkingDir, m_elsewhereFilter, this);
+    const bool sequential = KateRemote::locationForPath(m_elsewhereWorkingDir, KateRemote::configuredMountRoot()).has_value();
+    connect(lister,
+            &ACPSessionLister::finished,
+            this,
+            [this, lister, generation, job, sequential](const QList<ACPSessionLister::Session> &sessions, const QString &error, bool unavailable) {
+                if (generation != m_elsewhereGeneration) {
+                    return; // another location (or a reload) since
+                }
+                --m_elsewherePending;
+                for (const ACPSessionLister::Session &session : sessions) {
+                    // The same sessions through two providers of one agent:
+                    // the first provider's.
+                    if (std::any_of(m_elsewhereSessions.cbegin(), m_elsewhereSessions.cend(), [&session](const ElsewhereSession &s) {
+                            return s.sessionId == session.sessionId;
+                        })) {
+                        continue;
+                    }
+                    m_elsewhereSessions.append({session.sessionId, session.cwd, session.title, session.updatedAt, job.providerId});
+                }
+                if (!error.isEmpty() && !unavailable) {
+                    m_elsewhereErrors.append(QStringLiteral("%1: %2").arg(job.agentName, error));
+                    qDebug() << "[KateCodeView] Listing sessions of" << job.agentName << "failed:" << error;
+                }
+                if (sequential) {
+                    if (lister->exitCode() == 255) {
+                        // ssh failed: the other agents would too.
+                        m_elsewherePending -= m_elsewhereQueue.size();
+                        m_elsewhereQueue.clear();
+                    } else {
+                        startNextElsewhereLister(generation);
+                    }
+                }
+                showElsewhere();
+            });
+    lister->start();
+}
+
+void KateCodeView::showElsewhere()
+{
+    if (!m_sessionPanel) {
+        return;
+    }
+    // Kate Code's own sessions (those its list shows: a transcript with a
+    // prompt, or a recorded first prompt; a session opened from here but
+    // never prompted stays here), open ones and the summariser's are not
+    // "elsewhere".
+    QHash<QString, QString> transcripts; // session id -> Kate Code's transcript
+    if (m_elsewhereKey == QLatin1String("*")) {
+        for (const QString &path : m_summaryStore->listAllTranscriptPaths()) {
+            transcripts.insert(QFileInfo(path).completeBaseName(), path);
+        }
+    } else {
+        for (const QString &id : m_summaryStore->listTranscriptSessions(m_elsewhereKey)) {
+            transcripts.insert(id, m_summaryStore->transcriptPath(m_elsewhereKey, id));
+        }
+    }
+    const QStringList summariserSessions = SummaryGenerator::ownAgentSessions();
+    const auto listedByKateCode = [&](const ElsewhereSession &session) {
+        const QString path = transcripts.value(session.sessionId);
+        if (path.isEmpty()) {
+            return false;
+        }
+        if (!m_sessionStore->findSession(session.cwd, session.sessionId).firstPrompt.isEmpty()) {
+            return true;
+        }
+        TranscriptInfo &info = m_transcriptInfo[path];
+        const QDateTime modified = QFileInfo(path).lastModified();
+        if (info.modified != modified) {
+            info.modified = modified;
+            readTranscriptStart(path, info.projectRoot, info.hasUserMessage, info.firstPrompt);
+        }
+        return info.hasUserMessage;
+    };
+    QList<ElsewhereSession> sessions;
+    for (const ElsewhereSession &session : std::as_const(m_elsewhereSessions)) {
+        if (!summariserSessions.contains(session.sessionId) && !isSessionOpen(session.sessionId) && !listedByKateCode(session)) {
+            sessions.append(session);
+        }
+    }
+    std::stable_sort(sessions.begin(), sessions.end(), [](const ElsewhereSession &a, const ElsewhereSession &b) {
+        return a.updatedAt > b.updatedAt;
+    });
+    constexpr int maxEntries = 50;
+    constexpr int maxTitleLength = 80;
+    SettingsStore *settings = m_plugin->settings();
+    QList<SessionPanel::ResumableEntry> entries;
+    for (const ElsewhereSession &session : std::as_const(sessions)) {
+        if (entries.size() >= maxEntries) {
+            break;
+        }
+        const ACPProvider provider = settings->providerById(session.providerId);
+        const QString title = session.title.trimmed().isEmpty() ? QStringLiteral("(untitled)") : session.title.trimmed();
+        const QString when = session.updatedAt.isValid() ? session.updatedAt.toLocalTime().toString(QStringLiteral("yyyy-MM-dd hh:mm")) : QString();
+        SessionPanel::ResumableEntry entry;
+        entry.sessionId = session.sessionId;
+        entry.projectRoot = session.cwd;
+        entry.providerId = session.providerId;
+        entry.title = title.size() > maxTitleLength ? title.left(maxTitleLength - 1).trimmed() + QChar(0x2026) : title;
+        QStringList detail{provider.description};
+        if (m_elsewhereKey == QLatin1String("*")) {
+            detail << (QDir::cleanPath(session.cwd) == QDir::homePath() ? QStringLiteral("~") : QDir(session.cwd).dirName());
+        }
+        if (!when.isEmpty()) {
+            detail << when;
+        }
+        entry.detail = detail.join(QStringLiteral(" · "));
+        entry.icon = settings->agentIcons()->iconFor(provider);
+        entry.toolTip = QStringList{title,
+                                    QStringLiteral("Directory: %1").arg(session.cwd),
+                                    QStringLiteral("Agent: %1").arg(provider.description),
+                                    QStringLiteral("Last active: %1").arg(when),
+                                    QStringLiteral("Session: %1").arg(session.sessionId),
+                                    QStringLiteral("Started outside Kate Code. Double-click to open it in a new chat (the agent loads it).")}
+                            .join(QLatin1Char('\n'));
+        entries.append(entry);
+    }
+    QString status;
+    if (m_elsewherePending > 0) {
+        status = QStringLiteral("Asking the agents…");
+    } else if (!m_elsewhereErrors.isEmpty()) {
+        status = QStringLiteral("Could not ask %1").arg(m_elsewhereErrors.join(QStringLiteral("; ")));
+    }
+    m_sessionPanel->setElsewhere(entries, status);
 }
 
 void KateCodeView::browseSessions()
@@ -821,6 +1033,7 @@ void KateCodeView::refreshResumableSessions()
         m_sessionPanel->setResumable(QStringLiteral("Previous sessions in %1").arg(locationName(currentRoot)),
                                      currentRoot, entries);
     }
+    refreshElsewhere(false);
 }
 
 QString KateCodeView::getCurrentFilePath() const

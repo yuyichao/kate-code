@@ -38,6 +38,11 @@ public:
     // (no transcript is attached; the agent already has the conversation).
     static QString buildInSessionPrompt(const QString &projectRoot);
 
+    // The agent sessions the summariser created (it deletes them on the
+    // agent's side when it can): not the user's, so never offered for
+    // resuming (the "started elsewhere" list).
+    static QStringList ownAgentSessions();
+
 Q_SIGNALS:
     void summaryReady(const QString &sessionId, const QString &projectRoot, const QString &summary);
     void summaryError(const QString &sessionId, const QString &error);
@@ -55,7 +60,10 @@ private:
         int initId = -1;
         int newId = -1;
         int promptId = -1;
+        bool canDelete = false; // sessionCapabilities.delete
     };
+    // Deletes the job's agent session (session/delete), then stops svc.
+    void deleteAgentSession(ACPService *svc, const QString &acpSessionId);
 
     static QString buildPrompt(const QString &projectRoot, const QString &transcriptContent);
     static QString truncateTranscript(const QString &transcript, int maxChars = 50000);

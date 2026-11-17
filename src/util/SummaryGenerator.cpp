@@ -11,6 +11,7 @@
 #include <QJsonObject>
 #include <QPointer>
 #include <QProcess>
+#include <QSettings>
 #include <QTimer>
 
 // Hard ceiling per headless job so a silent or wedged agent cannot leak a
@@ -174,6 +175,8 @@ void SummaryGenerator::onServiceResponse(ACPService *svc, int id,
     }
 
     if (id == job.initId) {
+        job.canDelete = result[QStringLiteral("agentCapabilities")].toObject()[QStringLiteral("sessionCapabilities")].toObject()
+                            [QStringLiteral("delete")].isObject();
         QJsonObject params;
         params[QStringLiteral("cwd")] = job.agentDir;
         // Deliberately no MCP servers: the summariser needs no Kate tools.
@@ -188,6 +191,11 @@ void SummaryGenerator::onServiceResponse(ACPService *svc, int id,
             failJob(svc, QStringLiteral("Summariser agent returned no session id"));
             return;
         }
+        // Remembered before anything can fail: never the user's session.
+        QSettings settings(QStringLiteral("kate-code"), QStringLiteral("kate-code"));
+        QStringList own = settings.value(QStringLiteral("Summaries/agentSessions")).toStringList();
+        own.append(job.acpSessionId);
+        settings.setValue(QStringLiteral("Summaries/agentSessions"), own.mid(std::max<qsizetype>(0, own.size() - 500)));
         QJsonObject textBlock;
         textBlock[QStringLiteral("type")] = QStringLiteral("text");
         textBlock[QStringLiteral("text")] = job.prompt;
@@ -204,9 +212,15 @@ void SummaryGenerator::onServiceResponse(ACPService *svc, int id,
         const QString summary = job.collected.trimmed();
         const QString sessionId = job.sessionId;
         const QString projectRoot = job.projectRoot;
+        const QString acpSessionId = job.acpSessionId;
+        const bool canDelete = job.canDelete;
         m_jobs.erase(it);
-        svc->stop();
-        svc->deleteLater();
+        if (canDelete) {
+            deleteAgentSession(svc, acpSessionId);
+        } else {
+            svc->stop();
+            svc->deleteLater();
+        }
         if (summary.isEmpty()) {
             Q_EMIT summaryError(sessionId, QStringLiteral("Summariser agent returned an empty summary"));
         } else {
@@ -214,6 +228,40 @@ void SummaryGenerator::onServiceResponse(ACPService *svc, int id,
             Q_EMIT summaryReady(sessionId, projectRoot, summary);
         }
     }
+}
+
+QStringList SummaryGenerator::ownAgentSessions()
+{
+    return QSettings(QStringLiteral("kate-code"), QStringLiteral("kate-code")).value(QStringLiteral("Summaries/agentSessions")).toStringList();
+}
+
+void SummaryGenerator::deleteAgentSession(ACPService *svc, const QString &acpSessionId)
+{
+    // The job is over (its signals find no job any more); the agent only
+    // deletes the summariser's session, so that it is not among the user's
+    // sessions (e.g. claude --resume). At most 10 s.
+    const auto done = [svc]() {
+        svc->disconnect();
+        svc->stop();
+        svc->deleteLater();
+    };
+    QJsonObject params;
+    params[QStringLiteral("sessionId")] = acpSessionId;
+    const int id = svc->sendRequest(QStringLiteral("session/delete"), params);
+    if (id < 0) {
+        done();
+        return;
+    }
+    connect(svc, &ACPService::responseReceived, svc, [id, done](int responseId, const QJsonObject &, const QJsonObject &error) {
+        if (responseId == id) {
+            if (!error.isEmpty()) {
+                qDebug() << "[SummaryGenerator] Could not delete the summariser's session:" << error;
+            }
+            done();
+        }
+    });
+    connect(svc, &ACPService::disconnected, svc, done);
+    QTimer::singleShot(10000, svc, done);
 }
 
 void SummaryGenerator::onServiceNotification(ACPService *svc, const QString &method,
