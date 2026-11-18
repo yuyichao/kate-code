@@ -864,6 +864,8 @@ function renderToolCall(toolCall) {
                 ${globSummaryHtml}
                 ${grepSummaryHtml}
                 ${commandDisplay ? `<span class="tool-call-command">${escapeHtml(commandDisplay)}</span>` : ''}
+                ${toolCall.background === 'running' ? '<span class="tool-call-background-badge running" title="The command still runs in the background">running in background</span>'
+                  : toolCall.background === 'finished' ? '<span class="tool-call-background-badge" title="The command ran in the background and has ended">finished in background</span>' : ''}
                 ${fileName ? `<span class="tool-call-file">${escapeHtml(fileName)}</span>` : ''}
                 ${isKate ? '<span class="tool-call-kate-badge">Kate</span>' : ''}
                 <span class="tool-call-toggle">${materialIcon(isExpanded ? 'expand_more' : 'chevron_right', 'material-icon-sm')}</span>
@@ -1760,6 +1762,17 @@ function submitQuestionAnswers(requestId) {
 }
 
 // Set terminalId on a tool call (for vibe-acp where terminal info arrives in tool_call_update)
+// The tool call's command runs in the background (running) or ended there
+// (called from C++).
+function setToolCallBackground(messageId, toolCallId, running) {
+    if (!messages[messageId]) return;
+    const tc = messages[messageId].toolCalls.find(t => t.id === toolCallId);
+    if (tc) {
+        tc.background = running ? 'running' : 'finished';
+        updateMessageDOM(messageId);
+    }
+}
+
 function setToolCallTerminalId(messageId, toolCallId, terminalId) {
     if (!messages[messageId]) return;
     const tc = messages[messageId].toolCalls.find(t => t.id === toolCallId);

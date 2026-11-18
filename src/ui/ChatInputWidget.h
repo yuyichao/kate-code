@@ -82,6 +82,10 @@ public:
     void setAvailableCommands(const QList<SlashCommand> &commands);
     void setAvailableFiles(const QStringList &files);
     void setPromptRunning(bool running);
+    // Commands the agent runs in the background: shown instead of "waiting
+    // for your input" once its turn has ended (it may go on by itself when
+    // they finish).
+    void setBackgroundCommands(int count);
     // Context window usage in the status row: the percentage, with the token
     // counts in the tooltip. used < 0 hides it.
     void setContextUsage(qint64 used, qint64 size);
@@ -133,6 +137,7 @@ private:
     QTimer *m_rateLimitTimer;
     void updateRateLimitDisplay();
     bool m_promptRunning = false;
+    int m_backgroundCommands = 0;
     bool m_inputEnabled = false;
     QCompleter *m_completer;
     QList<SlashCommand> m_availableCommands;

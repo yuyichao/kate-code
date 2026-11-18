@@ -27,6 +27,8 @@ public:
     // Terminal support
     void updateTerminalOutput(const QString &terminalId, const QString &output, bool finished);
     void setToolCallTerminalId(const QString &messageId, const QString &toolCallId, const QString &terminalId);
+    // The tool call's command runs in the background, or ended there.
+    void setToolCallBackground(const QString &messageId, const QString &toolCallId, bool running);
 
     // User question support (MCP AskUserQuestion tool)
     void showUserQuestion(const QString &requestId, const QString &questionsJson);

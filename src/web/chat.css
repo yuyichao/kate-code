@@ -565,6 +565,21 @@ pre code.hljs {
     font-weight: 500;
 }
 
+.tool-call-background-badge {
+    font-size: 10px;
+    font-weight: 500;
+    padding: 1px 5px;
+    border-radius: 3px;
+    margin-left: 6px;
+    white-space: nowrap;
+    background-color: color-mix(in srgb, var(--fg-secondary, #888) 25%, transparent);
+    color: var(--fg-primary);
+}
+
+.tool-call-background-badge.running {
+    background-color: color-mix(in srgb, #f0ad4e 45%, transparent);
+}
+
 .tool-call-kate-badge {
     font-size: 10px;
     font-weight: 500;

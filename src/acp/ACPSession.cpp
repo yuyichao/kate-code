@@ -231,6 +231,10 @@ void ACPSession::resetSessionState()
     m_supportsSetTitle = false;
     m_supportsLoadSession = false;
     m_midTurnPromptIds.clear();
+    m_claudeCodeAgent = false;
+    m_cancelledPromptId = -1;
+    m_toolCallMessages.clear();
+    clearBackgroundWork();
     // The next session (possibly another agent) lists its own commands.
     if (!m_availableCommands.isEmpty()) {
         m_availableCommands.clear();
@@ -277,10 +281,21 @@ void ACPSession::setDocumentProvider(DocumentProvider provider)
 
 void ACPSession::cancelPrompt()
 {
+    if (m_promptRequestId < 0 && m_autonomousTurn) {
+        // Stops the cycle (not commands running in the background).
+        qDebug() << "[ACPSession] Cancelling the agent's own cycle";
+        QJsonObject params;
+        params[QStringLiteral("sessionId")] = m_sessionId;
+        m_service->sendNotification(QStringLiteral("session/cancel"), params);
+        finishAutonomousTurn();
+        Q_EMIT promptCancelled();
+        return;
+    }
     if (m_promptRequestId < 0) {
         qDebug() << "[ACPSession] cancelPrompt called but no prompt running";
         return;
     }
+    m_cancelledPromptId = m_promptRequestId;
 
     qDebug() << "[ACPSession] Cancelling prompt request:" << m_promptRequestId;
 
@@ -851,6 +866,12 @@ void ACPSession::startAssistantMessage()
 
 void ACPSession::dispatchPrompt(const QueuedPrompt &prompt)
 {
+    // A cycle of the agent's own ends here for the chat: what follows
+    // answers this prompt (Claude Code folds the prompt into the cycle).
+    if (m_autonomousTurn) {
+        finishAutonomousTurn();
+    }
+    m_cancelledPromptId = -1;
     // Exactly one assistant placeholder per dispatched turn.
     startAssistantMessage();
 
@@ -1062,6 +1083,15 @@ void ACPSession::onConnected()
     sessionCapabilities[QStringLiteral("configOptions")] = configOptionCapabilities;
     capabilities[QStringLiteral("session")] = sessionCapabilities;
 
+    // Display terminals (Zed's extension): a command's tool call carries
+    // _meta.terminal_info, terminal_output (its output, appended) and
+    // terminal_exit. claude-agent-acp then keeps the terminal of a command
+    // that went to the background open until the command ends, which is how
+    // Kate Code knows that it still runs (backgroundCommandCount()).
+    QJsonObject capabilitiesMeta;
+    capabilitiesMeta[QStringLiteral("terminal_output")] = true;
+    capabilities[QStringLiteral("_meta")] = capabilitiesMeta;
+
     params[QStringLiteral("clientCapabilities")] = capabilities;
 
     m_initializeRequestId = m_service->sendRequest(QStringLiteral("initialize"), params);
@@ -1151,6 +1181,10 @@ QString describeACPError(const QJsonObject &error)
 
 void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject &error)
 {
+    // The cancelled prompt has answered: later output is the agent's own.
+    if (id == m_cancelledPromptId) {
+        m_cancelledPromptId = -1;
+    }
     // A prompt sent during a running turn: its turn is the running one (or
     // the next), which ends with the last of them.
     if (m_midTurnPromptIds.removeOne(id)) {
@@ -1328,6 +1362,9 @@ void ACPSession::handleInitializeResponse(int id, const QJsonObject &result)
     m_supportsPromptQueueing = agentCaps[QStringLiteral("_meta")].toObject()
                                     [QStringLiteral("claudeCode")].toObject()
                                     [QStringLiteral("promptQueueing")].toBool(false);
+    // Only Claude Code works outside a prompt (cycles it starts itself);
+    // output of other agents outside a prompt stays ignored.
+    m_claudeCodeAgent = agentCaps[QStringLiteral("_meta")].toObject()[QStringLiteral("claudeCode")].isObject();
     // An object (even empty) announces session/set_title.
     m_supportsSetTitle = agentCaps[QStringLiteral("sessionCapabilities")].toObject()
                              [QStringLiteral("title")].isObject();
@@ -1416,6 +1453,124 @@ void ACPSession::flushReplayedUserMessage()
     userMsg.timestamp = QDateTime::currentDateTime();
     userMsg.content = parts.join(QStringLiteral("\n\n"));
     Q_EMIT messageAdded(userMsg);
+}
+
+bool ACPSession::isAgentDisplayTerminal(const QString &terminalId, const QString &toolCallId, const QJsonObject &update) const
+{
+    // claude-agent-acp names a display terminal after its tool call, and may
+    // leave _meta.terminal_info out of later updates (unchanged).
+    return update[QStringLiteral("_meta")].toObject().contains(QStringLiteral("terminal_info"))
+        || (terminalId == toolCallId && !m_terminalManager->isValid(terminalId));
+}
+
+QString ACPSession::handleDisplayTerminal(const QString &messageId, const QString &toolCallId, const QJsonObject &update)
+{
+    const QJsonObject meta = update[QStringLiteral("_meta")].toObject();
+    const QString status = update[QStringLiteral("status")].toString();
+    const bool final = status == QLatin1String("completed") || status == QLatin1String("failed");
+    QString output;
+    bool hasData = false;
+    for (const QString &key : {QStringLiteral("terminal_output"), QStringLiteral("terminal_output_delta")}) {
+        const QJsonObject chunk = meta[key].toObject();
+        if (chunk.contains(QStringLiteral("data"))) {
+            m_displayTerminalOutput[toolCallId] += chunk[QStringLiteral("data")].toString();
+            hasData = true;
+        }
+    }
+    if (hasData || final || meta.contains(QStringLiteral("terminal_exit"))) {
+        output = m_displayTerminalOutput.value(toolCallId);
+    }
+    if (final || meta.contains(QStringLiteral("terminal_exit"))) {
+        m_displayTerminalOutput.remove(toolCallId);
+    }
+    if (isReplaying()) {
+        // History: nothing of it runs now.
+        m_displayTerminals.remove(toolCallId);
+        return output;
+    }
+
+    // A command that went to the background: its result names the task
+    // (_meta.claudeCode.toolResponse.backgroundTaskId), the call completes,
+    // and the terminal stays open until the command ends (terminal_exit,
+    // also after the turn). A fast command that ended before its result
+    // exits with it.
+    if (!meta[QStringLiteral("claudeCode")].toObject()[QStringLiteral("toolResponse")].toObject()
+             [QStringLiteral("backgroundTaskId")].toString().isEmpty()) {
+        m_backgroundTaskToolCalls.insert(toolCallId);
+    }
+    if (meta.contains(QStringLiteral("terminal_exit"))) {
+        m_displayTerminals.remove(toolCallId);
+        m_backgroundTaskToolCalls.remove(toolCallId);
+        if (m_backgroundTerminals.remove(toolCallId)) {
+            qDebug() << "[ACPSession] Background command ended:" << toolCallId;
+            Q_EMIT toolCallBackgroundChanged(messageId, toolCallId, false);
+            Q_EMIT backgroundActivityChanged();
+        }
+    } else if (final && m_displayTerminals.contains(toolCallId)) {
+        if (status == QLatin1String("completed") && m_backgroundTaskToolCalls.contains(toolCallId)) {
+            qDebug() << "[ACPSession] Command runs in the background:" << toolCallId;
+            m_backgroundTerminals.insert(toolCallId);
+            Q_EMIT toolCallBackgroundChanged(messageId, toolCallId, true);
+            Q_EMIT backgroundActivityChanged();
+        } else {
+            // Never ran (refused, stopped): no exit will come.
+            m_displayTerminals.remove(toolCallId);
+        }
+        m_backgroundTaskToolCalls.remove(toolCallId);
+    }
+    return output;
+}
+
+void ACPSession::startAutonomousTurn()
+{
+    qDebug() << "[ACPSession] The agent works on its own (output outside a prompt)";
+    Message assistantMsg;
+    assistantMsg.id = QStringLiteral("auto_%1").arg(++m_autonomousCounter);
+    assistantMsg.role = QStringLiteral("assistant");
+    assistantMsg.timestamp = QDateTime::currentDateTime();
+    assistantMsg.isStreaming = true;
+    m_currentMessageId = assistantMsg.id;
+    m_currentMessageContent.clear();
+    m_currentMessageTimestamp = assistantMsg.timestamp;
+    m_autonomousTurn = true;
+    Q_EMIT messageAdded(assistantMsg);
+    Q_EMIT backgroundActivityChanged();
+}
+
+void ACPSession::finishAutonomousTurn()
+{
+    if (!m_autonomousTurn) {
+        return;
+    }
+    qDebug() << "[ACPSession] The agent's own cycle ended";
+    m_autonomousTurn = false;
+    if (!m_currentMessageId.isEmpty()) {
+        if (!m_currentMessageContent.isEmpty() && m_transcript) {
+            Message assistantMsg;
+            assistantMsg.id = m_currentMessageId;
+            assistantMsg.role = QStringLiteral("assistant");
+            assistantMsg.content = m_currentMessageContent;
+            assistantMsg.timestamp = m_currentMessageTimestamp;
+            m_transcript->recordMessage(assistantMsg);
+        }
+        Q_EMIT messageFinished(m_currentMessageId);
+        m_currentMessageId.clear();
+        m_currentMessageContent.clear();
+    }
+    Q_EMIT backgroundActivityChanged();
+}
+
+void ACPSession::clearBackgroundWork()
+{
+    const bool active = m_autonomousTurn || !m_backgroundTerminals.isEmpty();
+    m_autonomousTurn = false;
+    m_displayTerminals.clear();
+    m_backgroundTaskToolCalls.clear();
+    m_backgroundTerminals.clear();
+    m_displayTerminalOutput.clear();
+    if (active) {
+        Q_EMIT backgroundActivityChanged();
+    }
 }
 
 void ACPSession::startReplayedAssistantMessage()
@@ -1797,6 +1952,15 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         }
     }
 
+    // Claude Code's output outside a prompt: a cycle it started on its own
+    // (e.g. a background task ended). Not the trailing output of a
+    // cancelled prompt, nor a silent summary's.
+    if (!replaying && m_claudeCodeAgent && !isPromptRunning() && m_cancelledPromptId < 0 && !isSummaryRunning()
+        && m_currentMessageId.isEmpty() && m_status == ConnectionStatus::Connected
+        && (updateType == QStringLiteral("agent_message_chunk") || updateType == QStringLiteral("tool_call"))) {
+        startAutonomousTurn();
+    }
+
     if (!replaying && m_service->isRemote() && (updateType == QStringLiteral("tool_call") || updateType == QStringLiteral("tool_call_update"))) {
         const QString toolCallId = update[QStringLiteral("toolCallId")].toString();
         if (updateType == QStringLiteral("tool_call")) {
@@ -2004,8 +2168,11 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
 
                 qDebug() << "[ACPSession] Edit" << i + 1 << "detected - old:" << edit.oldText.length()
                          << "chars, new:" << edit.newText.length() << "chars";
-            } else if (type == QStringLiteral("terminal")) {
-                // This tool call has embedded terminal output
+            } else if (type == QStringLiteral("terminal")
+                       && !isAgentDisplayTerminal(contentItem[QStringLiteral("terminalId")].toString(), toolCall.id, update)) {
+                // This tool call has embedded terminal output (a terminal
+                // Kate Code runs; an agent's display terminal gives its
+                // output as the result).
                 toolCall.terminalId = contentItem[QStringLiteral("terminalId")].toString();
                 qDebug() << "[ACPSession] Terminal embedded - id:" << toolCall.terminalId;
             }
@@ -2050,8 +2217,12 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
 
         // Store tool input for later lookup (e.g., to check ExitPlanMode parameters)
         m_toolCallInputs[toolCall.id] = toolCall.input;
+        if (!replaying && update[QStringLiteral("_meta")].toObject().contains(QStringLiteral("terminal_info"))) {
+            m_displayTerminals.insert(toolCall.id);
+        }
 
         if (!m_currentMessageId.isEmpty()) {
+            m_toolCallMessages.insert(toolCall.id, m_currentMessageId);
             Q_EMIT toolCallAdded(m_currentMessageId, toolCall);
             m_transcript->recordToolCall(toolCall);
 
@@ -2154,10 +2325,14 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
             QString contentType = contentItem[QStringLiteral("type")].toString();
 
             if (contentType == QStringLiteral("terminal")) {
-                // vibe-acp sends terminal info in tool_call_update (not in initial tool_call)
+                // vibe-acp sends terminal info in tool_call_update (not in initial tool_call);
+                // an agent's display terminal is not one of Kate Code's
                 terminalId = contentItem[QStringLiteral("terminalId")].toString();
                 if (terminalId.isEmpty()) {
                     terminalId = contentItem[QStringLiteral("terminal_id")].toString();
+                }
+                if (isAgentDisplayTerminal(terminalId, toolCallId, update)) {
+                    terminalId.clear();
                 }
                 qDebug() << "[ACPSession] tool_call_update has terminal content - id:" << terminalId;
             } else if (contentType == QStringLiteral("content")) {
@@ -2321,6 +2496,17 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
             }
         }
 
+        // The tool call's own message: its updates can come after its turn
+        // (a command in the background, a cycle's tool call reported after
+        // the cycle was stopped).
+        const QString messageId = m_toolCallMessages.value(toolCallId, m_currentMessageId);
+        // A display terminal's output is the result (sent before the status;
+        // given again with the final status for the transcript).
+        const QString terminalOutput = handleDisplayTerminal(messageId, toolCallId, update);
+        if (result.isEmpty()) {
+            result = terminalOutput;
+        }
+
         // Infer tool name if not provided by _meta (needed when tool_call event was skipped)
         if (toolName.isEmpty() || (!isReadTool(toolName) && !isWriteTool(toolName) &&
             !isEditTool(toolName) && !isBashTool(toolName))) {
@@ -2341,16 +2527,16 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
                  << "status:" << status << "operation:" << operationType
                  << "toolName:" << toolName << "result length:" << result.length();
 
-        if (!m_currentMessageId.isEmpty()) {
+        if (!messageId.isEmpty()) {
             // Link terminal to tool call if we found one (vibe-acp sends terminal in tool_call_update)
             if (!terminalId.isEmpty()) {
-                Q_EMIT toolCallTerminalIdSet(m_currentMessageId, toolCallId, terminalId);
+                Q_EMIT toolCallTerminalIdSet(messageId, toolCallId, terminalId);
             }
 
             // Only emit update if we have a result OR status changed
             // (Don't overwrite good results with empty ones from status-only updates)
             if (!result.isEmpty() || !status.isEmpty()) {
-                Q_EMIT toolCallUpdated(m_currentMessageId, toolCallId, status, result, updateFilePath, toolName);
+                Q_EMIT toolCallUpdated(messageId, toolCallId, status, result, updateFilePath, toolName);
                 m_transcript->recordToolUpdate(toolCallId, status, result);
             }
         }
@@ -2404,6 +2590,14 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
             m_usage.currency = cost[QStringLiteral("currency")].toString();
         }
         Q_EMIT usageChanged(m_usage);
+        // The usage of a result (with its cost, and the origin of the work)
+        // ends a cycle Claude Code ran on its own. Mid-turn usage reports
+        // have neither.
+        if (m_autonomousTurn && !isPromptRunning()
+            && (update.contains(QStringLiteral("cost"))
+                || update[QStringLiteral("_meta")].toObject().contains(QStringLiteral("_claude/origin")))) {
+            finishAutonomousTurn();
+        }
         const QJsonObject rateLimit = update[QStringLiteral("_meta")].toObject()[QStringLiteral("_claude/rateLimit")].toObject();
         if (!rateLimit.isEmpty()) {
             const RateLimits limits = RateLimits::fromClaudeRateLimit(rateLimit, QDateTime::currentDateTime());

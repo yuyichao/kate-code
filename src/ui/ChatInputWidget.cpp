@@ -715,6 +715,15 @@ void ChatInputWidget::setPromptRunning(bool running)
     updateWaitingIndicator();
 }
 
+void ChatInputWidget::setBackgroundCommands(int count)
+{
+    if (count == m_backgroundCommands) {
+        return;
+    }
+    m_backgroundCommands = count;
+    updateWaitingIndicator();
+}
+
 static QString formatTokens(qint64 tokens)
 {
     if (tokens >= 1000000) {
@@ -861,6 +870,17 @@ void ChatInputWidget::updateWaitingIndicator()
         m_waitingLabel->setStyleSheet(
             QStringLiteral("QLabel { color: palette(mid); font-size: 11px; }"));
         m_waitingLabel->setToolTip(QStringLiteral("The agent is processing your request"));
+    } else if (m_backgroundCommands > 0) {
+        // The turn has ended, but commands it started still run: the agent
+        // may continue by itself when they finish.
+        m_waitingLabel->setText(m_backgroundCommands == 1
+                                    ? QStringLiteral("◐ Command running in the background")
+                                    : QStringLiteral("◐ %1 commands running in the background").arg(m_backgroundCommands));
+        m_waitingLabel->setStyleSheet(
+            QStringLiteral("QLabel { color: #f0ad4e; font-size: 11px; font-weight: bold; }"));
+        m_waitingLabel->setToolTip(QStringLiteral(
+            "The agent's turn has ended, but commands it started are still running.\n"
+            "It may continue by itself when they finish. You can send a message meanwhile."));
     } else {
         // Agent has finished: highlight that it is waiting for input
         m_waitingLabel->setText(QStringLiteral("● Waiting for your input"));

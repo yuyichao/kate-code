@@ -460,6 +460,13 @@ void ChatWebView::setToolCallTerminalId(const QString &messageId, const QString 
     runJavaScript(script);
 }
 
+void ChatWebView::setToolCallBackground(const QString &messageId, const QString &toolCallId, bool running)
+{
+    runJavaScript(QStringLiteral("setToolCallBackground('%1', '%2', %3);")
+                      .arg(escapeJsString(messageId), escapeJsString(toolCallId),
+                           running ? QStringLiteral("true") : QStringLiteral("false")));
+}
+
 void ChatWebView::setupBridge()
 {
     QWebChannel *channel = new QWebChannel(this);

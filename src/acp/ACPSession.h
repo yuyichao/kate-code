@@ -103,6 +103,18 @@ public:
     // side effects of a live turn (diff highlights, remote host holds,
     // document checks).
     bool isReplaying() const { return m_sessionLoadRequestId >= 0; }
+    // Claude Code's work outside a prompt (claude-agent-acp, which marks
+    // itself with agentCapabilities._meta.claudeCode; Kate Code advertises
+    // its display terminals, clientCapabilities._meta.terminal_output):
+    // - commands running in the background: a Bash call that completed with
+    //   a background task id and its display terminal still open, until the
+    //   agent reports the terminal's exit (also after the turn);
+    // - a cycle Claude Code runs on its own (e.g. when a background task
+    //   ended): its output arrives outside a prompt and is shown as an
+    //   assistant message until the cycle's result (the usage_update with
+    //   its cost), a prompt or cancelPrompt().
+    int backgroundCommandCount() const { return m_backgroundTerminals.size(); }
+    bool isWorkingOnItsOwn() const { return m_autonomousTurn; }
     // History replayed by session/load: the user message being collected
     // (shown when it ends), and helpers ending the replayed messages.
     QStringList m_replayUserChunks; // content blocks of the user message
@@ -187,6 +199,12 @@ Q_SIGNALS:
     // A remote agent's tool (not one of Kate's) may change files of its host
     // (below hostDir), which Kate sees only later (EditorSession::holdRemoteFiles()).
     void remoteHostActivity(const QString &hostDir);
+
+    // backgroundCommandCount() or isWorkingOnItsOwn() changed.
+    void backgroundActivityChanged();
+    // A tool call's command runs in the background (running), or ended
+    // there.
+    void toolCallBackgroundChanged(const QString &messageId, const QString &toolCallId, bool running);
 
     // Emitted when a built-in Edit/Write tool writes a file, with old and new content for diff display
     void fsEditApplied(const QString &filePath, const QString &oldText, const QString &newText);
@@ -380,6 +398,32 @@ private:
     // session/prompt requests sent while m_promptRequestId's turn runs. The
     // turn ends (and the next queued prompt goes out) once all have answered.
     QList<int> m_midTurnPromptIds;
+    // Work outside a prompt (see backgroundCommandCount()).
+    bool m_claudeCodeAgent = false;
+    // The message of each tool call: its updates can come after its turn.
+    QHash<QString, QString> m_toolCallMessages;
+    // Display terminals (_meta.terminal_info) not exited yet; tool calls
+    // whose result named a background task; the commands running in the
+    // background.
+    QSet<QString> m_displayTerminals;
+    QSet<QString> m_backgroundTaskToolCalls;
+    QSet<QString> m_backgroundTerminals;
+    // Output of each display terminal so far (appended chunks).
+    QHash<QString, QString> m_displayTerminalOutput;
+    bool m_autonomousTurn = false;
+    int m_autonomousCounter = 0;
+    // A cancelled prompt whose response has not come: its trailing output
+    // is not a cycle of its own.
+    int m_cancelledPromptId = -1;
+    void startAutonomousTurn();
+    void finishAutonomousTurn();
+    void clearBackgroundWork();
+    // _meta.terminal_* of a tool call update (claude-agent-acp's display
+    // terminals). Returns the command output it carries, if any.
+    QString handleDisplayTerminal(const QString &messageId, const QString &toolCallId, const QJsonObject &update);
+    // A terminal of the tool call's content that the agent only displays
+    // (not one Kate Code runs for it, TerminalManager).
+    bool isAgentDisplayTerminal(const QString &terminalId, const QString &toolCallId, const QJsonObject &update) const;
     QString m_title;
     // In-flight session/set_title requests.
     QSet<int> m_setTitleRequestIds;

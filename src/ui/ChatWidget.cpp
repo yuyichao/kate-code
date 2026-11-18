@@ -257,6 +257,11 @@ ChatWidget::ChatWidget(QWidget *parent)
     connect(m_session, &ACPSession::messageAdded, this, &ChatWidget::onMessageAdded);
     connect(m_session, &ACPSession::messageUpdated, this, &ChatWidget::onMessageUpdated);
     connect(m_session, &ACPSession::messageFinished, this, &ChatWidget::onMessageFinished);
+    // Commands in the background: the status row (a cycle of the agent's own
+    // shows as working, since its message runs like a prompt's).
+    connect(m_session, &ACPSession::backgroundActivityChanged, this, [this]() {
+        m_inputWidget->setBackgroundCommands(m_session->backgroundCommandCount());
+    });
     connect(m_session, &ACPSession::toolCallAdded, this, &ChatWidget::onToolCallAdded);
     connect(m_session, &ACPSession::toolCallUpdated, this, &ChatWidget::onToolCallUpdated);
     connect(m_session, &ACPSession::fsEditApplied, this, &ChatWidget::onEditApplied);
@@ -2011,6 +2016,7 @@ void ChatWidget::connectWebViewSignals()
     // Terminal output updates (forward to web view for live display)
     connect(m_session, &ACPSession::terminalOutputUpdated, m_chatWebView, &ChatWebView::updateTerminalOutput);
     connect(m_session, &ACPSession::toolCallTerminalIdSet, m_chatWebView, &ChatWebView::setToolCallTerminalId);
+    connect(m_session, &ACPSession::toolCallBackgroundChanged, m_chatWebView, &ChatWebView::setToolCallBackground);
 
     // Connect web view permission responses back to ACP
     connect(m_chatWebView, &ChatWebView::permissionResponseReady, this, [this](int requestId, const QString &optionId) {
@@ -2050,6 +2056,7 @@ void ChatWidget::resetWebView()
     // Disconnect signals from session to old web view (prevents dangling connections)
     disconnect(m_session, &ACPSession::terminalOutputUpdated, m_chatWebView, nullptr);
     disconnect(m_session, &ACPSession::toolCallTerminalIdSet, m_chatWebView, nullptr);
+    disconnect(m_session, &ACPSession::toolCallBackgroundChanged, m_chatWebView, nullptr);
     disconnect(m_session->editTracker(), &EditTracker::editRecorded, m_chatWebView, nullptr);
     disconnect(m_session->editTracker(), &EditTracker::editsCleared, m_chatWebView, nullptr);
 
