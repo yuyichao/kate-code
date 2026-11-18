@@ -234,6 +234,7 @@ void ACPSession::resetSessionState()
     m_claudeCodeAgent = false;
     m_cancelledPromptId = -1;
     m_toolCallMessages.clear();
+    recordRemoteUserMessage();
     clearBackgroundWork();
     // The next session (possibly another agent) lists its own commands.
     if (!m_availableCommands.isEmpty()) {
@@ -839,7 +840,7 @@ void ACPSession::sendMessage(const QString &content, const QString &filePath, co
     dispatchPrompt(prompt);
 }
 
-void ACPSession::startAssistantMessage()
+void ACPSession::startAssistantMessage(const QString &id)
 {
     if (!m_currentMessageId.isEmpty()) {
         if (!m_currentMessageContent.isEmpty() && m_transcript) {
@@ -854,7 +855,7 @@ void ACPSession::startAssistantMessage()
     }
     // Create assistant placeholder for streaming.
     Message assistantMsg;
-    assistantMsg.id = QStringLiteral("msg_%1").arg(++m_messageCounter);
+    assistantMsg.id = id.isEmpty() ? QStringLiteral("msg_%1").arg(++m_messageCounter) : id;
     assistantMsg.role = QStringLiteral("assistant");
     assistantMsg.timestamp = QDateTime::currentDateTime();
     assistantMsg.isStreaming = true;
@@ -1424,23 +1425,29 @@ void ACPSession::handleSessionNewResponse(int id, const QJsonObject &result)
     beginSessionConfiguration(false);
 }
 
+QString ACPSession::shownUserText(QString text)
+{
+    static const QRegularExpression context(QStringLiteral("<(system-reminder|ide_[a-z_]+)>.*?</\\1>"),
+                                            QRegularExpression::DotMatchesEverythingOption);
+    text.remove(context);
+    text = text.trimmed();
+    if (text.startsWith(QLatin1String("--- Previous session record ---"))) {
+        // Kate Code's context injection (ChatWidget).
+        text = QStringLiteral("(The record of an earlier session, given as context)");
+    }
+    return text;
+}
+
 void ACPSession::flushReplayedUserMessage()
 {
     // Each chunk is a content block of the prompt (a command, an editor's
     // context, the text): context blocks other clients and Kate Code add
     // are left out, the rest is shown as one message.
-    static const QRegularExpression context(QStringLiteral("<(system-reminder|ide_[a-z_]+)>.*?</\\1>"),
-                                            QRegularExpression::DotMatchesEverythingOption);
     QStringList parts;
-    for (QString chunk : std::as_const(m_replayUserChunks)) {
-        chunk.remove(context);
-        chunk = chunk.trimmed();
-        if (chunk.startsWith(QLatin1String("--- Previous session record ---"))) {
-            // Kate Code's context injection (ChatWidget).
-            chunk = QStringLiteral("(The record of an earlier session, given as context)");
-        }
-        if (!chunk.isEmpty()) {
-            parts.append(chunk);
+    for (const QString &chunk : std::as_const(m_replayUserChunks)) {
+        const QString text = shownUserText(chunk);
+        if (!text.isEmpty()) {
+            parts.append(text);
         }
     }
     m_replayUserChunks.clear();
@@ -1558,6 +1565,50 @@ void ACPSession::finishAutonomousTurn()
         m_currentMessageContent.clear();
     }
     Q_EMIT backgroundActivityChanged();
+}
+
+void ACPSession::handleRemoteUserChunk(const QJsonObject &content)
+{
+    // Text blocks only, as in a replay.
+    if (content[QStringLiteral("type")].toString() != QLatin1String("text")) {
+        return;
+    }
+    const QString text = shownUserText(content[QStringLiteral("text")].toString());
+    if (text.isEmpty()) {
+        return;
+    }
+    if (!m_remoteUserMessage.id.isEmpty()) {
+        // A further block of the same message.
+        m_remoteUserMessage.content += QStringLiteral("\n\n") + text;
+        Q_EMIT messageUpdated(m_remoteUserMessage.id, QStringLiteral("\n\n") + text);
+        return;
+    }
+    qDebug() << "[ACPSession] A message from another client of the session";
+    m_remoteUserMessage.id = QStringLiteral("remote_%1").arg(++m_remoteCounter);
+    m_remoteUserMessage.role = QStringLiteral("user");
+    m_remoteUserMessage.timestamp = QDateTime::currentDateTime();
+    m_remoteUserMessage.content = text;
+    Q_EMIT messageAdded(m_remoteUserMessage);
+
+    // Claude Code takes it into the turn that runs, or starts a cycle for it.
+    if (isPromptRunning()) {
+        startAssistantMessage();
+    } else if (m_autonomousTurn) {
+        startAssistantMessage(QStringLiteral("auto_%1").arg(++m_autonomousCounter));
+    } else if (m_status == ConnectionStatus::Connected && !isSummaryRunning()) {
+        startAutonomousTurn();
+    }
+}
+
+void ACPSession::recordRemoteUserMessage()
+{
+    if (m_remoteUserMessage.id.isEmpty()) {
+        return;
+    }
+    if (m_transcript) {
+        m_transcript->recordMessage(m_remoteUserMessage);
+    }
+    m_remoteUserMessage = Message();
 }
 
 void ACPSession::clearBackgroundWork()
@@ -1950,6 +2001,16 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
                 startReplayedAssistantMessage();
             }
         }
+    }
+
+    if (!replaying && m_claudeCodeAgent) {
+        // A message typed in another client of the session (Claude Code
+        // sends Kate Code's own prompts back only when replaying).
+        if (updateType == QStringLiteral("user_message_chunk")) {
+            handleRemoteUserChunk(update[QStringLiteral("content")].toObject());
+            return;
+        }
+        recordRemoteUserMessage();
     }
 
     // Claude Code's output outside a prompt: a cycle it started on its own

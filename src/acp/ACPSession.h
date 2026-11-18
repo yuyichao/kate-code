@@ -120,6 +120,9 @@ public:
     QStringList m_replayUserChunks; // content blocks of the user message
     int m_replayCounter = 0;
     void flushReplayedUserMessage();
+    // A user message content block as shown: other clients' and Kate Code's
+    // context blocks left out (empty if nothing is left).
+    static QString shownUserText(QString text);
     void finishReplayedMessage();
     void startReplayedAssistantMessage();
     // agentCapabilities.loadSession: session/load is available.
@@ -238,8 +241,9 @@ private:
     // step, or runs it next.
     void sendPromptMidTurn(const QueuedPrompt &prompt);
     // Finish the streaming assistant message and start a new one (output
-    // after a message sent mid-turn shows below it).
-    void startAssistantMessage();
+    // after a message sent mid-turn shows below it); the id is a new msg_N
+    // unless given.
+    void startAssistantMessage(const QString &id = QString());
 
     // Send the silent summary session/prompt now (requestSummary defers this
     // while a cancelled prompt's response is outstanding).
@@ -417,6 +421,14 @@ private:
     int m_cancelledPromptId = -1;
     void startAutonomousTurn();
     void finishAutonomousTurn();
+    // A message typed in another client of the session (Claude Code's Remote
+    // Control: claude.ai, the mobile app), sent as user_message_chunk outside
+    // a replay: shown at once, recorded in the transcript once the agent
+    // sends something else (m_remoteUserMessage); what follows answers it.
+    Message m_remoteUserMessage;
+    int m_remoteCounter = 0;
+    void handleRemoteUserChunk(const QJsonObject &content);
+    void recordRemoteUserMessage();
     void clearBackgroundWork();
     // _meta.terminal_* of a tool call update (claude-agent-acp's display
     // terminals). Returns the command output it carries, if any.
