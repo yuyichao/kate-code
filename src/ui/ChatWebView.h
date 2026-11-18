@@ -29,6 +29,9 @@ public:
     void setToolCallTerminalId(const QString &messageId, const QString &toolCallId, const QString &terminalId);
     // The tool call's command runs in the background, or ended there.
     void setToolCallBackground(const QString &messageId, const QString &toolCallId, bool running);
+    // A loaded session's history arrives: kept, and drawn once it has
+    // (newest messages first).
+    void setReplaying(bool replaying);
 
     // User question support (MCP AskUserQuestion tool)
     void showUserQuestion(const QString &requestId, const QString &questionsJson);

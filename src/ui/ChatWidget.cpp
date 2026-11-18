@@ -2017,6 +2017,10 @@ void ChatWidget::connectWebViewSignals()
     connect(m_session, &ACPSession::terminalOutputUpdated, m_chatWebView, &ChatWebView::updateTerminalOutput);
     connect(m_session, &ACPSession::toolCallTerminalIdSet, m_chatWebView, &ChatWebView::setToolCallTerminalId);
     connect(m_session, &ACPSession::toolCallBackgroundChanged, m_chatWebView, &ChatWebView::setToolCallBackground);
+    connect(m_session, &ACPSession::replayingChanged, m_chatWebView, &ChatWebView::setReplaying);
+    if (m_session->isReplaying()) {
+        m_chatWebView->setReplaying(true);
+    }
 
     // Connect web view permission responses back to ACP
     connect(m_chatWebView, &ChatWebView::permissionResponseReady, this, [this](int requestId, const QString &optionId) {
@@ -2057,6 +2061,7 @@ void ChatWidget::resetWebView()
     disconnect(m_session, &ACPSession::terminalOutputUpdated, m_chatWebView, nullptr);
     disconnect(m_session, &ACPSession::toolCallTerminalIdSet, m_chatWebView, nullptr);
     disconnect(m_session, &ACPSession::toolCallBackgroundChanged, m_chatWebView, nullptr);
+    disconnect(m_session, &ACPSession::replayingChanged, m_chatWebView, nullptr);
     disconnect(m_session->editTracker(), &EditTracker::editRecorded, m_chatWebView, nullptr);
     disconnect(m_session->editTracker(), &EditTracker::editsCleared, m_chatWebView, nullptr);
 

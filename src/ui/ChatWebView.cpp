@@ -460,6 +460,11 @@ void ChatWebView::setToolCallTerminalId(const QString &messageId, const QString 
     runJavaScript(script);
 }
 
+void ChatWebView::setReplaying(bool replaying)
+{
+    runJavaScript(replaying ? QStringLiteral("setReplaying(true);") : QStringLiteral("setReplaying(false);"));
+}
+
 void ChatWebView::setToolCallBackground(const QString &messageId, const QString &toolCallId, bool running)
 {
     runJavaScript(QStringLiteral("setToolCallBackground('%1', '%2', %3);")

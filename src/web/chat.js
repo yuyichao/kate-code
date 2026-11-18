@@ -431,6 +431,88 @@ function addMessage(id, role, content, timestamp, isStreaming, images) {
     scrollToBottom();
 }
 
+// Drawing. A message's HTML is built whole (markdown, highlighting, every
+// tool call), so an update only marks the message, and it is drawn once for
+// all the updates that come together. The history a loaded session replays
+// is drawn when it has all come: the newest messages at once, the older
+// ones in the background, newest first (or when updated).
+let dirtyMessages = new Set();
+let drawTimer = null;
+let scrollWanted = false;
+let replaying = false;
+let olderMessages = [];  // replayed messages not drawn yet, newest first
+let olderTimer = null;
+
+function scheduleDraw() {
+    if (drawTimer === null) {
+        drawTimer = setTimeout(drawDirtyMessages, 16);
+    }
+}
+
+function drawDirtyMessages() {
+    drawTimer = null;
+    const ids = Array.from(dirtyMessages);
+    dirtyMessages.clear();
+    for (const id of ids) {
+        drawMessage(id);
+    }
+    if (scrollWanted) {
+        scrollWanted = false;
+        scrollToBottomNow();
+    }
+}
+
+function setReplaying(on) {
+    if (on) {
+        replaying = true;
+        return;
+    }
+    if (!replaying) return;
+    replaying = false;
+    const container = document.getElementById('messages');
+    const ids = [];
+    for (const el of container.children) {
+        const id = el.id && el.id.startsWith('message-') ? el.id.substring(8) : null;
+        if (id && dirtyMessages.has(id) && messages[id] && messages[id].element === el) ids.push(id);
+    }
+    dirtyMessages.clear();
+    olderMessages = ids.reverse().concat(olderMessages);
+    // What shows: the newest messages, until the view is filled (and a
+    // little more), then the rest in the background.
+    const start = performance.now();
+    while (olderMessages.length > 0
+           && (container.scrollHeight < window.innerHeight * 2 || performance.now() - start < 30)) {
+        drawMessage(olderMessages.shift());
+    }
+    scrollToBottomNow();
+    logToQt('Replayed history: ' + ids.length + ' messages, ' + (ids.length - olderMessages.length)
+            + ' drawn in ' + Math.round(performance.now() - start) + ' ms, the rest in the background');
+    scheduleOlder();
+    if (dirtyMessages.size > 0 || scrollWanted) scheduleDraw();
+}
+
+function scheduleOlder() {
+    if (olderTimer === null && olderMessages.length > 0) {
+        olderTimer = setTimeout(drawOlderMessages, 0);
+    }
+}
+
+function drawOlderMessages() {
+    olderTimer = null;
+    // The page scrolls (the body grows with #messages).
+    const page = document.scrollingElement || document.documentElement;
+    const atBottom = page.scrollHeight - page.scrollTop - page.clientHeight < 40;
+    const start = performance.now();
+    while (olderMessages.length > 0 && performance.now() - start < 30) {
+        drawMessage(olderMessages.shift());
+    }
+    // Above the view: the browser keeps what is shown in place (scroll
+    // anchoring), and the bottom stays the bottom.
+    if (atBottom) scrollToBottomNow();
+    if (olderMessages.length === 0) logToQt('Replayed history drawn');
+    scheduleOlder();
+}
+
 // Show a distinct error banner (ACP/session errors).
 // text is Base64-encoded UTF-8 to avoid JS string injection.
 function addErrorMessage(base64Text) {
@@ -662,7 +744,7 @@ function setToolCallDiff(messageId, toolCallId, filePath, b64OldText, b64NewText
     updateMessageDOM(messageId);
 }
 
-// Render a message to DOM
+// Add a message's element (drawn with the next draw)
 function renderMessage(message) {
     const container = document.getElementById('messages');
 
@@ -672,17 +754,27 @@ function renderMessage(message) {
         messageEl.classList.add('streaming');
     }
     messageEl.id = `message-${message.id}`;
-
-    messageEl.innerHTML = createMessageHTML(message);
+    // Its own element: ids can repeat (C++ adds every "Generation stopped"
+    // notice as sys_cancelled).
+    message.element = messageEl;
     container.appendChild(messageEl);
+    updateMessageDOM(message.id);
 }
 
-// Update existing message in DOM
+// The message changed: draw it again (see scheduleDraw())
 function updateMessageDOM(id) {
+    if (!messages[id]) return;
+    const older = olderMessages.indexOf(id);
+    if (older >= 0) olderMessages.splice(older, 1);
+    dirtyMessages.add(id);
+    if (!replaying) scheduleDraw();
+}
+
+function drawMessage(id) {
     const message = messages[id];
     if (!message) return;
 
-    const messageEl = document.getElementById(`message-${id}`);
+    const messageEl = message.element;
     if (!messageEl) return;
 
     messageEl.className = `message ${message.role}`;
@@ -1162,6 +1254,9 @@ function toggleToolCall(toolCallId) {
 // Clear all messages and reset all state for new session
 function clearMessages() {
     messages = {};
+    dirtyMessages.clear();
+    olderMessages = [];
+    scrollWanted = false;
     terminals = {};  // Clear terminal output cache
     questionSelections = {};  // Clear any pending question state
 
@@ -1265,6 +1360,12 @@ function toggleTodos() {
 // overflow-y:auto), so we must scroll that element directly.
 // The window.scrollTo call is kept as a harmless fallback.
 function scrollToBottom() {
+    if (replaying) return;
+    scrollWanted = true;
+    scheduleDraw();
+}
+
+function scrollToBottomNow() {
     const c = document.getElementById('messages');
     if (c) { c.scrollTop = c.scrollHeight; }
     window.scrollTo(0, document.body.scrollHeight);

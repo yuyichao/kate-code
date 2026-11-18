@@ -189,6 +189,10 @@ Q_SIGNALS:
     // Emitted after initialize completes, before session creation
     void initializeComplete();
 
+    // session/load was sent (true: the history it replays follows) or
+    // answered or abandoned (false).
+    void replayingChanged(bool replaying);
+
     // Emitted if session/load fails (caller should fall back to createNewSession)
     void sessionLoadFailed(const QString &error);
 

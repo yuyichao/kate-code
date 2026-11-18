@@ -194,7 +194,10 @@ void ACPSession::resetSessionState()
     m_sessionLoadId.clear();
     m_initializeRequestId = -1;
     m_sessionNewRequestId = -1;
-    m_sessionLoadRequestId = -1;
+    if (m_sessionLoadRequestId >= 0) {
+        m_sessionLoadRequestId = -1;
+        Q_EMIT replayingChanged(false);
+    }
     m_replayUserChunks.clear();
     m_sessionConfigRequestId = -1;
     m_pendingSessionConfigKeys.clear();
@@ -768,6 +771,9 @@ void ACPSession::loadSession(const QString &sessionId)
     m_sessionLoadId = sessionId;
     m_sessionLoadRequestId = m_service->sendRequest(QStringLiteral("session/load"), params);
     qDebug() << "[ACPSession] Sent session/load request, id:" << m_sessionLoadRequestId;
+    if (m_sessionLoadRequestId >= 0) {
+        Q_EMIT replayingChanged(true);
+    }
 }
 
 bool ACPSession::isSlashCommand(const QString &text) const
@@ -1658,6 +1664,7 @@ void ACPSession::handleSessionLoadResponse(int id, const QJsonObject &result, co
     const QString requestedSessionId = m_sessionLoadId;
     m_sessionLoadId.clear();
     m_sessionLoadRequestId = -1;
+    Q_EMIT replayingChanged(false);
 
     if (!error.isEmpty()) {
         m_sessionId.clear();
