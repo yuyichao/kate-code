@@ -162,5 +162,6 @@ Settings > Configure Kate > Plugins > Enable "Kate Code"
 - QWebEngineView loads HTML from Qt resources (qrc:/katecode/web/chat.html)
 - JavaScript functions exposed: `addMessage()`, `updateMessage()`, `finishMessage()`, `addToolCall()`, `updateToolCall()`
 - C++ calls JavaScript via `page()->runJavaScript()` with proper string escaping
+- Tool and terminal output goes through `src/web/terminal-renderer.js` (a small terminal emulator: colours, cursor movement, 120 columns). Its input is decoded text, read by code point; wide characters (East Asian, emoji) take two columns, combining marks none. Rows that wrap at the width are marked and joined back into one line in the HTML (the `pre-wrap` boxes wrap it to the view's width; copying gives the original line); wrapping waits for the next character, as in terminals. Checked with node only (scratch cases), no test in ctest
 - CSS uses CSS variables for theming (ready for KDE color injection in Phase 4)
 - Responsive layout with message bubbles, tool call display, and streaming indicator

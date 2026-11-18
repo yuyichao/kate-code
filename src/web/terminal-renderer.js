@@ -98,10 +98,8 @@ class TerminalRenderer {
             this.cursorX = 0;
             this.lineFeed();
         } else if (byte === 0x08) {
-            // BS - backspace
-            if (this.cursorX > 0) {
-                this.cursorX--;
-            }
+            // BS - backspace (from a pending wrap: from the last column)
+            this.cursorX = Math.max(0, Math.min(this.cursorX, this.cols - 1) - 1);
         } else if (byte === 0x09) {
             // TAB - move to next tab stop (every 8 columns)
             this.cursorX = Math.min(this.cols - 1, (Math.floor(this.cursorX / 8) + 1) * 8);
@@ -418,8 +416,13 @@ class TerminalRenderer {
             }
             return;
         }
-        // A wide character does not fit in the last column: wrap first
-        if (width === 2 && this.cursorX >= this.cols - 1) {
+        // Wrap only when a character does not fit (as terminals do: a line
+        // that fills the width and then ends gets no empty line). The row is
+        // marked: it continues on the next one (joined in toHtml()).
+        if (this.cursorX + width > this.cols) {
+            const row = this.cells[this.cursorY];
+            row.wrapped = true;
+            row.wrapEnd = Math.min(this.cursorX, this.cols);
             this.cursorX = 0;
             this.lineFeed();
         }
@@ -447,12 +450,8 @@ class TerminalRenderer {
             row[this.cursorX + 1] = Object.assign({ char: '' }, attrs);
         }
 
-        // Advance cursor
+        // Advance cursor (cols: wrap pending until the next character)
         this.cursorX += width;
-        if (this.cursorX >= this.cols) {
-            this.cursorX = 0;
-            this.lineFeed();
-        }
     }
 
     // Overwriting either half of a wide character blanks the other half.
@@ -518,7 +517,7 @@ class TerminalRenderer {
      * Render the buffer to HTML
      */
     toHtml() {
-        const lines = [];
+        let html = '';
 
         // Find actual content bounds (trim empty rows from bottom)
         // Check each row for any non-empty content
@@ -543,9 +542,13 @@ class TerminalRenderer {
             let currentSpan = null;
             let spanContent = '';
 
-            // Find last non-space character in line
+            // Find last non-space character in line; a wrapped row keeps its
+            // trailing spaces (the text goes on in the next row)
+            const row = this.cells[y];
             let lineEnd = 0;
-            for (let x = this.cols - 1; x >= 0; x--) {
+            if (row.wrapped && y < maxRow) {
+                lineEnd = row.wrapEnd;
+            } else for (let x = this.cols - 1; x >= 0; x--) {
                 if (this.cells[y][x].char !== ' ' ||
                     this.cells[y][x].bg !== null) {
                     lineEnd = x + 1;
@@ -588,10 +591,15 @@ class TerminalRenderer {
                 line += this.escapeHtml(spanContent);
             }
 
-            lines.push(line);
+            // A wrapped row is one line with the next: the view wraps it to
+            // its own width, and copying gives the line as it was.
+            html += line;
+            if (y < maxRow && !row.wrapped) {
+                html += '\n';
+            }
         }
 
-        return lines.join('\n');
+        return html;
     }
 
     getCellClass(cell) {
