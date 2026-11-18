@@ -22,6 +22,7 @@
 #include <KTextEditor/Document>
 #include <KTextEditor/Editor>
 #include <KTextEditor/View>
+#include <KMainWindow>
 #include <KXMLGUIFactory>
 #include <QAction>
 #include <QApplication>
@@ -285,6 +286,16 @@ ChatWidget *KateCodeView::createChat(bool startSession)
 
 
     connect(chat, &ChatWidget::jumpToEditRequested, this, &KateCodeView::jumpToEdit);
+    // Kate follows a widget's title in its tab but sets the window caption
+    // from it only when the tab is activated: set it as Kate does
+    // (KateMainWindow::updateCaption(), not callable from here).
+    connect(chat, &QWidget::windowTitleChanged, this, [this, chat](const QString &title) {
+        if (m_mainWindow->activeWidget() == chat) {
+            if (auto *window = qobject_cast<KMainWindow *>(m_mainWindow->window())) {
+                window->setCaption(title, false);
+            }
+        }
+    });
 
     // The chat's own editor DBus endpoint: its agent's Kate MCP server calls
     // this object, so questions and edit notifications reach this chat only.
