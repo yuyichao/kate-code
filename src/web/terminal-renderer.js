@@ -30,10 +30,6 @@ class TerminalRenderer {
         this.state = 'normal';      // normal, escape, csi, osc
         this.csiParams = '';        // Accumulated CSI parameters
         this.oscData = '';          // Accumulated OSC data
-
-        // UTF-8 handling
-        this.utf8Buffer = [];
-        this.utf8Remaining = 0;
     }
 
     createBuffer(cols, rows) {
@@ -64,54 +60,16 @@ class TerminalRenderer {
     }
 
     /**
-     * Process raw terminal output and update internal buffer
+     * Process terminal output and update internal buffer. The text is
+     * already decoded (a JavaScript string), so it is read by code point.
      */
     write(text) {
-        for (let i = 0; i < text.length; i++) {
-            const byte = text.charCodeAt(i);
-            this.processByte(byte, text[i]);
+        for (const char of text) {
+            this.processByte(char.codePointAt(0), char);
         }
     }
 
     processByte(byte, char) {
-        // Handle UTF-8 multibyte sequences
-        if (this.utf8Remaining > 0) {
-            if ((byte & 0xC0) === 0x80) {
-                this.utf8Buffer.push(byte);
-                this.utf8Remaining--;
-                if (this.utf8Remaining === 0) {
-                    const decoded = this.decodeUtf8(this.utf8Buffer);
-                    if (decoded) {
-                        this.writeChar(decoded);
-                    }
-                    this.utf8Buffer = [];
-                }
-                return;
-            } else {
-                // Invalid continuation, reset
-                this.utf8Buffer = [];
-                this.utf8Remaining = 0;
-            }
-        }
-
-        // Check for UTF-8 start byte
-        if ((byte & 0xE0) === 0xC0) {
-            // 2-byte sequence
-            this.utf8Buffer = [byte];
-            this.utf8Remaining = 1;
-            return;
-        } else if ((byte & 0xF0) === 0xE0) {
-            // 3-byte sequence
-            this.utf8Buffer = [byte];
-            this.utf8Remaining = 2;
-            return;
-        } else if ((byte & 0xF8) === 0xF0) {
-            // 4-byte sequence
-            this.utf8Buffer = [byte];
-            this.utf8Remaining = 3;
-            return;
-        }
-
         switch (this.state) {
             case 'normal':
                 this.processNormal(byte, char);
@@ -125,15 +83,6 @@ class TerminalRenderer {
             case 'osc':
                 this.processOSC(byte, char);
                 break;
-        }
-    }
-
-    decodeUtf8(bytes) {
-        try {
-            const arr = new Uint8Array(bytes);
-            return new TextDecoder('utf-8').decode(arr);
-        } catch (e) {
-            return null;
         }
     }
 
@@ -156,8 +105,8 @@ class TerminalRenderer {
         } else if (byte === 0x09) {
             // TAB - move to next tab stop (every 8 columns)
             this.cursorX = Math.min(this.cols - 1, (Math.floor(this.cursorX / 8) + 1) * 8);
-        } else if (byte >= 0x20 && byte < 0x7F) {
-            // Printable ASCII
+        } else if (byte >= 0x20 && byte !== 0x7F && !(byte >= 0x80 && byte <= 0x9F)) {
+            // Printable (C0/C1 controls and DEL are not)
             this.writeChar(char);
         }
     }
@@ -456,28 +405,93 @@ class TerminalRenderer {
     }
 
     writeChar(char) {
+        const width = TerminalRenderer.charWidth(char.codePointAt(0));
+        if (width === 0) {
+            // Combining mark, zero-width character: joins the previous cell
+            const x = this.cursorX > 0 ? this.cursorX - 1 : -1;
+            if (x >= 0 && this.cursorY < this.rows) {
+                const cell = this.cells[this.cursorY][x].char === ''
+                    ? this.cells[this.cursorY][x - 1] : this.cells[this.cursorY][x];
+                if (cell) {
+                    cell.char += char;
+                }
+            }
+            return;
+        }
+        // A wide character does not fit in the last column: wrap first
+        if (width === 2 && this.cursorX >= this.cols - 1) {
+            this.cursorX = 0;
+            this.lineFeed();
+        }
         // Expand buffer if needed
         while (this.cursorY >= this.rows) {
             this.cells.push(this.createRow(this.cols));
             this.rows++;
         }
 
-        // Write character with current attributes
-        this.cells[this.cursorY][this.cursorX] = {
-            char: char,
+        const row = this.cells[this.cursorY];
+        for (let x = this.cursorX; x < this.cursorX + width; x++) {
+            this.clearWideHalves(row, x);
+        }
+        const attrs = {
             fg: this.currentFg,
             bg: this.currentBg,
             bold: this.bold,
             underline: this.underline,
             reverse: this.reverse
         };
+        // Write character with current attributes; a wide one takes the next
+        // cell too (an empty continuation cell)
+        row[this.cursorX] = Object.assign({ char: char }, attrs);
+        if (width === 2) {
+            row[this.cursorX + 1] = Object.assign({ char: '' }, attrs);
+        }
 
         // Advance cursor
-        this.cursorX++;
+        this.cursorX += width;
         if (this.cursorX >= this.cols) {
             this.cursorX = 0;
             this.lineFeed();
         }
+    }
+
+    // Overwriting either half of a wide character blanks the other half.
+    clearWideHalves(row, x) {
+        if (row[x].char === '' && x > 0) {
+            row[x - 1] = Object.assign({}, row[x - 1], { char: ' ' });
+        }
+        if (x + 1 < row.length && row[x + 1].char === '') {
+            row[x + 1] = Object.assign({}, row[x + 1], { char: ' ' });
+        }
+    }
+
+    /**
+     * Columns a character takes in a terminal (as wcwidth): 0 for combining
+     * marks and zero-width characters, 2 for East Asian wide/fullwidth
+     * characters and emoji shown as emoji, else 1.
+     */
+    static charWidth(code) {
+        if (code < 0x300) {
+            return 1;
+        }
+        const char = String.fromCodePoint(code);
+        if (/[\p{Mn}\p{Me}\p{Cf}]/u.test(char) || (code >= 0x1160 && code <= 0x11FF)) {
+            return 0;  // combining marks, format characters, Hangul medial/final jamo
+        }
+        if ((code >= 0x1100 && code <= 0x115F)
+            || code === 0x2329 || code === 0x232A
+            || (code >= 0x2E80 && code <= 0xA4CF && code !== 0x303F)
+            || (code >= 0xAC00 && code <= 0xD7A3)
+            || (code >= 0xF900 && code <= 0xFAFF)
+            || (code >= 0xFE10 && code <= 0xFE19)
+            || (code >= 0xFE30 && code <= 0xFE6F)
+            || (code >= 0xFF00 && code <= 0xFF60)
+            || (code >= 0xFFE0 && code <= 0xFFE6)
+            || (code >= 0x20000 && code <= 0x3FFFD)
+            || /\p{Emoji_Presentation}/u.test(char)) {
+            return 2;
+        }
+        return 1;
     }
 
     lineFeed() {
