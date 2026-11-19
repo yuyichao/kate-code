@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ACPModels.h"
+#include "ACPProtocolV2.h"
 #include "RateLimits.h"
 #include <QDeadlineTimer>
 #include <QHash>
@@ -115,6 +116,8 @@ public:
     //   its cost), a prompt or cancelPrompt().
     int backgroundCommandCount() const { return m_backgroundTerminals.size(); }
     bool isWorkingOnItsOwn() const { return m_autonomousTurn; }
+    // The agent speaks ACP v2 (offered with KATECODE_ACP_PROTOCOL=2).
+    bool usesProtocolV2() const { return m_protocol.isActive(); }
     // History replayed by session/load: the user message being collected
     // (shown when it ends), and helpers ending the replayed messages.
     QStringList m_replayUserChunks; // content blocks of the user message
@@ -219,11 +222,27 @@ Q_SIGNALS:
 private Q_SLOTS:
     void onConnected();
     void onDisconnected(int exitCode);
+    // From the agent: through m_protocol to the dispatch functions below.
     void onNotification(const QString &method, const QJsonObject &params, int requestId);
     void onResponse(int id, const QJsonObject &result, const QJsonObject &error);
     void onError(const QString &message);
 
 private:
+    // To the agent, through m_protocol (ACP v1 shapes in, the agent's
+    // version out). Responses (permission outcomes, fs/terminal results) are
+    // the same in both and go to the service directly.
+    int sendRequest(const QString &method, const QJsonObject &params);
+    void sendNotification(const QString &method, const QJsonObject &params);
+    // A message from the agent in v1 shapes.
+    void dispatchNotification(const QString &method, const QJsonObject &params, int requestId);
+    void dispatchResponse(int id, const QJsonObject &result, const QJsonObject &error);
+    ACPProtocolV2 m_protocol;
+    // The tool call an update (tool_call, or v2's whole tool call) describes.
+    ToolCall toolCallFromUpdate(const QJsonObject &update) const;
+    // v2: tool calls announced before their input, recorded in the
+    // transcript once they finish (with the input they had then).
+    QHash<QString, ToolCall> m_unrecordedToolCalls;
+
     // A follow-up prompt queued while another session/prompt is in flight.
     struct QueuedPrompt {
         QString content;
@@ -420,6 +439,14 @@ private:
     QHash<QString, QString> m_displayTerminalOutput;
     bool m_autonomousTurn = false;
     int m_autonomousCounter = 0;
+    // The agent works outside prompts and Kate Code follows it: Claude Code
+    // (v1: its output), any ACP v2 agent (state_update).
+    bool worksOutsidePrompts() const { return m_claudeCodeAgent || m_protocol.isActive(); }
+    // v2: a state_update (foreground work and the background snapshot).
+    void handleStateUpdate(const QJsonObject &update);
+    // v2: the agent's own work was stopped; its output until it is idle is
+    // not a new cycle.
+    bool m_cycleCancelled = false;
     // Tool calls of the running cycle without a final status: a result
     // while one runs is a placeholder (several task notifications answered
     // by one follow-up), not the cycle's end.

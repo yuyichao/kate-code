@@ -2,6 +2,7 @@
 #include "ACPService.h"
 #include "RemoteHelper.h"
 #include "TerminalManager.h"
+#include "BuildVersion.h"
 #include "../mcp/EditorDBusService.h"
 #include "../util/EditTracker.h"
 #include "../util/TranscriptWriter.h"
@@ -95,6 +96,7 @@ ACPSession::ACPSession(QObject *parent)
     , m_messageCounter(0)
     , m_editTracker(new EditTracker(this))
 {
+    m_protocol.setOffered(ACPProtocolV2::requestedByEnvironment());
     connect(m_service, &ACPService::connected, this, &ACPSession::onConnected);
     connect(m_service, &ACPService::disconnected, this, &ACPSession::onDisconnected);
     connect(m_service, &ACPService::notificationReceived, this, &ACPSession::onNotification);
@@ -237,6 +239,9 @@ void ACPSession::resetSessionState()
     m_claudeCodeAgent = false;
     m_cancelledPromptId = -1;
     m_toolCallMessages.clear();
+    m_unrecordedToolCalls.clear();
+    m_cycleCancelled = false;
+    m_protocol.reset();
     recordRemoteUserMessage();
     clearBackgroundWork();
     // The next session (possibly another agent) lists its own commands.
@@ -267,7 +272,7 @@ void ACPSession::setTitle(const QString &title)
     QJsonObject params;
     params[QStringLiteral("sessionId")] = m_sessionId;
     params[QStringLiteral("title")] = trimmed;
-    const int id = m_service->sendRequest(QStringLiteral("session/set_title"), params);
+    const int id = sendRequest(QStringLiteral("session/set_title"), params);
     if (id >= 0) {
         m_setTitleRequestIds.insert(id);
     }
@@ -290,7 +295,9 @@ void ACPSession::cancelPrompt()
         qDebug() << "[ACPSession] Cancelling the agent's own cycle";
         QJsonObject params;
         params[QStringLiteral("sessionId")] = m_sessionId;
-        m_service->sendNotification(QStringLiteral("session/cancel"), params);
+        sendNotification(QStringLiteral("session/cancel"), params);
+        // v2: its output until the agent is idle is not a new cycle.
+        m_cycleCancelled = m_protocol.isActive();
         finishAutonomousTurn();
         Q_EMIT promptCancelled();
         return;
@@ -306,11 +313,11 @@ void ACPSession::cancelPrompt()
     // Send $/cancel_request notification per ACP protocol
     QJsonObject params;
     params[QStringLiteral("id")] = m_promptRequestId;
-    m_service->sendNotification(QStringLiteral("$/cancel_request"), params);
+    sendNotification(QStringLiteral("$/cancel_request"), params);
     for (const int id : std::as_const(m_midTurnPromptIds)) {
         QJsonObject midTurn;
         midTurn[QStringLiteral("id")] = id;
-        m_service->sendNotification(QStringLiteral("$/cancel_request"), midTurn);
+        sendNotification(QStringLiteral("$/cancel_request"), midTurn);
     }
 
     // Finish any streaming message
@@ -373,7 +380,7 @@ void ACPSession::sendSummaryPrompt(const QString &prompt)
     params[QStringLiteral("prompt")] = promptBlocks;
 
     m_summaryCollected.clear();
-    m_summaryRequestId = m_service->sendRequest(QStringLiteral("session/prompt"), params);
+    m_summaryRequestId = sendRequest(QStringLiteral("session/prompt"), params);
     qDebug() << "[ACPSession] Sent summary session/prompt request, id:" << m_summaryRequestId;
     if (m_summaryRequestId < 0) {
         Q_EMIT summaryResult(QString(), QStringLiteral("Failed to send the summary prompt"));
@@ -386,7 +393,7 @@ void ACPSession::cancelSummary()
         qDebug() << "[ACPSession] Cancelling summary request:" << m_summaryRequestId;
         QJsonObject params;
         params[QStringLiteral("id")] = m_summaryRequestId;
-        m_service->sendNotification(QStringLiteral("$/cancel_request"), params);
+        sendNotification(QStringLiteral("$/cancel_request"), params);
     }
     m_summaryRequestId = -1;
     m_summaryAfterPromptId = -1;
@@ -455,7 +462,7 @@ void ACPSession::setMode(const QString &modeId)
         params[QStringLiteral("sessionId")] = m_sessionId;
         params[QStringLiteral("configId")]  = QStringLiteral("mode");
         params[QStringLiteral("value")]     = modeId;
-        int reqId = m_service->sendRequest(
+        int reqId = sendRequest(
             QStringLiteral("session/set_config_option"), params);
         if (reqId < 0) {
             qWarning() << "[ACPSession] setMode: failed to send session/set_config_option";
@@ -470,7 +477,7 @@ void ACPSession::setMode(const QString &modeId)
         QJsonObject params;
         params[QStringLiteral("sessionId")] = m_sessionId;
         params[QStringLiteral("modeId")]    = modeId;
-        int reqId = m_service->sendRequest(
+        int reqId = sendRequest(
             QStringLiteral("session/set_mode"), params);
         if (reqId < 0) {
             qWarning() << "[ACPSession] setMode: failed to send session/set_mode";
@@ -740,7 +747,7 @@ void ACPSession::createNewSession()
     params[QStringLiteral("cwd")] = m_workingDir;
     params[QStringLiteral("mcpServers")] = buildMcpServers();
 
-    m_sessionNewRequestId = m_service->sendRequest(QStringLiteral("session/new"), params);
+    m_sessionNewRequestId = sendRequest(QStringLiteral("session/new"), params);
     qDebug() << "[ACPSession] Sent session/new request, id:" << m_sessionNewRequestId;
 }
 
@@ -769,7 +776,7 @@ void ACPSession::loadSession(const QString &sessionId)
     // ACP session/load responses do not normally repeat the session id, so
     // retain the requested id until the response arrives.
     m_sessionLoadId = sessionId;
-    m_sessionLoadRequestId = m_service->sendRequest(QStringLiteral("session/load"), params);
+    m_sessionLoadRequestId = sendRequest(QStringLiteral("session/load"), params);
     qDebug() << "[ACPSession] Sent session/load request, id:" << m_sessionLoadRequestId;
     if (m_sessionLoadRequestId >= 0) {
         Q_EMIT replayingChanged(true);
@@ -886,7 +893,7 @@ void ACPSession::dispatchPrompt(const QueuedPrompt &prompt)
     params[QStringLiteral("sessionId")] = m_sessionId;
     params[QStringLiteral("prompt")] = buildPromptBlocks(prompt);
 
-    m_promptRequestId = m_service->sendRequest(QStringLiteral("session/prompt"), params);
+    m_promptRequestId = sendRequest(QStringLiteral("session/prompt"), params);
     qDebug() << "[ACPSession] Sent session/prompt request, id:" << m_promptRequestId;
 }
 
@@ -895,7 +902,7 @@ void ACPSession::sendPromptMidTurn(const QueuedPrompt &prompt)
     QJsonObject params;
     params[QStringLiteral("sessionId")] = m_sessionId;
     params[QStringLiteral("prompt")] = buildPromptBlocks(prompt);
-    const int id = m_service->sendRequest(QStringLiteral("session/prompt"), params);
+    const int id = sendRequest(QStringLiteral("session/prompt"), params);
     if (id < 0) {
         return;
     }
@@ -1100,8 +1107,13 @@ void ACPSession::onConnected()
     capabilities[QStringLiteral("_meta")] = capabilitiesMeta;
 
     params[QStringLiteral("clientCapabilities")] = capabilities;
+    if (m_protocol.isOffered()) {
+        params[QStringLiteral("clientInfo")] = QJsonObject{{QStringLiteral("name"), QStringLiteral("kate-code")},
+                                                           {QStringLiteral("title"), QStringLiteral("Kate Code")},
+                                                           {QStringLiteral("version"), KateRemote::buildVersion()}};
+    }
 
-    m_initializeRequestId = m_service->sendRequest(QStringLiteral("initialize"), params);
+    m_initializeRequestId = sendRequest(QStringLiteral("initialize"), params);
     qDebug() << "[ACPSession] Sent initialize request, id:" << m_initializeRequestId;
 }
 
@@ -1140,7 +1152,48 @@ void ACPSession::onDisconnected(int exitCode)
     Q_EMIT statusChanged(m_status);
 }
 
+int ACPSession::sendRequest(const QString &method, const QJsonObject &params)
+{
+    const QJsonObject wireParams = method == QLatin1String("initialize") ? m_protocol.initializeParams(params) : params;
+    const ACPProtocolV2::Outgoing out = m_protocol.request(method, wireParams);
+    const int id = m_service->sendRequest(out.method, out.params);
+    m_protocol.requestSent(id, method, params);
+    return id;
+}
+
+void ACPSession::sendNotification(const QString &method, const QJsonObject &params)
+{
+    const ACPProtocolV2::Outgoing out = m_protocol.notification(method, params);
+    if (out.send) {
+        m_service->sendNotification(out.method, out.params);
+    }
+}
+
 void ACPSession::onNotification(const QString &method, const QJsonObject &params, int requestId)
+{
+    const QList<ACPProtocolV2::Incoming> messages = m_protocol.incomingMessage(method, params, requestId);
+    for (const ACPProtocolV2::Incoming &message : messages) {
+        if (message.isResponse) {
+            dispatchResponse(message.id, message.result, message.error);
+        } else {
+            dispatchNotification(message.method, message.params, message.requestId);
+        }
+    }
+}
+
+void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject &error)
+{
+    const QList<ACPProtocolV2::Incoming> messages = m_protocol.incomingResponse(id, result, error);
+    for (const ACPProtocolV2::Incoming &message : messages) {
+        if (message.isResponse) {
+            dispatchResponse(message.id, message.result, message.error);
+        } else {
+            dispatchNotification(message.method, message.params, message.requestId);
+        }
+    }
+}
+
+void ACPSession::dispatchNotification(const QString &method, const QJsonObject &params, int requestId)
 {
     if (method == QStringLiteral("session/update")) {
         handleSessionUpdate(params);
@@ -1186,7 +1239,7 @@ QString describeACPError(const QJsonObject &error)
     return text;
 }
 
-void ACPSession::onResponse(int id, const QJsonObject &result, const QJsonObject &error)
+void ACPSession::dispatchResponse(int id, const QJsonObject &result, const QJsonObject &error)
 {
     // The cancelled prompt has answered: later output is the agent's own.
     if (id == m_cancelledPromptId) {
@@ -1486,6 +1539,10 @@ QString ACPSession::handleDisplayTerminal(const QString &messageId, const QStrin
     for (const QString &key : {QStringLiteral("terminal_output"), QStringLiteral("terminal_output_delta")}) {
         const QJsonObject chunk = meta[key].toObject();
         if (chunk.contains(QStringLiteral("data"))) {
+            if (chunk[QStringLiteral("replace")].toBool()) {
+                // v2: a snapshot that does not continue the output.
+                m_displayTerminalOutput[toolCallId].clear();
+            }
             m_displayTerminalOutput[toolCallId] += chunk[QStringLiteral("data")].toString();
             hasData = true;
         }
@@ -1572,6 +1629,62 @@ void ACPSession::finishAutonomousTurn()
         m_currentMessageContent.clear();
     }
     Q_EMIT backgroundActivityChanged();
+}
+
+void ACPSession::handleStateUpdate(const QJsonObject &update)
+{
+    if (!m_protocol.isActive() || isReplaying()) {
+        return;
+    }
+    // The commands (and other work) running in the background: a snapshot,
+    // when given.
+    const QJsonValue backgroundValue = update[QStringLiteral("background")];
+    if (backgroundValue.isArray()) {
+        QSet<QString> background;
+        for (const QJsonValue &value : backgroundValue.toArray()) {
+            const QString toolCallId = value.toObject()[QStringLiteral("toolCallId")].toString();
+            if (!toolCallId.isEmpty()) {
+                background.insert(toolCallId);
+            }
+        }
+        bool changed = false;
+        for (const QString &toolCallId : std::as_const(background)) {
+            if (!m_backgroundTerminals.contains(toolCallId)) {
+                m_backgroundTerminals.insert(toolCallId);
+                Q_EMIT toolCallBackgroundChanged(m_toolCallMessages.value(toolCallId), toolCallId, true);
+                changed = true;
+            }
+        }
+        const QSet<QString> previous = m_backgroundTerminals;
+        for (const QString &toolCallId : previous) {
+            if (!background.contains(toolCallId)) {
+                m_backgroundTerminals.remove(toolCallId);
+                Q_EMIT toolCallBackgroundChanged(m_toolCallMessages.value(toolCallId), toolCallId, false);
+                changed = true;
+            }
+        }
+        if (changed) {
+            Q_EMIT backgroundActivityChanged();
+        }
+    }
+
+    // Foreground work: a prompt's (its end answers the prompt: ACPProtocolV2)
+    // or the agent's own.
+    const QString state = update[QStringLiteral("state")].toString();
+    if (state == QLatin1String("running") || state == QLatin1String("requires_action")) {
+        if (!m_autonomousTurn && !isPromptRunning() && !isSummaryRunning() && m_cancelledPromptId < 0 && !m_cycleCancelled
+            && m_status == ConnectionStatus::Connected) {
+            // The message comes with the first output (startAutonomousTurn()).
+            qDebug() << "[ACPSession] The agent works on its own (state_update)";
+            m_autonomousTurn = true;
+            Q_EMIT backgroundActivityChanged();
+        }
+    } else if (state == QLatin1String("idle")) {
+        m_cycleCancelled = false;
+        if (m_autonomousTurn && !isPromptRunning()) {
+            finishAutonomousTurn();
+        }
+    }
 }
 
 void ACPSession::handleRemoteUserChunk(const QJsonObject &content)
@@ -1830,7 +1943,7 @@ void ACPSession::sendNextSessionConfigOption()
         // Required by the ACP boolean config-option request variant.
         params[QStringLiteral("type")] = QStringLiteral("boolean");
     }
-    m_sessionConfigRequestId = m_service->sendRequest(QStringLiteral("session/set_config_option"), params);
+    m_sessionConfigRequestId = sendRequest(QStringLiteral("session/set_config_option"), params);
     if (m_sessionConfigRequestId < 0) {
         qWarning() << "[ACPSession] Failed to send session config option" << m_currentSessionConfigKey;
         sendNextSessionConfigOption();
@@ -1928,7 +2041,7 @@ void ACPSession::sendConfigOption(const QString &configId, const QJsonValue &val
         // Required by the ACP boolean config-option request variant.
         params[QStringLiteral("type")] = QStringLiteral("boolean");
     }
-    const int reqId = m_service->sendRequest(QStringLiteral("session/set_config_option"), params);
+    const int reqId = sendRequest(QStringLiteral("session/set_config_option"), params);
     if (reqId < 0) {
         qWarning() << "[ACPSession] Failed to send session/set_config_option for" << configId;
         Q_EMIT configOptionsChanged(m_availableConfigOptions);
@@ -1994,6 +2107,14 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
     if (replaying) {
         // A replayed turn: the user's messages, then the agent's text and
         // tool calls (into one assistant message until the next user one).
+        if (updateType == QStringLiteral("user_message")) {
+            // v2: a message starts (so two in a row stay two).
+            if (!m_currentMessageId.isEmpty()) {
+                finishReplayedMessage();
+            }
+            flushReplayedUserMessage();
+            return;
+        }
         if (updateType == QStringLiteral("user_message_chunk")) {
             if (!m_currentMessageId.isEmpty()) {
                 finishReplayedMessage();
@@ -2012,7 +2133,27 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         }
     }
 
-    if (!replaying && m_claudeCodeAgent) {
+    if (updateType == QStringLiteral("state_update")) {
+        handleStateUpdate(update);
+        return;
+    }
+    if (updateType == QStringLiteral("notice") && m_protocol.isActive()) {
+        // v2: something the user should know (e.g. an MCP server that did
+        // not start).
+        const QString severity = update[QStringLiteral("severity")].toString();
+        QString text = update[QStringLiteral("title")].toString();
+        const QString description = update[QStringLiteral("description")].toString();
+        if (!description.isEmpty()) {
+            text += QStringLiteral(": ") + description;
+        }
+        qDebug() << "[ACPSession] Notice from the agent:" << severity << text;
+        if (!replaying && severity != QLatin1String("info") && !text.isEmpty()) {
+            Q_EMIT errorOccurred(text);
+        }
+        return;
+    }
+
+    if (!replaying && worksOutsidePrompts()) {
         // A message typed in another client of the session (Claude Code
         // sends Kate Code's own prompts back only when replaying).
         if (updateType == QStringLiteral("user_message_chunk")) {
@@ -2020,14 +2161,18 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
             return;
         }
         recordRemoteUserMessage();
+        if (updateType == QStringLiteral("user_message")) {
+            // v2: where another client's message starts.
+            return;
+        }
     }
 
     // Claude Code's output outside a prompt: a cycle it started on its own
     // (e.g. a background task ended). Not the trailing output of a
     // cancelled prompt, nor a silent summary's. Thinking counts too (not
     // shown): it may be all there is for a while.
-    if (!replaying && m_claudeCodeAgent && !isPromptRunning() && m_cancelledPromptId < 0 && !isSummaryRunning()
-        && m_currentMessageId.isEmpty() && m_status == ConnectionStatus::Connected
+    if (!replaying && worksOutsidePrompts() && !isPromptRunning() && m_cancelledPromptId < 0 && !isSummaryRunning()
+        && !m_cycleCancelled && m_currentMessageId.isEmpty() && m_status == ConnectionStatus::Connected
         && (updateType == QStringLiteral("agent_message_chunk") || updateType == QStringLiteral("agent_thought_chunk")
             || updateType == QStringLiteral("tool_call"))) {
         startAutonomousTurn();
@@ -2111,184 +2256,9 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         qDebug() << "[ACPSession] tool_call raw JSON:"
                  << QJsonDocument(update).toJson(QJsonDocument::Compact);
 
-        ToolCall toolCall;
-        toolCall.id = update[QStringLiteral("toolCallId")].toString();
-        toolCall.status = update[QStringLiteral("status")].toString();
-        // rawInput may be a JSON object or a JSON string that needs parsing
-        QJsonValue rawInputVal = update[QStringLiteral("rawInput")];
-        if (rawInputVal.isObject()) {
-            toolCall.input = rawInputVal.toObject();
-        } else if (rawInputVal.isString()) {
-            QJsonDocument rawDoc = QJsonDocument::fromJson(rawInputVal.toString().toUtf8());
-            if (rawDoc.isObject()) {
-                toolCall.input = rawDoc.object();
-            }
-        }
-
+        ToolCall toolCall = toolCallFromUpdate(update);
         // Track current tool call ID for edit tracking
         m_currentToolCallId = toolCall.id;
-
-        // Get tool name from _meta.claudeCode.toolName or fall back to title
-        QJsonObject meta = update[QStringLiteral("_meta")].toObject();
-        QJsonObject claudeCode = meta[QStringLiteral("claudeCode")].toObject();
-        toolCall.name = claudeCode[QStringLiteral("toolName")].toString();
-        if (toolCall.name.isEmpty()) {
-            toolCall.name = update[QStringLiteral("title")].toString();
-        }
-
-        // vibe-acp uses "kind" field to indicate tool type (e.g., "execute" for Bash)
-        QString kind = update[QStringLiteral("kind")].toString();
-
-        // Extract file path if present
-        // Try locations array first
-        QJsonArray locations = update[QStringLiteral("locations")].toArray();
-        if (!locations.isEmpty()) {
-            QJsonObject location = locations[0].toObject();
-            toolCall.filePath = location[QStringLiteral("path")].toString();
-        }
-        // Fall back to rawInput.file_path
-        if (toolCall.filePath.isEmpty()) {
-            toolCall.filePath = toolCall.input[QStringLiteral("file_path")].toString();
-        }
-
-        // Infer tool type from vibe-acp kind or title if toolName is not a known tool
-        // vibe-acp uses "kind" field: "execute" for Bash, or titles like "Reading ...", "Editing ..."
-        if (!isReadTool(toolCall.name) && !isWriteTool(toolCall.name) &&
-            !isEditTool(toolCall.name) && !isBashTool(toolCall.name)) {
-            // Check kind field first - more reliable than title matching
-            if (kind == QStringLiteral("execute")) {
-                toolCall.name = QStringLiteral("Bash");
-                // Extract command from rawInput for display
-                QString command = toolCall.input[QStringLiteral("command")].toString();
-                if (!command.isEmpty()) {
-                    toolCall.operationType = QStringLiteral("bash");
-                }
-            }
-        }
-        if (!isReadTool(toolCall.name) && !isWriteTool(toolCall.name) &&
-            !isEditTool(toolCall.name) && !isBashTool(toolCall.name)) {
-            QString title = update[QStringLiteral("title")].toString();
-            if (title.startsWith(QStringLiteral("Reading "))) {
-                toolCall.name = QStringLiteral("Read");
-                if (toolCall.filePath.isEmpty()) {
-                    // Extract path from title - it may be relative
-                    QString titlePath = title.mid(8);  // len("Reading ")
-                    if (!titlePath.isEmpty()) {
-                        toolCall.filePath = agentPath(titlePath);
-                    }
-                }
-            } else if (title.startsWith(QStringLiteral("Editing "))) {
-                toolCall.name = QStringLiteral("Edit");
-                if (toolCall.filePath.isEmpty()) {
-                    QString titlePath = title.mid(8);
-                    if (!titlePath.isEmpty()) {
-                        toolCall.filePath = agentPath(titlePath);
-                    }
-                }
-            } else if (title.startsWith(QStringLiteral("Writing "))) {
-                toolCall.name = QStringLiteral("Write");
-                if (toolCall.filePath.isEmpty()) {
-                    QString titlePath = title.mid(8);
-                    if (!titlePath.isEmpty()) {
-                        toolCall.filePath = agentPath(titlePath);
-                    }
-                }
-            } else if (title.startsWith(QStringLiteral("Patching "))) {
-                // vibe-acp Edit uses "Patching file.txt (N blocks)" format
-                toolCall.name = QStringLiteral("Edit");
-                if (toolCall.filePath.isEmpty()) {
-                    QString titlePath = title.mid(9);  // len("Patching ")
-                    // Remove trailing " (N blocks)" if present
-                    int parenIdx = titlePath.lastIndexOf(QStringLiteral(" ("));
-                    if (parenIdx > 0) {
-                        titlePath = titlePath.left(parenIdx);
-                    }
-                    if (!titlePath.isEmpty()) {
-                        toolCall.filePath = agentPath(titlePath);
-                    }
-                }
-            } else if (title.contains(QStringLiteral("bash")) || title.contains(QStringLiteral("Bash")) ||
-                       title.startsWith(QStringLiteral("Running "))) {
-                toolCall.name = QStringLiteral("Bash");
-            }
-        }
-
-        // Final fallback: infer from toolCallId prefix (e.g., Gemini "run_shell_command-<ts>")
-        if (!isReadTool(toolCall.name) && !isWriteTool(toolCall.name) &&
-            !isEditTool(toolCall.name) && !isBashTool(toolCall.name)) {
-            QString inferred = inferToolNameFromId(toolCall.id);
-            if (!inferred.isEmpty()) {
-                toolCall.name = inferred;
-            }
-        }
-
-        // Extract Edit/Write specific fields from content array
-        QJsonArray contentArray = update[QStringLiteral("content")].toArray();
-        for (int i = 0; i < contentArray.size(); ++i) {
-            QJsonObject contentItem = contentArray[i].toObject();
-            QString type = contentItem[QStringLiteral("type")].toString();
-
-            if (type == QStringLiteral("diff")) {
-                // This is an Edit operation
-                toolCall.operationType = QStringLiteral("edit");
-
-                EditDiff edit;
-                edit.oldText = contentItem[QStringLiteral("oldText")].toString();
-                edit.newText = contentItem[QStringLiteral("newText")].toString();
-                edit.filePath = contentItem[QStringLiteral("filePath")].toString();
-
-                toolCall.edits.append(edit);
-
-                // Keep backward compatibility with single-edit fields
-                if (i == 0) {
-                    toolCall.oldText = edit.oldText;
-                    toolCall.newText = edit.newText;
-                }
-
-                qDebug() << "[ACPSession] Edit" << i + 1 << "detected - old:" << edit.oldText.length()
-                         << "chars, new:" << edit.newText.length() << "chars";
-            } else if (type == QStringLiteral("terminal")
-                       && !isAgentDisplayTerminal(contentItem[QStringLiteral("terminalId")].toString(), toolCall.id, update)) {
-                // This tool call has embedded terminal output (a terminal
-                // Kate Code runs; an agent's display terminal gives its
-                // output as the result).
-                toolCall.terminalId = contentItem[QStringLiteral("terminalId")].toString();
-                qDebug() << "[ACPSession] Terminal embedded - id:" << toolCall.terminalId;
-            }
-        }
-
-        if (!toolCall.edits.isEmpty()) {
-            qDebug() << "[ACPSession] Total edits in tool call:" << toolCall.edits.size();
-        }
-
-        // Fallback: Extract edit data from rawInput for MCP tools (e.g., mcp__kate__katecode_edit)
-        // MCP tools use old_string/new_string in rawInput, not diff objects in content array
-        if (toolCall.edits.isEmpty() && isEditTool(toolCall.name)) {
-            QString oldStr = toolCall.input[QStringLiteral("old_string")].toString();
-            QString newStr = toolCall.input[QStringLiteral("new_string")].toString();
-
-            if (!oldStr.isEmpty() || !newStr.isEmpty()) {
-                EditDiff edit;
-                edit.oldText = oldStr;
-                edit.newText = newStr;
-                edit.filePath = toolCall.filePath;
-                toolCall.edits.append(edit);
-                toolCall.oldText = oldStr;
-                toolCall.newText = newStr;
-
-                qDebug() << "[ACPSession] Edit from rawInput - old:" << oldStr.length()
-                         << "chars, new:" << newStr.length() << "chars";
-            }
-        }
-
-        // Fallback: Extract write content from rawInput for MCP tools (e.g., mcp__kate__katecode_write)
-        if (isWriteTool(toolCall.name) && toolCall.newText.isEmpty()) {
-            QString content = toolCall.input[QStringLiteral("content")].toString();
-            if (!content.isEmpty()) {
-                toolCall.newText = content;
-                qDebug() << "[ACPSession] Write content from rawInput:" << content.length() << "chars";
-            }
-        }
 
         qDebug() << "[ACPSession] Tool call - id:" << toolCall.id
                  << "name:" << toolCall.name << "status:" << toolCall.status
@@ -2303,7 +2273,12 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         if (!m_currentMessageId.isEmpty()) {
             m_toolCallMessages.insert(toolCall.id, m_currentMessageId);
             Q_EMIT toolCallAdded(m_currentMessageId, toolCall);
-            m_transcript->recordToolCall(toolCall);
+            if (m_protocol.isActive() && toolCall.status != QLatin1String("completed") && toolCall.status != QLatin1String("failed")) {
+                // v2: its input comes later (recorded with its final status).
+                m_unrecordedToolCalls.insert(toolCall.id, toolCall);
+            } else {
+                m_transcript->recordToolCall(toolCall);
+            }
 
             // Handle already-completed tool calls (some agents send tool_call with status=completed
             // and rawOutput in a single event, without a separate tool_call_update)
@@ -2579,6 +2554,24 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         // (a command in the background, a cycle's tool call reported after
         // the cycle was stopped).
         const QString messageId = m_toolCallMessages.value(toolCallId, m_currentMessageId);
+        // v2: the tool call as it is now (its input streams in after it was
+        // announced; v1 gives its input to the tool call only).
+        const QJsonObject current = update[QStringLiteral("_meta")].toObject()[QStringLiteral("_kate/toolCall")].toObject();
+        if (!current.isEmpty() && !messageId.isEmpty() && m_toolCallMessages.contains(toolCallId)) {
+            const ToolCall toolCall = toolCallFromUpdate(current);
+            m_toolCallInputs[toolCallId] = toolCall.input;
+            if (m_unrecordedToolCalls.contains(toolCallId)) {
+                m_unrecordedToolCalls.insert(toolCallId, toolCall);
+            }
+            Q_EMIT toolCallAdded(messageId, toolCall);
+        }
+        if (status == QLatin1String("completed") || status == QLatin1String("failed")) {
+            const auto unrecorded = m_unrecordedToolCalls.constFind(toolCallId);
+            if (unrecorded != m_unrecordedToolCalls.constEnd()) {
+                m_transcript->recordToolCall(*unrecorded);
+                m_unrecordedToolCalls.erase(unrecorded);
+            }
+        }
         // A display terminal's output is the result (sent before the status;
         // given again with the final status for the transcript).
         const QString terminalOutput = handleDisplayTerminal(messageId, toolCallId, update);
@@ -2675,7 +2668,7 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         // it is a placeholder's (Claude Code answers task notifications that
         // came together with one follow-up, sending an empty result for all
         // but the last; the usage_update does not tell them apart).
-        if (m_autonomousTurn && !isPromptRunning()
+        if (m_autonomousTurn && !isPromptRunning() && !m_protocol.isActive()
             && (update.contains(QStringLiteral("cost"))
                 || update[QStringLiteral("_meta")].toObject().contains(QStringLiteral("_claude/origin")))) {
             if (m_cycleToolCalls.isEmpty()) {
@@ -2856,6 +2849,186 @@ void ACPSession::handlePermissionRequest(const QJsonObject &params, int requestI
              << "options count:" << request.options.size();
 
     Q_EMIT permissionRequested(request);
+}
+
+ToolCall ACPSession::toolCallFromUpdate(const QJsonObject &update) const
+{
+    ToolCall toolCall;
+    toolCall.id = update[QStringLiteral("toolCallId")].toString();
+    toolCall.status = update[QStringLiteral("status")].toString();
+    // rawInput may be a JSON object or a JSON string that needs parsing
+    QJsonValue rawInputVal = update[QStringLiteral("rawInput")];
+    if (rawInputVal.isObject()) {
+        toolCall.input = rawInputVal.toObject();
+    } else if (rawInputVal.isString()) {
+        QJsonDocument rawDoc = QJsonDocument::fromJson(rawInputVal.toString().toUtf8());
+        if (rawDoc.isObject()) {
+            toolCall.input = rawDoc.object();
+        }
+    }
+
+    // Get tool name from _meta.claudeCode.toolName or fall back to title
+    QJsonObject meta = update[QStringLiteral("_meta")].toObject();
+    QJsonObject claudeCode = meta[QStringLiteral("claudeCode")].toObject();
+    toolCall.name = claudeCode[QStringLiteral("toolName")].toString();
+    if (toolCall.name.isEmpty()) {
+        toolCall.name = update[QStringLiteral("title")].toString();
+    }
+
+    // vibe-acp uses "kind" field to indicate tool type (e.g., "execute" for Bash)
+    QString kind = update[QStringLiteral("kind")].toString();
+
+    // Extract file path if present
+    // Try locations array first
+    QJsonArray locations = update[QStringLiteral("locations")].toArray();
+    if (!locations.isEmpty()) {
+        QJsonObject location = locations[0].toObject();
+        toolCall.filePath = location[QStringLiteral("path")].toString();
+    }
+    // Fall back to rawInput.file_path
+    if (toolCall.filePath.isEmpty()) {
+        toolCall.filePath = toolCall.input[QStringLiteral("file_path")].toString();
+    }
+
+    // Infer tool type from vibe-acp kind or title if toolName is not a known tool
+    // vibe-acp uses "kind" field: "execute" for Bash, or titles like "Reading ...", "Editing ..."
+    if (!isReadTool(toolCall.name) && !isWriteTool(toolCall.name) &&
+        !isEditTool(toolCall.name) && !isBashTool(toolCall.name)) {
+        // Check kind field first - more reliable than title matching
+        if (kind == QStringLiteral("execute")) {
+            toolCall.name = QStringLiteral("Bash");
+            // Extract command from rawInput for display
+            QString command = toolCall.input[QStringLiteral("command")].toString();
+            if (!command.isEmpty()) {
+                toolCall.operationType = QStringLiteral("bash");
+            }
+        }
+    }
+    if (!isReadTool(toolCall.name) && !isWriteTool(toolCall.name) &&
+        !isEditTool(toolCall.name) && !isBashTool(toolCall.name)) {
+        QString title = update[QStringLiteral("title")].toString();
+        if (title.startsWith(QStringLiteral("Reading "))) {
+            toolCall.name = QStringLiteral("Read");
+            if (toolCall.filePath.isEmpty()) {
+                // Extract path from title - it may be relative
+                QString titlePath = title.mid(8);  // len("Reading ")
+                if (!titlePath.isEmpty()) {
+                    toolCall.filePath = agentPath(titlePath);
+                }
+            }
+        } else if (title.startsWith(QStringLiteral("Editing "))) {
+            toolCall.name = QStringLiteral("Edit");
+            if (toolCall.filePath.isEmpty()) {
+                QString titlePath = title.mid(8);
+                if (!titlePath.isEmpty()) {
+                    toolCall.filePath = agentPath(titlePath);
+                }
+            }
+        } else if (title.startsWith(QStringLiteral("Writing "))) {
+            toolCall.name = QStringLiteral("Write");
+            if (toolCall.filePath.isEmpty()) {
+                QString titlePath = title.mid(8);
+                if (!titlePath.isEmpty()) {
+                    toolCall.filePath = agentPath(titlePath);
+                }
+            }
+        } else if (title.startsWith(QStringLiteral("Patching "))) {
+            // vibe-acp Edit uses "Patching file.txt (N blocks)" format
+            toolCall.name = QStringLiteral("Edit");
+            if (toolCall.filePath.isEmpty()) {
+                QString titlePath = title.mid(9);  // len("Patching ")
+                // Remove trailing " (N blocks)" if present
+                int parenIdx = titlePath.lastIndexOf(QStringLiteral(" ("));
+                if (parenIdx > 0) {
+                    titlePath = titlePath.left(parenIdx);
+                }
+                if (!titlePath.isEmpty()) {
+                    toolCall.filePath = agentPath(titlePath);
+                }
+            }
+        } else if (title.contains(QStringLiteral("bash")) || title.contains(QStringLiteral("Bash")) ||
+                   title.startsWith(QStringLiteral("Running "))) {
+            toolCall.name = QStringLiteral("Bash");
+        }
+    }
+
+    // Final fallback: infer from toolCallId prefix (e.g., Gemini "run_shell_command-<ts>")
+    if (!isReadTool(toolCall.name) && !isWriteTool(toolCall.name) &&
+        !isEditTool(toolCall.name) && !isBashTool(toolCall.name)) {
+        QString inferred = inferToolNameFromId(toolCall.id);
+        if (!inferred.isEmpty()) {
+            toolCall.name = inferred;
+        }
+    }
+
+    // Extract Edit/Write specific fields from content array
+    QJsonArray contentArray = update[QStringLiteral("content")].toArray();
+    for (int i = 0; i < contentArray.size(); ++i) {
+        QJsonObject contentItem = contentArray[i].toObject();
+        QString type = contentItem[QStringLiteral("type")].toString();
+
+        if (type == QStringLiteral("diff")) {
+            // This is an Edit operation
+            toolCall.operationType = QStringLiteral("edit");
+
+            EditDiff edit;
+            edit.oldText = contentItem[QStringLiteral("oldText")].toString();
+            edit.newText = contentItem[QStringLiteral("newText")].toString();
+            edit.filePath = contentItem[QStringLiteral("filePath")].toString();
+
+            toolCall.edits.append(edit);
+
+            // Keep backward compatibility with single-edit fields
+            if (i == 0) {
+                toolCall.oldText = edit.oldText;
+                toolCall.newText = edit.newText;
+            }
+
+            qDebug() << "[ACPSession] Edit" << i + 1 << "detected - old:" << edit.oldText.length()
+                     << "chars, new:" << edit.newText.length() << "chars";
+        } else if (type == QStringLiteral("terminal")
+                   && !isAgentDisplayTerminal(contentItem[QStringLiteral("terminalId")].toString(), toolCall.id, update)) {
+            // This tool call has embedded terminal output (a terminal
+            // Kate Code runs; an agent's display terminal gives its
+            // output as the result).
+            toolCall.terminalId = contentItem[QStringLiteral("terminalId")].toString();
+            qDebug() << "[ACPSession] Terminal embedded - id:" << toolCall.terminalId;
+        }
+    }
+
+    if (!toolCall.edits.isEmpty()) {
+        qDebug() << "[ACPSession] Total edits in tool call:" << toolCall.edits.size();
+    }
+
+    // Fallback: Extract edit data from rawInput for MCP tools (e.g., mcp__kate__katecode_edit)
+    // MCP tools use old_string/new_string in rawInput, not diff objects in content array
+    if (toolCall.edits.isEmpty() && isEditTool(toolCall.name)) {
+        QString oldStr = toolCall.input[QStringLiteral("old_string")].toString();
+        QString newStr = toolCall.input[QStringLiteral("new_string")].toString();
+
+        if (!oldStr.isEmpty() || !newStr.isEmpty()) {
+            EditDiff edit;
+            edit.oldText = oldStr;
+            edit.newText = newStr;
+            edit.filePath = toolCall.filePath;
+            toolCall.edits.append(edit);
+            toolCall.oldText = oldStr;
+            toolCall.newText = newStr;
+
+            qDebug() << "[ACPSession] Edit from rawInput - old:" << oldStr.length()
+                     << "chars, new:" << newStr.length() << "chars";
+        }
+    }
+
+    // Fallback: Extract write content from rawInput for MCP tools (e.g., mcp__kate__katecode_write)
+    if (isWriteTool(toolCall.name) && toolCall.newText.isEmpty()) {
+        QString content = toolCall.input[QStringLiteral("content")].toString();
+        if (!content.isEmpty()) {
+            toolCall.newText = content;
+            qDebug() << "[ACPSession] Write content from rawInput:" << content.length() << "chars";
+        }
+    }
+    return toolCall;
 }
 
 QString ACPSession::agentPath(const QString &path) const

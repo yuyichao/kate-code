@@ -14,6 +14,7 @@ set(katecode_SRCS
     # ACP layer
     acp/ACPService.cpp
     acp/ACPSession.cpp
+    acp/ACPProtocolV2.cpp
     acp/ACPSessionDeleter.cpp
     acp/ACPSessionLister.cpp
     acp/RateLimits.cpp

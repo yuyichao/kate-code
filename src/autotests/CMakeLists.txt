@@ -11,3 +11,11 @@ ecm_add_test(SettingsStoreTest.cpp
 )
 target_include_directories(settingsstoretest PRIVATE ${CMAKE_SOURCE_DIR}/src/acp)
 set_tests_properties(settingsstoretest PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# ACP v2 (draft) translated to the v1 messages ACPSession handles.
+ecm_add_test(ACPProtocolV2Test.cpp
+    ${CMAKE_SOURCE_DIR}/src/acp/ACPProtocolV2.cpp
+    TEST_NAME acpprotocolv2test
+    LINK_LIBRARIES Qt6::Test Qt6::Core
+)
+target_include_directories(acpprotocolv2test PRIVATE ${CMAKE_SOURCE_DIR}/src/acp)
