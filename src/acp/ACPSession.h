@@ -420,6 +420,10 @@ private:
     QHash<QString, QString> m_displayTerminalOutput;
     bool m_autonomousTurn = false;
     int m_autonomousCounter = 0;
+    // Tool calls of the running cycle without a final status: a result
+    // while one runs is a placeholder (several task notifications answered
+    // by one follow-up), not the cycle's end.
+    QSet<QString> m_cycleToolCalls;
     // A cancelled prompt whose response has not come: its trailing output
     // is not a cycle of its own.
     int m_cancelledPromptId = -1;

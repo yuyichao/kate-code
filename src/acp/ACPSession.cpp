@@ -1557,6 +1557,7 @@ void ACPSession::finishAutonomousTurn()
     }
     qDebug() << "[ACPSession] The agent's own cycle ended";
     m_autonomousTurn = false;
+    m_cycleToolCalls.clear();
     if (!m_currentMessageId.isEmpty()) {
         if (!m_currentMessageContent.isEmpty() && m_transcript) {
             Message assistantMsg;
@@ -1621,6 +1622,7 @@ void ACPSession::clearBackgroundWork()
 {
     const bool active = m_autonomousTurn || !m_backgroundTerminals.isEmpty();
     m_autonomousTurn = false;
+    m_cycleToolCalls.clear();
     m_displayTerminals.clear();
     m_backgroundTaskToolCalls.clear();
     m_backgroundTerminals.clear();
@@ -2022,10 +2024,12 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
 
     // Claude Code's output outside a prompt: a cycle it started on its own
     // (e.g. a background task ended). Not the trailing output of a
-    // cancelled prompt, nor a silent summary's.
+    // cancelled prompt, nor a silent summary's. Thinking counts too (not
+    // shown): it may be all there is for a while.
     if (!replaying && m_claudeCodeAgent && !isPromptRunning() && m_cancelledPromptId < 0 && !isSummaryRunning()
         && m_currentMessageId.isEmpty() && m_status == ConnectionStatus::Connected
-        && (updateType == QStringLiteral("agent_message_chunk") || updateType == QStringLiteral("tool_call"))) {
+        && (updateType == QStringLiteral("agent_message_chunk") || updateType == QStringLiteral("agent_thought_chunk")
+            || updateType == QStringLiteral("tool_call"))) {
         startAutonomousTurn();
     }
 
@@ -2043,9 +2047,16 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
             Q_EMIT remoteHostActivity(m_service->pathMap().hostDir());
         }
     }
-    if (updateType == QStringLiteral("tool_call_update") && !replaying) {
+    if (!replaying && (updateType == QStringLiteral("tool_call") || updateType == QStringLiteral("tool_call_update"))) {
+        const QString toolCallId = update[QStringLiteral("toolCallId")].toString();
         const QString toolStatus = update[QStringLiteral("status")].toString();
-        if (toolStatus == QStringLiteral("completed") || toolStatus == QStringLiteral("failed")) {
+        const bool done = toolStatus == QStringLiteral("completed") || toolStatus == QStringLiteral("failed");
+        if (done) {
+            m_cycleToolCalls.remove(toolCallId);
+        } else if (updateType == QStringLiteral("tool_call") && m_autonomousTurn) {
+            m_cycleToolCalls.insert(toolCallId);
+        }
+        if (done && updateType == QStringLiteral("tool_call_update")) {
             scheduleRemoteDocumentCheck();
         }
     }
@@ -2660,11 +2671,19 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         Q_EMIT usageChanged(m_usage);
         // The usage of a result (with its cost, and the origin of the work)
         // ends a cycle Claude Code ran on its own. Mid-turn usage reports
-        // have neither.
+        // have neither. Not while one of the cycle's tool calls runs: then
+        // it is a placeholder's (Claude Code answers task notifications that
+        // came together with one follow-up, sending an empty result for all
+        // but the last; the usage_update does not tell them apart).
         if (m_autonomousTurn && !isPromptRunning()
             && (update.contains(QStringLiteral("cost"))
                 || update[QStringLiteral("_meta")].toObject().contains(QStringLiteral("_claude/origin")))) {
-            finishAutonomousTurn();
+            if (m_cycleToolCalls.isEmpty()) {
+                finishAutonomousTurn();
+            } else {
+                qDebug() << "[ACPSession] A result while" << m_cycleToolCalls.size()
+                         << "tool call(s) of the cycle run: the cycle goes on";
+            }
         }
         const QJsonObject rateLimit = update[QStringLiteral("_meta")].toObject()[QStringLiteral("_claude/rateLimit")].toObject();
         if (!rateLimit.isEmpty()) {
