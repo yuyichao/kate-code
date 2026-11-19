@@ -60,6 +60,7 @@ AGENT_LOG = os.path.join(AGENT_HOME, "agent.log")
 HOSTS_FILE = os.path.join(STATE, "kate-remote-fs", "hosts")
 SSH_LOG = os.path.join(TMP, "ssh.log")
 FAKE_SSH = os.path.join(TMP, "fake-ssh")
+FAKE_WIN = os.path.join(TMP, "fake-windows-host")  # a Windows host's side of the tunnel
 DAEMON_LOG = os.path.join(TMP, "daemon.log")
 DAV_TREE = os.path.join(TMP, "dav")       # a WebDAV share (served at /dav/; "/" is 404)
 DAV_DEEP = os.path.join(TMP, "dav-deep")  # one at /deep/er/dav/ (/deep/ and /deep/er/ are 404)
@@ -275,6 +276,27 @@ case " $* " in
     *" slowhost "*) sleep 1.5;;
 esac
 case " $* " in
+    *" -W "*)
+        # The tunnel to a Windows host's agent (-W 127.0.0.1:<port>);
+        # winnofwd refuses forwarding.
+        case " $* " in *" winnofwd "*)
+            echo "channel 0: open failed: administratively prohibited: open failed" >&2
+            echo "stdio forwarding failed" >&2
+            exit 255;;
+        esac
+        prev=
+        for arg in "$@"; do
+            [ "$prev" = "-W" ] && target=$arg
+            prev=$arg
+        done
+        exec python3 {FAKE_WIN} relay "$target";;
+esac
+for arg in "$@"; do last=$arg; done
+case "$last" in "powershell -NoLogo -NoProfile -NonInteractive -EncodedCommand "*)
+    # A Windows host (agent script): the tunnel's other end.
+    exec python3 {FAKE_WIN} script "$last";;
+esac
+case " $* " in
     *" -T "*)
         # A remote command (Kate Code's agent): run by the login shell
         # (sh), with a home of its own.
@@ -296,6 +318,99 @@ exec bwrap --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 -
     --bind {TREE} /data --dev /dev --proc /proc --chdir / --die-with-parent {SFTP_SERVER}
 """)
     os.chmod(FAKE_SSH, 0o755)
+
+    with open(FAKE_WIN, "w") as f:
+        f.write(f"""#!/usr/bin/python3
+# Stand-in for a Windows host's side of Kate Code's tunnel (RemoteStdio,
+# KateRemote::TunnelLinePrefix):
+#   script <command>: an agent script (windowsAgentScript()): checks the
+#     folder (C:\\data\\... is the sandbox's /data/...) and the program like
+#     it, prints the tunnel line, serves the first connection with the
+#     token: the agent (in the sandbox, as for -T commands) with the
+#     connection as its stdin/stdout; the end of the connection's input
+#     kills it; its stderr comes at the end, its code is the exit code.
+#   relay <host:port>: ssh -W.
+import base64, os, re, secrets, socket, subprocess, sys, threading, time
+if sys.argv[1] == "relay":
+    host, port = sys.argv[2].rsplit(":", 1)
+    s = socket.create_connection((host, int(port)))
+    def up():
+        while True:
+            data = os.read(0, 65536)
+            if not data:
+                s.shutdown(socket.SHUT_WR)
+                return
+            s.sendall(data)
+    threading.Thread(target=up, daemon=True).start()
+    while True:
+        data = s.recv(65536)
+        if not data:
+            break
+        os.write(1, data)
+    sys.exit(0)
+text = base64.b64decode(sys.argv[2].split()[-1]).decode("utf-16-le")
+assert "KATECODE-TUNNEL" in text
+folder = re.search(r"^\\$d='((?:[^']|'')*)'$", text, re.M).group(1).replace("''", "'")
+program = re.search(r"Get-Command -Name '((?:[^']|'')*)'", text).group(1).replace("''", "'")
+path = folder[2:].replace("\\\\", "/") if folder.startswith("C:") else ""
+if not (path + "/").startswith("/data/") or not os.path.isdir("{TREE}" + path[5:]):
+    print("No such folder: " + folder, file=sys.stderr)
+    sys.exit(1)
+if not os.path.exists("{AGENT_HOME}/.local/bin/" + program):
+    print(program + ": not found", file=sys.stderr)
+    sys.exit(127)
+listener = socket.socket()
+listener.bind(("127.0.0.1", 0))
+listener.listen(4)
+token = secrets.token_hex(16)
+sys.stdout.write("KATECODE-TUNNEL %d %s\\r\\n" % (listener.getsockname()[1], token))
+sys.stdout.flush()
+listener.settimeout(60)
+while True:
+    connection, _ = listener.accept()
+    connection.settimeout(10)
+    received = b""
+    try:
+        while len(received) < 33:
+            data = connection.recv(33 - len(received))
+            if not data:
+                break
+            received += data
+    except OSError:
+        pass
+    if received == (token + "\\n").encode():
+        break
+    connection.close()
+listener.close()
+connection.settimeout(None)
+agent = subprocess.Popen(["bwrap", "--ro-bind", "/usr", "/usr", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib", "/lib64",
+                          "--symlink", "usr/bin", "/bin", "--ro-bind", "/etc/passwd", "/etc/passwd", "--ro-bind", "/etc/group", "/etc/group",
+                          "--bind", "{TREE}", "/data", "--bind", "{AGENT_HOME}", "/agent-home", "--dev", "/dev", "--proc", "/proc",
+                          "--tmpfs", "/tmp", "--chdir", path, "--die-with-parent", "--setenv", "HOME", "/agent-home",
+                          "/agent-home/.local/bin/" + program],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+stderr = []
+threading.Thread(target=lambda: stderr.append(agent.stderr.read()), daemon=True).start()
+def down():
+    while True:
+        data = connection.recv(65536)
+        if not data:
+            agent.kill()
+            return
+        agent.stdin.write(data)
+        agent.stdin.flush()
+threading.Thread(target=down, daemon=True).start()
+while True:
+    data = agent.stdout.read1(65536)
+    if not data:
+        break
+    connection.sendall(data)
+code = agent.wait()
+connection.close()
+time.sleep(0.2)
+sys.stderr.buffer.write(b"".join(stderr)[-4096:])
+sys.exit(code)
+""")
 
     # KIO's fish worker runs "ssh ... host <command>": run the command in the
     # same sandbox (the tree as /data).
@@ -769,6 +884,46 @@ def test_remote_agent():
     check(code != 0 and any("ssh to badagent failed" in e and "Connection refused" in e for e in errors), f"ssh failure reported: {errors}")
     code, _, errors, output = run_agent("goodhost", "/data/missing")
     check(code != 0 and any("exited" in e for e in errors), f"missing folder reported: {errors}")
+
+
+def test_windows_tunnel():
+    print("Kate Code agents on a Windows host (through a tunnel)")
+    if not ACPDRIVER:
+        check(False, "acpdriver given")
+        return
+    import re
+    import time
+    if os.path.exists(AGENT_LOG):
+        os.remove(AGENT_LOG)
+    code, messages, errors, output = run_agent("winhost", "/C:/data/sub")
+    check(code == 0 and "DONE" in output, f"agent ran on the Windows host ({code}): {output}")
+    check("REMOTE winhost" in output, "agent marked remote")
+    new = next((m for m in agent_log() if m.get("method") == "session/new"), {})
+    check(new.get("params", {}).get("cwd") == "C:\\data\\sub", f"agent got the Windows cwd: {new}")
+    chunk = next((m["params"]["update"]["content"]["text"] for m in messages if m.get("method") == "session/update"
+                  and m["params"]["update"].get("sessionUpdate") == "agent_message_chunk"), "")
+    check(chunk == "pwd=/data/sub", f"agent runs in the folder: {chunk!r}")
+    check(not errors, f"no errors: {errors}")
+    with open(SSH_LOG) as f:
+        calls = f.read().splitlines()
+    launcher = [c for c in calls if " winhost " in c + " " and "-EncodedCommand" in c]
+    tunnel = [c for c in calls if " -W 127.0.0.1:" in c and c.endswith(" winhost")]
+    check(launcher and tunnel, f"agent script and tunnel through ssh: {calls[-2:]}")
+    if launcher and tunnel:
+        control = re.search(r"ControlPath=(\S+)", launcher[-1])
+        check("ControlMaster=yes" in launcher[-1] and control, f"the agent's ssh is a master: {launcher[-1][:300]}")
+        check(control and f"ControlMaster=no -o ControlPath={control.group(1)} " in tunnel[-1], f"the tunnel goes through it: {tunnel[-1]}")
+
+    code, _, errors, output = run_agent("winhost", "/C:/data", "no-such-agent")
+    check(code != 0 and "MISSING" in output and any("no-such-agent was not found on winhost (searched PATH, %USERPROFILE%" in e
+                                                    and "no-such-agent: not found" in e for e in errors), f"missing agent reported: {errors} {output}")
+    code, _, errors, output = run_agent("winhost", "/C:/data/missing")
+    check(code != 0 and any("exited (exit code 1)" in e and "No such folder: C:\\data\\missing" in e for e in errors), f"missing folder reported: {errors}")
+    start = time.monotonic()
+    code, _, errors, output = run_agent("winnofwd", "/C:/data")
+    check(code != 0 and len(errors) == 1 and "ssh to winnofwd failed" in errors[0] and "administratively prohibited" in errors[0],
+          f"a refused tunnel reported: {errors} {output}")
+    check(time.monotonic() - start < 15, "at once")
 
 
 def run_install(entry, program, authority="goodhost", path="/data/sub"):
@@ -1629,7 +1784,7 @@ def main():
             check(False, f"daemon start: {e!r}")
             return 1
         for test in (register_hosts, test_listing_and_read, test_write_operations, test_symlinks, test_invalid_names,
-                     test_host_registry, test_kde_passwords, test_remote_agent, test_remote_agent_install, test_local_agent_install, test_session_list, test_remote_helper, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
+                     test_host_registry, test_kde_passwords, test_remote_agent, test_windows_tunnel, test_remote_agent_install, test_local_agent_install, test_session_list, test_remote_helper, test_terminal_askpass, test_kio_backend, test_kio_folders, test_network_drop, test_failure_cache, test_concurrent_connect, test_idle_unmount, test_backend_crash,
                      test_dbus_unmount, test_restart, test_shutdown_and_restart):
             try:
                 test()

@@ -6,6 +6,7 @@
 #include "AgentInstaller.h"
 
 #include "ACPService.h"
+#include "RemoteStdio.h"
 
 #include <KTar>
 #include <KZip>
@@ -386,10 +387,10 @@ void AgentInstaller::cancel()
             // and lets the script's traps remove its temporary directory, so
             // the process object stays (no SIGKILL from its destructor)
             // until it ends; SIGKILL after 10 s.
-            QProcess *process = m_process;
-            const qint64 pid = process->processId();
+            RemoteStdio *process = m_process;
+            const qint64 pid = process->launcher() ? process->launcher()->processId() : 0;
             process->setParent(nullptr);
-            connect(process, &QProcess::finished, process, &QObject::deleteLater);
+            connect(process, &RemoteStdio::finished, process, &QObject::deleteLater);
             if (pid > 0) {
                 ::kill(-pid_t(pid), SIGTERM);
                 QTimer::singleShot(10000, process, [process, pid] {
@@ -412,7 +413,6 @@ void AgentInstaller::cancel()
     m_downloadFile = nullptr;
     delete m_hash;
     m_hash = nullptr;
-    removeAskpassState();
     if (!m_tempArchive.isEmpty()) {
         QFile::remove(m_tempArchive);
         m_tempArchive.clear();
@@ -437,19 +437,10 @@ void AgentInstaller::succeed(const QString &message)
     Q_EMIT finished(true, message);
 }
 
-void AgentInstaller::removeAskpassState()
-{
-    if (!m_askpassState.isEmpty()) {
-        QFile::remove(m_askpassState);
-        m_askpassState.clear();
-    }
-}
-
 void AgentInstaller::runScript(const QString &script, const QString &stdinFile, std::function<void(int, const QByteArray &, const QByteArray &)> done)
 {
     QStringList command;
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    removeAskpassState();
+    auto *process = new RemoteStdio(this);
     if (m_local) {
         if (!script.isEmpty()) {
             command = QStringList{QStringLiteral("/bin/sh"), QStringLiteral("-c"), script};
@@ -457,24 +448,23 @@ void AgentInstaller::runScript(const QString &script, const QString &stdinFile, 
     } else {
         command = KateRemote::sshScriptCommand(*m_location, KateRemote::configuredSshCommand(), script);
         if (command.isEmpty()) {
+            delete process;
             fail(QStringLiteral("Cannot run commands on %1 through ssh.").arg(m_location->authority));
             return;
         }
         // Like the agent's ssh (ACPService::start()): passwords from KDE's
         // cache, else a dialog.
-        const QString state = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/kate-code-askpass-")
-            + QUuid::createUuid().toString(QUuid::Id128);
-        if (KateRemote::setSshAskpassEnvironment(env, ACPService::remoteFsAskpassProgram(), m_location->authority, state)) {
-            m_askpassState = state;
+        process->setAskpass(ACPService::remoteFsAskpassProgram(), m_location->authority);
+        if (!stdinFile.isEmpty() && KateRemote::usesTunnel(*m_location)) {
+            process->setTunnel(*m_location, KateRemote::configuredSshCommand());
         }
     }
     if (command.isEmpty()) {
+        delete process;
         fail(QStringLiteral("Cannot install %1.").arg(agentName()));
         return;
     }
-    auto *process = new QProcess(this);
     m_process = process;
-    process->setProcessEnvironment(env);
     process->setWorkingDirectory(QDir::homePath());
     if (m_local) {
         // Its own process group: cancel() ends npm and tar with it.
@@ -482,20 +472,15 @@ void AgentInstaller::runScript(const QString &script, const QString &stdinFile, 
             ::setpgid(0, 0);
         });
     }
-    if (!stdinFile.isEmpty()) {
-        process->setStandardInputFile(stdinFile);
-    } else {
-        process->setStandardInputFile(QProcess::nullDevice());
-    }
-    connect(process, &QProcess::finished, this, [this, process, done](int exitCode, QProcess::ExitStatus status) {
+    process->setStandardInputFile(!stdinFile.isEmpty() ? stdinFile : QProcess::nullDevice());
+    connect(process, &RemoteStdio::finished, this, [this, process, done](int exitCode, QProcess::ExitStatus status) {
         const QByteArray out = process->readAllStandardOutput();
         const QByteArray err = process->readAllStandardError();
         process->deleteLater();
         m_process = nullptr;
-        removeAskpassState();
         done(status == QProcess::NormalExit ? exitCode : -1, out, err);
     });
-    connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError error) {
+    connect(process, &RemoteStdio::errorOccurred, this, [this, process](QProcess::ProcessError error) {
         if (error == QProcess::FailedToStart) {
             fail(QStringLiteral("Cannot start %1: %2").arg(m_local ? QStringLiteral("/bin/sh") : QStringLiteral("ssh"), process->errorString()));
         }

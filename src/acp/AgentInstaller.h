@@ -16,7 +16,7 @@
 
 class QNetworkAccessManager;
 class QNetworkReply;
-class QProcess;
+class RemoteStdio;
 class QSaveFile;
 class QCryptographicHash;
 
@@ -105,8 +105,9 @@ private:
     void fail(const QString &message);
     void succeed(const QString &message);
     // ssh running script on the host; done(exit code, stdout, stderr).
+    // Windows hosts: a script with input (the install script) gets it
+    // through a tunnel (RemoteStdio).
     void runScript(const QString &script, const QString &stdinFile, std::function<void(int, const QByteArray &, const QByteArray &)> done);
-    void removeAskpassState();
 
     QJsonObject m_agent;
     QString m_workingDir;
@@ -126,8 +127,7 @@ private:
     QPointer<QNetworkReply> m_reply;
     QSaveFile *m_downloadFile = nullptr;
     QCryptographicHash *m_hash = nullptr;
-    QPointer<QProcess> m_process;
-    QString m_askpassState;
+    QPointer<RemoteStdio> m_process;
     QString m_tempArchive; // re-packed .tar.gz, removed at the end
     int m_lastPercent = -1;
 };

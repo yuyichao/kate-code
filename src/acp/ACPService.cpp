@@ -1,6 +1,7 @@
 #include "ACPService.h"
 
 #include "AgentInstaller.h"
+#include "RemoteStdio.h"
 
 #include "RemoteLocation.h"
 
@@ -38,7 +39,6 @@ ACPService::~ACPService()
         disconnect(m_process, nullptr, this, nullptr);
     }
     stop();
-    removeAskpassState();
 }
 
 // kate-remote-fs-askpass, as kate-remote-fs uses it (empty when its
@@ -66,6 +66,7 @@ QStringList ACPService::remoteCommand(const QString &workingDir)
 {
     m_pathMap = KateRemote::RemotePathMap();
     m_remoteHost.clear();
+    m_remoteLocation.reset();
     if (!m_allowRemote) {
         return {};
     }
@@ -81,6 +82,7 @@ QStringList ACPService::remoteCommand(const QString &workingDir)
         return {};
     }
     m_remoteHost = location->authority;
+    m_remoteLocation = *location;
     const QString hostDir = KateRemote::pathForLocation({location->scheme, location->authority, QStringLiteral("/")}, KateRemote::configuredMountRoot());
     const QString windowsPath = KateRemote::windowsPathForSftpPath(location->path);
     m_pathMap = windowsPath.isEmpty() ? KateRemote::RemotePathMap(hostDir)
@@ -166,14 +168,6 @@ void ACPService::mcpForwardResult(int remotePort)
     Q_EMIT remoteMcpReady();
 }
 
-void ACPService::removeAskpassState()
-{
-    if (!m_askpassState.isEmpty()) {
-        QFile::remove(m_askpassState);
-        m_askpassState.clear();
-    }
-}
-
 bool ACPService::start(const QString &workingDir)
 {
     qDebug() << "[ACPService] Starting" << m_executable << "in:" << workingDir;
@@ -189,7 +183,6 @@ bool ACPService::start(const QString &workingDir)
 
     m_stderrTail.clear();
     m_stderrLine.clear();
-    removeAskpassState();
     stopMcpServer();
 
     QStringList remote = remoteCommand(workingDir);
@@ -204,13 +197,15 @@ bool ACPService::start(const QString &workingDir)
             // and the forward would outlive the agent; the report is an
             // INFO message (a LogLevel of ERROR in ssh_config hides it).
             // ssh takes the first value of an option: these beat the
-            // config files.
-            const QStringList forward{QStringLiteral("-o"),
-                                      QStringLiteral("ControlPath=none"),
-                                      QStringLiteral("-o"),
-                                      QStringLiteral("LogLevel=INFO"),
-                                      QStringLiteral("-R"),
-                                      QStringLiteral("0:127.0.0.1:%1").arg(m_mcpLocalPort)};
+            // config files. With a tunnel (Windows hosts) this ssh is a
+            // master of its own (RemoteStdio): a connection of its own too,
+            // and the forward is on it (-W, the tunnel's, forwards nothing
+            // else).
+            QStringList forward;
+            if (!KateRemote::usesTunnel(*m_remoteLocation)) {
+                forward << QStringLiteral("-o") << QStringLiteral("ControlPath=none");
+            }
+            forward << QStringLiteral("-o") << QStringLiteral("LogLevel=INFO") << QStringLiteral("-R") << QStringLiteral("0:127.0.0.1:%1").arg(m_mcpLocalPort);
             for (const QString &arg : forward) {
                 remote.insert(remote.size() - 3, arg);
             }
@@ -218,23 +213,22 @@ bool ACPService::start(const QString &workingDir)
         }
     }
 
-    m_process = new QProcess(this);
+    m_process = new RemoteStdio(this);
 
-    connect(m_process, &QProcess::readyReadStandardOutput, this, &ACPService::onStdout);
-    connect(m_process, &QProcess::readyReadStandardError, this, &ACPService::onStderr);
-    connect(m_process, &QProcess::finished, this, &ACPService::onFinished);
-    connect(m_process, &QProcess::errorOccurred, this, &ACPService::onError);
+    connect(m_process, &RemoteStdio::readyReadStandardOutput, this, &ACPService::onStdout);
+    connect(m_process, &RemoteStdio::readyReadStandardError, this, &ACPService::onStderr);
+    connect(m_process, &RemoteStdio::finished, this, &ACPService::onFinished);
+    connect(m_process, &RemoteStdio::errorOccurred, this, &ACPService::onError);
 
     if (!remote.isEmpty()) {
         // ssh without a terminal: passwords through SSH_ASKPASS, from KDE's
         // password cache like the mounts, else a dialog.
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        const QString state = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/kate-code-askpass-")
-            + QUuid::createUuid().toString(QUuid::Id128);
-        if (KateRemote::setSshAskpassEnvironment(env, remoteFsAskpassProgram(), m_remoteHost, state)) {
-            m_askpassState = state;
+        m_process->setAskpass(remoteFsAskpassProgram(), m_remoteHost);
+        if (KateRemote::usesTunnel(*m_remoteLocation)) {
+            // Windows hosts: the protocol through a tunnel (RemoteStdio);
+            // until it is up, messages wait.
+            m_process->setTunnel(*m_remoteLocation, KateRemote::configuredSshCommand());
         }
-        m_process->setProcessEnvironment(env);
         // Not the mount: the agent's directory is on the host.
         m_process->setWorkingDirectory(QDir::homePath());
         qDebug() << "[ACPService] Starting agent on" << m_remoteHost << ":" << remote;
@@ -283,7 +277,6 @@ void ACPService::stop()
         // Emit disconnected signal since onFinished won't be called (signals disconnected)
         Q_EMIT disconnected(0);
     }
-    removeAskpassState();
     stopMcpServer();
 }
 
@@ -472,7 +465,6 @@ void ACPService::onStderr()
 void ACPService::onFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
     qDebug() << "[ACPService] Process finished with exit code:" << exitCode;
-    removeAskpassState();
     stopMcpServer();
 
     if (isRemote() && (exitCode != 0 || exitStatus != QProcess::NormalExit)) {

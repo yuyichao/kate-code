@@ -22,7 +22,7 @@
 class QCryptographicHash;
 class QNetworkAccessManager;
 class QNetworkReply;
-class QProcess;
+class RemoteStdio;
 class QSaveFile;
 class QTimer;
 
@@ -111,9 +111,9 @@ private:
     void syncWatches();
     QString toHost(const QString &localPath) const;
     QString toLocal(const QString &hostPath) const;
-    // ssh's environment (askpass, like the agent's ssh); stateFile: the
-    // askpass state file to remove afterwards (empty if none).
-    QProcessEnvironment sshEnvironment(QString *stateFile) const;
+    // An ssh for a script on the host (askpass, like the agent's ssh;
+    // Windows hosts: through a tunnel), not started.
+    RemoteStdio *newSshProcess();
 
     QString m_workingDir;
     KateRemote::RemotePathMap m_map;
@@ -123,8 +123,7 @@ private:
     QString m_downloadDir;
     bool m_allowFileUrls = false;
 
-    QPointer<QProcess> m_process;
-    QString m_askpassState;
+    QPointer<RemoteStdio> m_process;
     QByteArray m_buffer;
     QByteArray m_stderrTail;
     qint64 m_preHelloBytes = 0;
@@ -144,8 +143,7 @@ private:
     QHash<QString, QString> m_hostToLocal; // for changed()
 
     // Installing.
-    QPointer<QProcess> m_installProcess;
-    QString m_installAskpassState;
+    QPointer<RemoteStdio> m_installProcess;
     QNetworkAccessManager *m_network = nullptr;
     QPointer<QNetworkReply> m_reply;
     QSaveFile *m_downloadFile = nullptr;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QByteArray>
 #include <QList>
 #include <QString>
 #include <QUrl>
@@ -122,7 +123,8 @@ QStringList sshTerminalCommand(const Location &location, const QStringList &ssh)
 // missing agent exits with 127 (env).
 // Windows hosts (sftp drive paths, windowsPathForSftpPath()): PowerShell
 // runs windowsAgentScript() (-EncodedCommand, so either default shell of
-// Windows' sshd passes it on unchanged).
+// Windows' sshd passes it on unchanged); the protocol goes through a tunnel
+// (see TunnelLinePrefix), not ssh's stdin/stdout.
 QStringList sshAgentCommand(const Location &location, const QStringList &ssh, const QString &program, const QStringList &args);
 
 // SSH_ASKPASS for an ssh started without a terminal (env: its environment).
@@ -134,10 +136,39 @@ QStringList sshAgentCommand(const Location &location, const QStringList &ssh, co
 // fallback is set up.
 bool setSshAskpassEnvironment(QProcessEnvironment &env, const QString &askpass, const QString &authority, const QString &stateFile);
 
+// Windows hosts: the stream of an agent, kate-code-helper or an install
+// script goes through a tunnel. Windows' sshd stops passing on a session's
+// output once a process in it has started another one, and PowerShell's
+// reads of its stdin stall. The script (after checks whose errors and exit
+// codes come through ssh as usual) listens on the host's 127.0.0.1 and
+// prints "KATECODE-TUNNEL <port> <token>" (32 hex digits); the client
+// connects there (sshTunnelCommand()) and sends "<token>\n" first, then the
+// stream. Only the first connection with the token is served (within 60 s,
+// else exit 124). The end of its input is the end of an install script's
+// archive; for a program (agent, helper) it is the client gone, and the
+// program's process tree is killed (as a POSIX session's hangup would). Output the script writes
+// later on ssh's stdout/stderr comes when the session ends (an agent's
+// stderr: its last 4 KiB once it has exited), and its exit code is the
+// program's.
+constexpr const char TunnelLinePrefix[] = "KATECODE-TUNNEL";
+struct TunnelEndpoint {
+    quint16 port = 0;
+    QByteArray token;
+};
+// A line of the script's output: the tunnel's port and token, else nullopt.
+std::optional<TunnelEndpoint> parseTunnelLine(const QByteArray &line);
+// Whether location's scripts and agents use a tunnel (Windows hosts).
+bool usesTunnel(const Location &location);
+// The command line (program first) carrying the tunnel's stream on stdio:
+// `ssh -W 127.0.0.1:<port>`, through the connection of the ssh that runs the
+// script when that one is the master of controlPath (else a login of its
+// own). Empty when ssh cannot reach the location.
+QStringList sshTunnelCommand(const Location &location, const QStringList &ssh, const QString &controlPath, quint16 port);
+
 // The PowerShell script starting an agent on a Windows host in folder
 // (a Windows path): the program from PATH plus %USERPROFILE%\.local\bin,
 // \bin, \.cargo\bin and %APPDATA%\npm (exit 127 if missing), its stdio
-// copied as bytes.
+// the tunnel's stream (TunnelLinePrefix), copied as bytes.
 QString windowsAgentScript(const QString &folder, const QString &program, const QStringList &args);
 // 'arg' quoted for a Windows command line (CommandLineToArgvW rules).
 QString windowsArgument(const QString &arg);
@@ -171,8 +202,9 @@ struct RemotePlatform {
     bool installed = false; // Kate Code's launcher exists
 };
 std::optional<RemotePlatform> parseRemotePlatform(const QString &output);
-// The script installing package from a .tar.gz on its stdin; prints
-// "installed" at the end. Exit 3: cmd is not in the archive.
+// The script installing package from a .tar.gz on its stdin (Windows: the
+// tunnel's stream, TunnelLinePrefix); prints "installed" at the end. Exit 3:
+// cmd is not in the archive.
 QString remoteAgentInstallScript(bool windows, const RemoteAgentPackage &package);
 // Agents the registry runs with npx, installed by Kate Code on this
 // computer: `npm install` of the registry's exact version into
@@ -238,14 +270,16 @@ std::optional<RemoteHelperPin> parseRemoteHelperPin(const QByteArray &json, bool
 // armv6l/armv7l/armv8l -> linux-arm; static builds, so no libc
 // distinction; Windows: PROCESSOR_ARCHITECTURE), checks the installed copy of pin's build for it (size,
 // SHA-256 when sha256sum/shasum/openssl/Get-FileHash is there) and execs it
-// (its stdin/stdout are then the protocol); else prints
+// (its stdin/stdout are then the protocol; Windows: the tunnel's stream,
+// TunnelLinePrefix); else prints
 // "kate-code-helper: install <platform>" and exits with
 // RemoteHelperInstallNeeded, or "kate-code-helper: unsupported <os> <machine>"
 // and exits with RemoteHelperUnsupported. Empty for an invalid pin.
 constexpr int RemoteHelperInstallNeeded = 97;
 constexpr int RemoteHelperUnsupported = 98;
 QString remoteHelperLaunchScript(bool windows, const RemoteHelperPin &pin);
-// The script installing build (a .tar.gz on its stdin) for pin's version:
+// The script installing build (a .tar.gz on its stdin; Windows: the
+// tunnel's stream) for pin's version:
 // unpacked next to its place and renamed over it (atomic; a concurrent
 // install of the same version writes the same file); prints "installed".
 // Exit 3: the program is not in the archive. Empty for invalid input.

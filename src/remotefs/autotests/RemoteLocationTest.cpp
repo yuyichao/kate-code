@@ -514,7 +514,14 @@ private Q_SLOTS:
         QCOMPARE(script, windowsAgentScript(QStringLiteral("C:\\Users\\me\\it's proj"), QStringLiteral("claude-agent-acp"), {QStringLiteral("--x"), QStringLiteral("a \"b\" c\\")}));
         QVERIFY(script.contains(QStringLiteral("$d='C:\\Users\\me\\it''s proj'\n")));
         QVERIFY(script.contains(QStringLiteral("Get-Command -Name 'claude-agent-acp' ")));
-        QVERIFY(script.contains(QStringLiteral("$i.Arguments='--x \"a \\\"b\\\" c\\\\\"'\n")));
+        QVERIFY(script.contains(QStringLiteral("Arguments='--x \"a \\\"b\\\" c\\\\\"';")));
+        // The checks come before the tunnel, the program after it.
+        QVERIFY(script.indexOf(QStringLiteral("exit 127")) < script.indexOf(QLatin1String(TunnelLinePrefix)));
+        QVERIFY(script.indexOf(QLatin1String(TunnelLinePrefix)) < script.indexOf(QStringLiteral("[Diagnostics.Process]::Start(")));
+        QVERIFY(script.contains(QStringLiteral("CopyToAsync($n)")));
+        QVERIFY(!script.contains(QStringLiteral("OpenStandardInput")));
+        QVERIFY(usesTunnel(Location{QStringLiteral("sftp"), QStringLiteral("me@win"), QStringLiteral("/C:/x")}));
+        QVERIFY(!usesTunnel(Location{QStringLiteral("sftp"), QStringLiteral("me@host"), QStringLiteral("/home/me")}));
         // fish has no Windows hosts.
         QVERIFY(sshAgentCommand(Location{QStringLiteral("fish"), QStringLiteral("win"), QStringLiteral("/C:/x")}, ssh, QStringLiteral("a"), {}).isEmpty());
     }
@@ -794,6 +801,9 @@ private Q_SLOTS:
         QVERIFY(script.contains(QStringLiteral("(Join-Path $x 'goose-package\\goose.exe')")));
         QVERIFY(script.contains(QStringLiteral("-Value '@\"%~dp0..\\agents\\goose\\1.59.0\\goose-package\\goose.exe\" %*'")));
         QVERIFY(script.contains(QStringLiteral("(Join-Path $n 'goose.cmd')")));
+        QVERIFY(script.startsWith(QStringLiteral("$l=New-Object Net.Sockets.TcpListener")));
+        QVERIFY(script.contains(QStringLiteral("$n.CopyTo($f)")));
+        QVERIFY(!script.contains(QStringLiteral("OpenStandardInput")));
         // The agent's script looks there last.
         QVERIFY(windowsAgentScript(QStringLiteral("C:\\x"), QStringLiteral("goose"), {}).contains(QStringLiteral(";$env:LOCALAPPDATA\\kate-code\\bin\"")));
         const QString probe = remotePlatformScript(true, QStringLiteral("goose"));
@@ -1009,11 +1019,45 @@ private Q_SLOTS:
         QCOMPARE(script, remoteHelperLaunchScript(true, pin));
         QVERIFY(script.contains(QStringLiteral("$t=@{'windows-x86_64'=@('%1',1234)}").arg(QString(64, QLatin1Char('c')))));
         QVERIFY(script.contains(QStringLiteral("('kate-code\\helper\\0.1.0\\'+$q+'\\kate-code-helper.exe')")));
-        QVERIFY(script.contains(QStringLiteral("$i.FileName=$f\n")));
+        QVERIFY(script.contains(QStringLiteral("FileName=$f;")));
+        QVERIFY(script.indexOf(QStringLiteral("exit %1").arg(RemoteHelperInstallNeeded)) < script.indexOf(QLatin1String(TunnelLinePrefix)));
+        // Two Windows builds still fit.
+        RemoteHelperPin two = pin;
+        two.builds << RemoteHelperBuild{QStringLiteral("windows-aarch64"), QString(), QString(), 0, QStringLiteral("kate-code-helper.exe"), QString(64, QLatin1Char('e')), 123456789};
+        const QStringList twoCommand = sshHelperCommand(Location{QStringLiteral("sftp"), QStringLiteral("me@win"), QStringLiteral("/C:/Users/me/proj")}, {QStringLiteral("ssh")}, two);
+        QVERIFY2(twoCommand.last().size() < 7000, qPrintable(QString::number(twoCommand.last().size())));
         QVERIFY(!script.contains(QStringLiteral("linux-x86_64")));
         const QString install = remoteHelperInstallScript(true, pin.version, pin.builds.first());
         QVERIFY(install.contains(QStringLiteral("'kate-code\\helper\\0.1.0\\windows-x86_64'")));
         QVERIFY(install.contains(QStringLiteral("Move-Item -LiteralPath $s -Destination (Join-Path $d 'kate-code-helper.exe') -Force")));
+        QVERIFY(install.contains(QStringLiteral("$n.CopyTo($f)")));
+        QVERIFY(!install.contains(QStringLiteral("OpenStandardInput")));
+    }
+
+    void tunnel()
+    {
+        const auto endpoint = parseTunnelLine("KATECODE-TUNNEL 50123 0123456789abcdef0123456789abcdef\r");
+        QVERIFY(endpoint);
+        QCOMPARE(endpoint->port, quint16(50123));
+        QCOMPARE(endpoint->token, QByteArray("0123456789abcdef0123456789abcdef"));
+        QVERIFY(parseTunnelLine("KATECODE-TUNNEL 50123 0123456789abcdef0123456789abcdef"));
+        QVERIFY(!parseTunnelLine("KATECODE-TUNNEL 0 0123456789abcdef0123456789abcdef"));
+        QVERIFY(!parseTunnelLine("KATECODE-TUNNEL 70000 0123456789abcdef0123456789abcdef"));
+        QVERIFY(!parseTunnelLine("KATECODE-TUNNEL 50123 0123456789abcdef"));
+        QVERIFY(!parseTunnelLine("KATECODE-TUNNEL 50123 0123456789ABCDEF0123456789abcdef"));
+        QVERIFY(!parseTunnelLine("x KATECODE-TUNNEL 50123 0123456789abcdef0123456789abcdef"));
+        QVERIFY(!parseTunnelLine(""));
+
+        const Location win{QStringLiteral("sftp"), QStringLiteral("me@win:2222"), QStringLiteral("/C:/Users/me")};
+        QCOMPARE(sshTunnelCommand(win, {QStringLiteral("ssh"), QStringLiteral("-F"), QStringLiteral("cfg")}, QStringLiteral("/run/user/1/kc"), 50123),
+                 (QStringList{QStringLiteral("ssh"), QStringLiteral("-F"), QStringLiteral("cfg"),
+                              QStringLiteral("-o"), QStringLiteral("ControlMaster=no"), QStringLiteral("-o"), QStringLiteral("ControlPath=/run/user/1/kc"),
+                              QStringLiteral("-o"), QStringLiteral("ServerAliveInterval=15"), QStringLiteral("-o"), QStringLiteral("ServerAliveCountMax=3"),
+                              QStringLiteral("-o"), QStringLiteral("ConnectTimeout=10"), QStringLiteral("-W"), QStringLiteral("127.0.0.1:50123"),
+                              QStringLiteral("-l"), QStringLiteral("me"), QStringLiteral("-p"), QStringLiteral("2222"), QStringLiteral("--"), QStringLiteral("win")}));
+        QVERIFY(!sshTunnelCommand(win, {QStringLiteral("ssh")}, QString(), 1).contains(QStringLiteral("ControlMaster=no")));
+        QVERIFY(sshTunnelCommand(win, {QStringLiteral("ssh")}, QString(), 0).isEmpty());
+        QVERIFY(sshTunnelCommand(Location{QStringLiteral("sftp"), QStringLiteral("-oProxyCommand=x"), QStringLiteral("/C:/")}, {QStringLiteral("ssh")}, QString(), 1).isEmpty());
     }
 
     void windowsArguments_data()

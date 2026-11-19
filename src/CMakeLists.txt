@@ -20,6 +20,7 @@ set(katecode_SRCS
     acp/RateLimits.cpp
     acp/AgentInstaller.cpp
     acp/RemoteHelper.cpp
+    acp/RemoteStdio.cpp
     acp/TerminalManager.cpp
 
     # UI layer

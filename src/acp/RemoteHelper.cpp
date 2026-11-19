@@ -6,6 +6,7 @@
 #include "RemoteHelper.h"
 
 #include "ACPService.h"
+#include "RemoteStdio.h"
 
 #include <QCryptographicHash>
 #include <QDebug>
@@ -104,18 +105,17 @@ QString RemoteHelper::host() const
     return m_location ? m_location->authority : QString();
 }
 
-QProcessEnvironment RemoteHelper::sshEnvironment(QString *stateFile) const
+RemoteStdio *RemoteHelper::newSshProcess()
 {
+    auto *process = new RemoteStdio(this);
     // Like the agent's ssh (ACPService::start()): passwords from KDE's
     // cache, else a dialog.
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    const QString state = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation) + QStringLiteral("/kate-code-askpass-")
-        + QUuid::createUuid().toString(QUuid::Id128);
-    stateFile->clear();
-    if (m_location && KateRemote::setSshAskpassEnvironment(env, ACPService::remoteFsAskpassProgram(), m_location->authority, state)) {
-        *stateFile = state;
+    process->setAskpass(ACPService::remoteFsAskpassProgram(), m_location->authority);
+    if (KateRemote::usesTunnel(*m_location)) {
+        process->setTunnel(*m_location, KateRemote::configuredSshCommand());
     }
-    return env;
+    process->setWorkingDirectory(QDir::homePath());
+    return process;
 }
 
 void RemoteHelper::start()
@@ -154,26 +154,22 @@ void RemoteHelper::launch()
     m_watchedOnHelper.clear();
     m_hostToLocal.clear();
 
-    auto *process = new QProcess(this);
+    RemoteStdio *process = newSshProcess();
     m_process = process;
-    QString state;
-    process->setProcessEnvironment(sshEnvironment(&state));
-    m_askpassState = state;
-    process->setWorkingDirectory(QDir::homePath());
-    connect(process, &QProcess::readyReadStandardOutput, this, &RemoteHelper::onStdout);
-    connect(process, &QProcess::readyReadStandardError, this, [this, process] {
+    connect(process, &RemoteStdio::readyReadStandardOutput, this, &RemoteHelper::onStdout);
+    connect(process, &RemoteStdio::readyReadStandardError, this, [this, process] {
         m_stderrTail += process->readAllStandardError();
         if (m_stderrTail.size() > 4096) {
             m_stderrTail = m_stderrTail.right(4096);
         }
     });
-    connect(process, &QProcess::finished, this, [this, process](int exitCode, QProcess::ExitStatus status) {
+    connect(process, &RemoteStdio::finished, this, [this, process](int exitCode, QProcess::ExitStatus status) {
         if (process != m_process) {
             return;
         }
         onFinished(status == QProcess::NormalExit ? exitCode : -1);
     });
-    connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError error) {
+    connect(process, &RemoteStdio::errorOccurred, this, [this, process](QProcess::ProcessError error) {
         if (process == m_process && error == QProcess::FailedToStart) {
             m_process = nullptr;
             process->deleteLater();
@@ -201,8 +197,8 @@ void RemoteHelper::stop()
     if (m_helloTimer) {
         m_helloTimer->stop();
     }
-    for (QPointer<QProcess> *p : {&m_process, &m_installProcess}) {
-        if (QProcess *process = *p) {
+    for (QPointer<RemoteStdio> *p : {&m_process, &m_installProcess}) {
+        if (RemoteStdio *process = *p) {
             process->disconnect(this);
             process->kill();
             process->waitForFinished(1000);
@@ -217,12 +213,6 @@ void RemoteHelper::stop()
     m_downloadFile = nullptr;
     delete m_hash;
     m_hash = nullptr;
-    for (QString *state : {&m_askpassState, &m_installAskpassState}) {
-        if (!state->isEmpty()) {
-            QFile::remove(*state);
-            state->clear();
-        }
-    }
     failAllPending(QStringLiteral("kate-code-helper stopped"));
 }
 
@@ -366,14 +356,10 @@ void RemoteHelper::becomeReady(const QJsonObject &hello)
 
 void RemoteHelper::onFinished(int exitCode)
 {
-    QProcess *process = m_process;
+    RemoteStdio *process = m_process;
     m_process = nullptr;
     if (process) {
         process->deleteLater();
-    }
-    if (!m_askpassState.isEmpty()) {
-        QFile::remove(m_askpassState);
-        m_askpassState.clear();
     }
     m_helloTimer->stop();
     const bool wasReady = m_ready;
@@ -504,22 +490,14 @@ void RemoteHelper::runInstall(const KateRemote::RemoteHelperBuild &build, const 
         return;
     }
     Q_EMIT progress(QStringLiteral("Installing kate-code-helper %1 (%2) on %3").arg(m_pin->version, build.platform, host()));
-    auto *process = new QProcess(this);
+    RemoteStdio *process = newSshProcess();
     m_installProcess = process;
-    QString state;
-    process->setProcessEnvironment(sshEnvironment(&state));
-    m_installAskpassState = state;
-    process->setWorkingDirectory(QDir::homePath());
     process->setStandardInputFile(archive);
-    connect(process, &QProcess::finished, this, [this, process](int exitCode, QProcess::ExitStatus status) {
+    connect(process, &RemoteStdio::finished, this, [this, process](int exitCode, QProcess::ExitStatus status) {
         const QByteArray out = process->readAllStandardOutput();
         const QByteArray err = process->readAllStandardError();
         process->deleteLater();
         m_installProcess = nullptr;
-        if (!m_installAskpassState.isEmpty()) {
-            QFile::remove(m_installAskpassState);
-            m_installAskpassState.clear();
-        }
         if (status != QProcess::NormalExit || exitCode != 0 || !out.contains("installed")) {
             const QString details = lastLines(err);
             finish(QStringLiteral("installing kate-code-helper on %1 failed (exit code %2)%3")
@@ -531,7 +509,7 @@ void RemoteHelper::runInstall(const KateRemote::RemoteHelperBuild &build, const 
         Q_EMIT progress(QStringLiteral("Installed kate-code-helper %1 on %2").arg(m_pin->version, host()));
         launch();
     });
-    connect(process, &QProcess::errorOccurred, this, [this, process](QProcess::ProcessError error) {
+    connect(process, &RemoteStdio::errorOccurred, this, [this, process](QProcess::ProcessError error) {
         if (error == QProcess::FailedToStart) {
             finish(QStringLiteral("cannot start ssh: %1").arg(process->errorString()));
         }

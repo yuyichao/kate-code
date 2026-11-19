@@ -368,30 +368,59 @@ QStringList sshTerminalCommand(const Location &location, const QStringList &ssh)
     return command;
 }
 
+// The start of a Windows script whose stream goes through a tunnel (see
+// TunnelLinePrefix): Windows' sshd (OpenSSH 9.5) stops passing on a
+// session's output once a process in it has started another one (the rest
+// comes when the session ends), and PowerShell's reads of its stdin stall
+// after the first chunk. So the script listens on the host's 127.0.0.1,
+// prints the port and a token (its first output, before any process
+// starts; a random GUID: 122 bits from Windows' cryptographic generator),
+// and takes the first connection that starts with the token within
+// 60 s (others are closed; exit 124 at the deadline). $n is then the
+// connection's stream, $s the connection.
+static QString windowsTunnelScript()
+{
+    return QStringLiteral(
+               "$l=New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback,0);$l.Start()\n"
+               "$k=[guid]::NewGuid().ToString('N')\n"
+               "[Console]::Out.WriteLine('%1 '+$l.LocalEndpoint.Port+' '+$k)\n"
+               "$z=[DateTime]::Now.AddSeconds(60);$s=$null\n"
+               "while(-not $s){while(-not $l.Pending()){if([DateTime]::Now -gt $z){exit 124};Start-Sleep -m 50}\n"
+               "$c=$l.AcceptTcpClient();$n=$c.GetStream();$n.ReadTimeout=10000;$r=New-Object byte[] 33;$m=0\n"
+               "try{while($m -lt 33){$j=$n.Read($r,$m,33-$m);if($j -le 0){break};$m+=$j}}catch{}\n"
+               "if($m -eq 33 -and [Text.Encoding]::ASCII.GetString($r) -eq \"$k`n\"){$s=$c}else{$c.Close()}}\n"
+               "$l.Stop();$s.NoDelay=1;$n.ReadTimeout=-1\n")
+        .arg(QLatin1String(TunnelLinePrefix));
+}
+
 // The end of a PowerShell script running the program $f (a path) in the
-// directory $d with arguments (a PowerShell string literal): PowerShell
-// re-encodes a native program's output it passes on, so the program's
-// stdin/stdout/stderr are copied as bytes instead: stdin through an
-// unbuffered stream, closed at end of input (the program then exits); the
-// script exits with the program's code.
+// directory $d with arguments (a PowerShell string literal), its
+// stdin/stdout being the tunnel's stream $n (windowsTunnelScript()), copied
+// as bytes (PowerShell re-encodes a native program's output it passes on;
+// stdin through an unbuffered stream). The end of the tunnel's input (the
+// client gone) kills the program's process tree at once, as the hangup of a
+// POSIX session would: Windows' sshd ends no process of a session, and an
+// agent whose input ends kills its running command's shell, not the
+// shell's children. Its stderr is kept
+// (the last 4 KiB) and written on the script's stderr when it has exited
+// (the session's output then comes through); the script exits with its
+// code.
 static QString windowsRunProgramScript(const QString &arguments)
 {
     return QStringLiteral(
-               "$i=New-Object Diagnostics.ProcessStartInfo\n"
-               "$i.FileName=$f\n"
-               "$i.Arguments=%1\n"
-               "$i.WorkingDirectory=$d\n"
-               "$i.UseShellExecute=$false\n"
-               "$i.RedirectStandardInput=$true\n"
-               "$i.RedirectStandardOutput=$true\n"
-               "$i.RedirectStandardError=$true\n"
-               "$p=[Diagnostics.Process]::Start($i)\n"
+               "$p=[Diagnostics.Process]::Start([Diagnostics.ProcessStartInfo]@{FileName=$f;Arguments=%1;WorkingDirectory=$d;UseShellExecute=$false;"
+               "RedirectStandardInput=1;RedirectStandardOutput=1;RedirectStandardError=1})\n"
                "$w=New-Object IO.FileStream($p.StandardInput.BaseStream.SafeFileHandle,[IO.FileAccess]::Write,1)\n"
-               "$o=$p.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())\n"
-               "$e=$p.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())\n"
-               "$n=[Console]::OpenStandardInput().CopyToAsync($w)\n"
-               "while(-not $p.HasExited){if($n -and $n.IsCompleted){$w.Close();$n=$null};Start-Sleep -Milliseconds 100}\n"
-               "[void]$o.Wait(5000);[void]$e.Wait(5000)\n"
+               "$o=$p.StandardOutput.BaseStream.CopyToAsync($n)\n"
+               "$e=$p.StandardError.BaseStream;$v=New-Object byte[] 4096;$t=New-Object IO.MemoryStream;$a=$e.ReadAsync($v,0,4096)\n"
+               "$r=$n.CopyToAsync($w);$u=$null\n"
+               "while($true){if($a -and $a.IsCompleted){try{$j=$a.Result}catch{$j=0}\n"
+               "if($j -gt 0){$t.Write($v,0,$j);if($t.Length -gt 8192){$x=$t.ToArray();$t=New-Object IO.MemoryStream;$t.Write($x,$x.Length-4096,4096)};$a=$e.ReadAsync($v,0,4096)}else{$a=$null};continue}\n"
+               "if($p.HasExited){if(-not $u){$u=[DateTime]::Now.AddSeconds(2)};if(-not $a -or [DateTime]::Now -gt $u){break}}\n"
+               "elseif($r -and $r.IsCompleted){$r=$null;& taskkill.exe /T /F /PID $p.Id *>$null}\n"
+               "Start-Sleep -m 100}\n"
+               "try{[void]$o.Wait(5000)}catch{};$s.Close()\n"
+               "$x=$t.ToArray();[Console]::OpenStandardError().Write($x,0,$x.Length)\n"
                "exit $p.ExitCode\n")
         .arg(arguments);
 }
@@ -403,8 +432,9 @@ QString windowsAgentScript(const QString &folder, const QString &program, const 
         quoted << windowsArgument(arg);
     }
     // Run by Windows PowerShell 5.1 or PowerShell 7, whichever shell sshd
-    // uses; the agent's stdio copied as bytes (windowsRunProgramScript()).
-    // Kept short: cmd limits a command line to 8191 characters.
+    // uses; the agent's stdio through the tunnel, copied as bytes
+    // (windowsRunProgramScript()). Checks first: their errors come before
+    // the tunnel. Kept short: cmd limits a command line to 8191 characters.
     return QStringLiteral(
                "$ProgressPreference='SilentlyContinue'\n"
                "$d=%1\n"
@@ -415,7 +445,7 @@ QString windowsAgentScript(const QString &folder, const QString &program, const 
                "if(-not $c){[Console]::Error.WriteLine(%3);exit 127}\n"
                "$f=$c.Path\n")
         .arg(powershellQuote(folder), powershellQuote(program), powershellQuote(program + QStringLiteral(": not found")))
-        + windowsRunProgramScript(powershellQuote(quoted.join(QLatin1Char(' '))));
+        + windowsTunnelScript() + windowsRunProgramScript(powershellQuote(quoted.join(QLatin1Char(' '))));
 }
 
 bool isValidRemoteAgentPackage(const RemoteAgentPackage &package)
@@ -528,17 +558,20 @@ QString remoteAgentInstallScript(bool windows, const RemoteAgentPackage &package
         return {};
     }
     if (windows) {
-        // stdin as bytes ([Console]::OpenStandardInput()) into a file, then
-        // Windows' tar (bsdtar, Windows 10 1803+).
+        // The archive through the tunnel (windowsTunnelScript()) into a
+        // file, then Windows' tar (bsdtar, Windows 10 1803+); "installed"
+        // and errors come when the session ends. The connection stays open
+        // until then (closed with the script): its end means the script's.
         const QString cmd = agentCmdPath(package.cmd, QLatin1Char('\\'));
-        return QStringLiteral(
-                   "$ErrorActionPreference='Stop'\n"
+        return windowsTunnelScript()
+            + QStringLiteral(
+                   "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'\n"
                    "$b=Join-Path $env:LOCALAPPDATA 'kate-code'\n"
                    "$t=Join-Path $b ('.install.'+[guid]::NewGuid().ToString('N'))\n"
                    "[void](New-Item -ItemType Directory -Force -Path $t)\n"
                    "try{\n"
                    "$a=Join-Path $t 'a.tgz'\n"
-                   "$f=[IO.File]::Create($a);[Console]::OpenStandardInput().CopyTo($f);$f.Close()\n"
+                   "$f=[IO.File]::Create($a);$n.CopyTo($f);$f.Close()\n"
                    "$x=Join-Path $t 'x';[void](New-Item -ItemType Directory -Path $x)\n"
                    "& tar.exe -xzf $a -C $x;if($LASTEXITCODE){exit 2}\n"
                    "if(-not(Test-Path -LiteralPath (Join-Path $x %3) -PathType Leaf)){[Console]::Error.WriteLine(%4);exit 3}\n"
@@ -745,6 +778,7 @@ QString remoteHelperLaunchScript(bool windows, const RemoteHelperPin &pin)
             }
         }
         // 64-bit PowerShell (sshd's) reports the machine's architecture.
+        // Get-FileHash: SHA-256 in upper case (-eq ignores case).
         return QStringLiteral(
                    "$ProgressPreference='SilentlyContinue'\n"
                    "$a=$env:PROCESSOR_ARCHITECTURE\n"
@@ -753,16 +787,14 @@ QString remoteHelperLaunchScript(bool windows, const RemoteHelperPin &pin)
                    "if(-not $q -or -not $t.ContainsKey($q)){Write-Output \"kate-code-helper: unsupported Windows $a\";exit %2}\n"
                    "$x=$t[$q]\n"
                    "$f=Join-Path $env:LOCALAPPDATA ('kate-code\\helper\\%3\\'+$q+'\\kate-code-helper.exe')\n"
-                   "$ok=$false\n"
-                   "if(Test-Path -LiteralPath $f -PathType Leaf){if((Get-Item -LiteralPath $f).Length -eq $x[1]){"
-                   "$ok=((Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower() -eq $x[0])}}\n"
+                   "$g=Get-Item -LiteralPath $f -EA 0;$ok=$g -and $g.Length -eq $x[1] -and (Get-FileHash -LiteralPath $f).Hash -eq $x[0]\n"
                    "if(-not $ok){Write-Output ('kate-code-helper: install '+$q);exit %4}\n"
                    "$d=$env:USERPROFILE\n")
                    .arg(table.join(QLatin1Char(';')))
                    .arg(RemoteHelperUnsupported)
                    .arg(pin.version)
                    .arg(RemoteHelperInstallNeeded)
-            + windowsRunProgramScript(QStringLiteral("''"));
+            + windowsTunnelScript() + windowsRunProgramScript(QStringLiteral("''"));
     }
     QStringList expected;
     for (const RemoteHelperBuild &b : pin.builds) {
@@ -801,15 +833,17 @@ QString remoteHelperInstallScript(bool windows, const QString &version, const Re
         return {};
     }
     if (windows) {
-        return QStringLiteral(
-                   "$ErrorActionPreference='Stop'\n"
+        // The archive through the tunnel (windowsTunnelScript()).
+        return windowsTunnelScript()
+            + QStringLiteral(
+                   "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'\n"
                    "$d=Join-Path $env:LOCALAPPDATA 'kate-code\\helper\\%1\\%2'\n"
                    "[void](New-Item -ItemType Directory -Force -Path $d)\n"
                    "$t=Join-Path $d ('.install.'+[guid]::NewGuid().ToString('N'))\n"
                    "[void](New-Item -ItemType Directory -Path $t)\n"
                    "try{\n"
                    "$a=Join-Path $t 'a.tgz'\n"
-                   "$f=[IO.File]::Create($a);[Console]::OpenStandardInput().CopyTo($f);$f.Close()\n"
+                   "$f=[IO.File]::Create($a);$n.CopyTo($f);$f.Close()\n"
                    "$x=Join-Path $t 'x';[void](New-Item -ItemType Directory -Path $x)\n"
                    "& tar.exe -xzf $a -C $x;if($LASTEXITCODE){exit 2}\n"
                    "$s=Join-Path $x 'kate-code-helper.exe'\n"
@@ -844,6 +878,47 @@ QStringList sshHelperCommand(const Location &location, const QStringList &ssh, c
                                  QStringLiteral("-o"),
                                  QStringLiteral("ConnectTimeout=10")},
                                 remoteHelperLaunchScript(windows, pin));
+}
+
+std::optional<TunnelEndpoint> parseTunnelLine(const QByteArray &line)
+{
+    static const QRegularExpression re(QStringLiteral("^%1 ([0-9]{1,5}) ([0-9a-f]{32})\\r?$").arg(QLatin1String(TunnelLinePrefix)));
+    const QRegularExpressionMatch match = re.match(QString::fromLatin1(line));
+    if (!match.hasMatch()) {
+        return std::nullopt;
+    }
+    bool ok = false;
+    const uint port = match.captured(1).toUInt(&ok);
+    if (!ok || port == 0 || port > 65535) {
+        return std::nullopt;
+    }
+    return TunnelEndpoint{quint16(port), match.captured(2).toLatin1()};
+}
+
+bool usesTunnel(const Location &location)
+{
+    return location.scheme == QLatin1String("sftp") && !windowsPathForSftpPath(location.path).isEmpty();
+}
+
+QStringList sshTunnelCommand(const Location &location, const QStringList &ssh, const QString &controlPath, quint16 port)
+{
+    if (!isSshScheme(location.scheme) || ssh.isEmpty() || port == 0) {
+        return {};
+    }
+    const auto target = parseSshAuthority(location.authority);
+    if (!target) {
+        return {};
+    }
+    QStringList command = ssh;
+    // Through the script's connection when it is up (no second login),
+    // else a connection of its own. -W forwards no other ports.
+    if (!controlPath.isEmpty()) {
+        command << QStringLiteral("-o") << QStringLiteral("ControlMaster=no") << QStringLiteral("-o") << QStringLiteral("ControlPath=") + controlPath;
+    }
+    command << QStringLiteral("-o") << QStringLiteral("ServerAliveInterval=15") << QStringLiteral("-o") << QStringLiteral("ServerAliveCountMax=3")
+            << QStringLiteral("-o") << QStringLiteral("ConnectTimeout=10") << QStringLiteral("-W") << QStringLiteral("127.0.0.1:%1").arg(port);
+    appendSshDestination(command, *target);
+    return command;
 }
 
 QStringList sshAgentCommand(const Location &location, const QStringList &ssh, const QString &program, const QStringList &args)

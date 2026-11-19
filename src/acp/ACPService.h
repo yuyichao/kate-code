@@ -6,7 +6,12 @@
 #include <QProcessEnvironment>
 #include <QString>
 
+#include "RemoteLocation.h"
 #include "RemotePathMap.h"
+
+#include <optional>
+
+class RemoteStdio;
 
 class ACPService : public QObject
 {
@@ -102,13 +107,13 @@ private:
     // The ssh command for an agent in workingDir on its host, or empty
     // when the agent runs locally (sets up m_pathMap and m_remoteHost).
     QStringList remoteCommand(const QString &workingDir);
-    void removeAskpassState();
     // Starts kate-mcp-server --http; its local port, 0 on failure.
     quint16 startMcpServer();
     void stopMcpServer();
     void mcpForwardResult(int remotePort);
 
-    QProcess *m_process;
+    // The agent (directly, through ssh, or through ssh and a tunnel).
+    RemoteStdio *m_process;
     int m_messageId;
     // Raw bytes: split into lines before UTF-8 decoding, so multi-byte
     // sequences straddling a read boundary are never mangled.
@@ -118,7 +123,7 @@ private:
     bool m_allowRemote = true;
     KateRemote::RemotePathMap m_pathMap;
     QString m_remoteHost;
-    QString m_askpassState;
+    std::optional<KateRemote::Location> m_remoteLocation;
     // The last bytes the remote side wrote on stderr (ssh's or the agent's
     // messages), reported when it fails.
     QByteArray m_stderrTail;
