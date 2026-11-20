@@ -3,12 +3,87 @@
 #include "../util/KateThemeConverter.h"
 
 #include <QDebug>
+#include <QDesktopServices>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QPointer>
 #include <QWebChannel>
 #include <QWebEnginePage>
 #include <QWebEngineSettings>
+
+namespace
+{
+const QUrl ChatPageUrl(QStringLiteral("qrc:/katecode/web/chat.html"));
+
+// A window the page asks for (target="_blank", middle or Ctrl+click,
+// window.open()): its first navigation is opened outside, then it goes.
+class ExternalLinkPage : public QWebEnginePage
+{
+public:
+    using QWebEnginePage::QWebEnginePage;
+
+protected:
+    bool acceptNavigationRequest(const QUrl &url, NavigationType type, bool isMainFrame) override
+    {
+        Q_UNUSED(type)
+        if (isMainFrame) {
+            // Asked for by a click (window.open() without one is blocked).
+            if (ChatWebView::linkAction(url, true) == ChatWebView::LinkAction::OpenExternally) {
+                QDesktopServices::openUrl(url);
+            } else {
+                qWarning() << "[ChatWebView] Not opening" << url.toDisplayString();
+            }
+            deleteLater();
+        }
+        return false;
+    }
+};
+
+// The chat's page: links never replace the chat (ChatWebView::linkAction()).
+class ChatWebPage : public QWebEnginePage
+{
+public:
+    using QWebEnginePage::QWebEnginePage;
+
+protected:
+    bool acceptNavigationRequest(const QUrl &url, NavigationType type, bool isMainFrame) override
+    {
+        if (!isMainFrame) {
+            // No frames of its own: never load anything into one.
+            return url.scheme() == QLatin1String("about") || url.scheme() == QLatin1String("data");
+        }
+        switch (ChatWebView::linkAction(url, type == NavigationTypeLinkClicked)) {
+        case ChatWebView::LinkAction::Stay:
+            return true;
+        case ChatWebView::LinkAction::OpenExternally:
+            QDesktopServices::openUrl(url);
+            return false;
+        case ChatWebView::LinkAction::Refuse:
+            qWarning() << "[ChatWebView] Not following" << url.toDisplayString();
+            return false;
+        }
+        return false;
+    }
+
+    QWebEnginePage *createWindow(WebWindowType type) override
+    {
+        Q_UNUSED(type)
+        return new ExternalLinkPage(profile(), this);
+    }
+};
+}
+
+ChatWebView::LinkAction ChatWebView::linkAction(const QUrl &url, bool userClicked)
+{
+    if (url.adjusted(QUrl::RemoveFragment) == ChatPageUrl) {
+        return LinkAction::Stay;
+    }
+    const QString scheme = url.scheme().toLower();
+    if (userClicked && (scheme == QLatin1String("http") || scheme == QLatin1String("https") || scheme == QLatin1String("mailto"))) {
+        return LinkAction::OpenExternally;
+    }
+    return LinkAction::Refuse;
+}
 
 ChatWebView::ChatWebView(QWidget *parent)
     : QWebEngineView(parent)
@@ -26,6 +101,9 @@ ChatWebView::ChatWebView(QWidget *parent)
     if (qEnvironmentVariableIsSet("KATECODE_REMOTE_DEBUGGING")) {
         qputenv("QTWEBENGINE_REMOTE_DEBUGGING", qgetenv("KATECODE_REMOTE_DEBUGGING"));
     }
+
+    // Links open outside, never in place of the chat.
+    setPage(new ChatWebPage(this));
 
     // Setup web channel for JavaScript <-> C++ communication
     setupBridge();
@@ -45,7 +123,7 @@ ChatWebView::ChatWebView(QWidget *parent)
 
     // Register lifecycle handlers before loading. A cached resource may
     // finish quickly enough to otherwise miss loadFinished entirely.
-    setUrl(QUrl(QStringLiteral("qrc:/katecode/web/chat.html")));
+    setUrl(ChatPageUrl);
 }
 
 ChatWebView::~ChatWebView()

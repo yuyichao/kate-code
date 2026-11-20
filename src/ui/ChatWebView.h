@@ -14,6 +14,17 @@ public:
     explicit ChatWebView(QWidget *parent = nullptr);
     ~ChatWebView() override;
 
+    // Where a navigation of the chat's page goes: the chat page itself
+    // (and anchors in it) stays; links the user follows to web or mail
+    // addresses open in the desktop's browser or mail program (never in
+    // the chat: the page would be replaced); anything else is refused.
+    enum class LinkAction {
+        Stay,
+        OpenExternally,
+        Refuse,
+    };
+    static LinkAction linkAction(const QUrl &url, bool userClicked);
+
     void addMessage(const Message &message);
     void updateMessage(const QString &messageId, const QString &content);
     void finishMessage(const QString &messageId);
