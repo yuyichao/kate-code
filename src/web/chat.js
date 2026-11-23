@@ -428,6 +428,11 @@ function addMessage(id, role, content, timestamp, isStreaming, images) {
 
     messages[id] = message;
     renderMessage(message);
+    // A prompt sent from here brings the view back to the newest output
+    // (not one typed in another client, nor the replayed history).
+    if (role === 'user' && !id.startsWith('remote_') && !id.startsWith('replay_')) {
+        setFollowing(true);
+    }
     scrollToBottom();
 }
 
@@ -458,7 +463,7 @@ function drawDirtyMessages() {
     }
     if (scrollWanted) {
         scrollWanted = false;
-        scrollToBottomNow();
+        if (following) scrollToBottomNow();
     }
 }
 
@@ -484,6 +489,7 @@ function setReplaying(on) {
            && (container.scrollHeight < window.innerHeight * 2 || performance.now() - start < 30)) {
         drawMessage(olderMessages.shift());
     }
+    setFollowing(true);
     scrollToBottomNow();
     logToQt('Replayed history: ' + ids.length + ' messages, ' + (ids.length - olderMessages.length)
             + ' drawn in ' + Math.round(performance.now() - start) + ' ms, the rest in the background');
@@ -499,9 +505,7 @@ function scheduleOlder() {
 
 function drawOlderMessages() {
     olderTimer = null;
-    // The page scrolls (the body grows with #messages).
-    const page = document.scrollingElement || document.documentElement;
-    const atBottom = page.scrollHeight - page.scrollTop - page.clientHeight < 40;
+    const atBottom = following;
     const start = performance.now();
     while (olderMessages.length > 0 && performance.now() - start < 30) {
         drawMessage(olderMessages.shift());
@@ -1364,6 +1368,59 @@ function scrollToBottom() {
     if (replaying) return;
     scrollWanted = true;
     scheduleDraw();
+}
+
+// Following the newest output: new output scrolls the view only while it
+// is at the bottom. Scrolling up (wheel, keys, the scroll bar, touch) stops
+// that; scrolling back to the bottom, the "Latest" button or sending a
+// prompt resumes it. Only the user's own scrolling stops it: a scroll event
+// can report a position from before the next drawn update.
+let following = true;
+let userInputAt = -Infinity;
+let mouseHeld = false;
+
+function distanceFromBottom() {
+    // The page scrolls (the body grows with #messages); #messages too if it
+    // ever gets a height of its own.
+    const page = document.scrollingElement || document.documentElement;
+    const c = document.getElementById('messages');
+    const d = el => el ? el.scrollHeight - el.scrollTop - el.clientHeight : 0;
+    return Math.max(d(page), d(c));
+}
+
+function setFollowing(on) {
+    following = on;
+    const button = document.getElementById('jump-to-latest');
+    if (button) {
+        // Above the todo list (sticky at the bottom) when it shows.
+        const todos = document.getElementById('todos-container');
+        button.style.bottom = ((todos && todos.offsetHeight) ? todos.offsetHeight + 8 : 16) + 'px';
+        button.classList.toggle('visible', !on);
+    }
+}
+
+function onUserScrollInput() {
+    userInputAt = performance.now();
+}
+
+window.addEventListener('wheel', onUserScrollInput, {passive: true, capture: true});
+window.addEventListener('touchmove', onUserScrollInput, {passive: true, capture: true});
+window.addEventListener('keydown', e => {
+    if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) onUserScrollInput();
+}, {capture: true});
+window.addEventListener('mousedown', () => { mouseHeld = true; onUserScrollInput(); }, {capture: true});
+window.addEventListener('mouseup', () => { mouseHeld = false; }, {capture: true});
+window.addEventListener('scroll', () => {
+    if (distanceFromBottom() < 40) {
+        if (!following) setFollowing(true);
+    } else if (following && (mouseHeld || performance.now() - userInputAt < 1000)) {
+        setFollowing(false);
+    }
+}, {passive: true, capture: true});
+
+function jumpToLatest() {
+    setFollowing(true);
+    scrollToBottomNow();
 }
 
 function scrollToBottomNow() {

@@ -1458,3 +1458,24 @@ pre.terminal-output.terminal-running .terminal-indicator {
 .user-question-submit:active {
     filter: brightness(0.95);
 }
+
+/* Shown while the view does not follow new output (scrolled up). */
+#jump-to-latest {
+    display: none;
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 20;
+    padding: 4px 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(128, 128, 128, 0.4);
+    background-color: var(--bg-secondary);
+    color: var(--fg-primary);
+    font-size: 12px;
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+
+#jump-to-latest.visible {
+    display: block;
+}
