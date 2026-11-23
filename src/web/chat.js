@@ -864,9 +864,10 @@ function renderToolCall(toolCall) {
 
     // Extract command for Bash tools (including MCP variants like mcp__acp__Bash)
     let commandDisplay = '';
-    if (isBashTool(toolCall.name) && toolCall.input && toolCall.input.command) {
-        const cmd = toolCall.input.command;
-        // Show first 50 chars of command
+    if (isBashTool(toolCall.name) && toolCall.input && (toolCall.input.description || toolCall.input.command)) {
+        // The agent's summary of the command (Claude Code's `description`),
+        // else its first 50 chars; the whole command is in the details.
+        const cmd = toolCall.input.description || toolCall.input.command;
         commandDisplay = cmd.length > 50 ? cmd.substring(0, 50) + '...' : cmd;
     }
 

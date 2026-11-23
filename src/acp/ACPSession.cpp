@@ -240,6 +240,7 @@ void ACPSession::resetSessionState()
     m_cancelledPromptId = -1;
     m_toolCallMessages.clear();
     m_unrecordedToolCalls.clear();
+    m_v1ToolCalls.clear();
     m_cycleCancelled = false;
     m_protocol.reset();
     recordRemoteUserMessage();
@@ -2270,11 +2271,18 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
             m_displayTerminals.insert(toolCall.id);
         }
 
+        const bool finished = toolCall.status == QLatin1String("completed") || toolCall.status == QLatin1String("failed");
+        if (!m_protocol.isActive() && !finished) {
+            m_v1ToolCalls.insert(toolCall.id, update);
+        }
         if (!m_currentMessageId.isEmpty()) {
             m_toolCallMessages.insert(toolCall.id, m_currentMessageId);
             Q_EMIT toolCallAdded(m_currentMessageId, toolCall);
-            if (m_protocol.isActive() && toolCall.status != QLatin1String("completed") && toolCall.status != QLatin1String("failed")) {
-                // v2: its input comes later (recorded with its final status).
+            // (toolCall.input may hold keys looked up on it, with null values.)
+            const QJsonValue rawInput = update.value(QStringLiteral("rawInput"));
+            const bool inputPending = !rawInput.isString() && rawInput.toObject().isEmpty();
+            if ((m_protocol.isActive() || inputPending) && !finished) {
+                // Its input comes later (recorded with its final status).
                 m_unrecordedToolCalls.insert(toolCall.id, toolCall);
             } else {
                 m_transcript->recordToolCall(toolCall);
@@ -2554,9 +2562,13 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         // (a command in the background, a cycle's tool call reported after
         // the cycle was stopped).
         const QString messageId = m_toolCallMessages.value(toolCallId, m_currentMessageId);
-        // v2: the tool call as it is now (its input streams in after it was
-        // announced; v1 gives its input to the tool call only).
-        const QJsonObject current = update[QStringLiteral("_meta")].toObject()[QStringLiteral("_kate/toolCall")].toObject();
+        // The tool call as it is now, when this update changes it (its input
+        // streams in after it was announced): v2's whole call, or v1's call
+        // with this update applied.
+        QJsonObject current = update[QStringLiteral("_meta")].toObject()[QStringLiteral("_kate/toolCall")].toObject();
+        if (current.isEmpty() && !m_protocol.isActive()) {
+            current = mergeV1ToolCallUpdate(update);
+        }
         if (!current.isEmpty() && !messageId.isEmpty() && m_toolCallMessages.contains(toolCallId)) {
             const ToolCall toolCall = toolCallFromUpdate(current);
             m_toolCallInputs[toolCallId] = toolCall.input;
@@ -2566,6 +2578,7 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
             Q_EMIT toolCallAdded(messageId, toolCall);
         }
         if (status == QLatin1String("completed") || status == QLatin1String("failed")) {
+            m_v1ToolCalls.remove(toolCallId);
             const auto unrecorded = m_unrecordedToolCalls.constFind(toolCallId);
             if (unrecorded != m_unrecordedToolCalls.constEnd()) {
                 m_transcript->recordToolCall(*unrecorded);
@@ -2849,6 +2862,49 @@ void ACPSession::handlePermissionRequest(const QJsonObject &params, int requestI
              << "options count:" << request.options.size();
 
     Q_EMIT permissionRequested(request);
+}
+
+QJsonObject ACPSession::mergeV1ToolCallUpdate(const QJsonObject &update)
+{
+    const auto it = m_v1ToolCalls.find(update[QStringLiteral("toolCallId")].toString());
+    if (it == m_v1ToolCalls.end()) {
+        return {};
+    }
+    QJsonObject &call = it.value();
+    // Only fields with values: lookups on a non-const QJsonObject insert
+    // nulls (the handler's own update has "status": null).
+    const QString status = update.value(QStringLiteral("status")).toString();
+    if (!status.isEmpty()) {
+        call[QStringLiteral("status")] = status;
+    }
+    bool changed = false;
+    for (const QString &key : {QStringLiteral("rawInput"), QStringLiteral("title"), QStringLiteral("kind"), QStringLiteral("locations")}) {
+        const QJsonValue value = update.value(key);
+        if (!value.isNull() && !value.isUndefined() && value != call.value(key)) {
+            call[key] = value;
+            changed = true;
+        }
+    }
+    // The content of an input update describes the call (an Edit's diff, a
+    // command's terminal); later updates' content is the result.
+    if (update.value(QStringLiteral("rawInput")).isObject() && update.value(QStringLiteral("content")).isArray() && status != QLatin1String("completed")
+        && status != QLatin1String("failed")) {
+        call[QStringLiteral("content")] = update.value(QStringLiteral("content"));
+        changed = true;
+    }
+    const QString toolName =
+        update.value(QStringLiteral("_meta")).toObject().value(QStringLiteral("claudeCode")).toObject().value(QStringLiteral("toolName")).toString();
+    if (!toolName.isEmpty()) {
+        QJsonObject meta = call[QStringLiteral("_meta")].toObject();
+        QJsonObject claudeCode = meta[QStringLiteral("claudeCode")].toObject();
+        if (claudeCode[QStringLiteral("toolName")].toString() != toolName) {
+            claudeCode[QStringLiteral("toolName")] = toolName;
+            meta[QStringLiteral("claudeCode")] = claudeCode;
+            call[QStringLiteral("_meta")] = meta;
+            changed = true;
+        }
+    }
+    return changed ? call : QJsonObject();
 }
 
 ToolCall ACPSession::toolCallFromUpdate(const QJsonObject &update) const

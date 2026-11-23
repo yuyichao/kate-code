@@ -239,9 +239,18 @@ private:
     ACPProtocolV2 m_protocol;
     // The tool call an update (tool_call, or v2's whole tool call) describes.
     ToolCall toolCallFromUpdate(const QJsonObject &update) const;
-    // v2: tool calls announced before their input, recorded in the
-    // transcript once they finish (with the input they had then).
+    // Tool calls announced before their input (v2; v1 when the tool_call has
+    // an empty rawInput), recorded in the transcript once they finish (with
+    // the input they had then).
     QHash<QString, ToolCall> m_unrecordedToolCalls;
+    // v1: tool calls that have not finished, as the tool_call and the
+    // updates since describe them. claude-agent-acp (0.109) announces a call
+    // when the model starts writing it (empty rawInput, title "Terminal"...)
+    // and sends its input, title and content in later tool_call_updates.
+    QHash<QString, QJsonObject> m_v1ToolCalls;
+    // v1: the tool call with this update applied, if it changes what the
+    // chat shows (input, title, kind, locations); empty otherwise.
+    QJsonObject mergeV1ToolCallUpdate(const QJsonObject &update);
 
     // A follow-up prompt queued while another session/prompt is in flight.
     struct QueuedPrompt {
