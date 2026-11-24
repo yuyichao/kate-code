@@ -2380,6 +2380,9 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
         QString updateFilePath;  // File path extracted from this update
 
         QString terminalId;  // Terminal ID extracted from content (vibe-acp sends this in tool_call_update)
+        // Images of the result (`{type: content, content: {type: image, data, mimeType}}`)
+        QList<ImageAttachment> images;
+        QStringList imageNotes;  // What the transcript records for them
 
         QJsonArray contentArray = update[QStringLiteral("content")].toArray();
         for (int i = 0; i < contentArray.size(); ++i) {
@@ -2399,6 +2402,20 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
                 qDebug() << "[ACPSession] tool_call_update has terminal content - id:" << terminalId;
             } else if (contentType == QStringLiteral("content")) {
                 QJsonObject content = contentItem[QStringLiteral("content")].toObject();
+                if (content.value(QStringLiteral("type")).toString() == QLatin1String("image")) {
+                    static const QStringList shownTypes{QStringLiteral("image/png"), QStringLiteral("image/jpeg"),
+                                                        QStringLiteral("image/gif"), QStringLiteral("image/webp")};
+                    const QString mimeType = content.value(QStringLiteral("mimeType")).toString();
+                    const QByteArray data = QByteArray::fromBase64(content.value(QStringLiteral("data")).toString().toLatin1());
+                    if (shownTypes.contains(mimeType) && !data.isEmpty()) {
+                        ImageAttachment image;
+                        image.mimeType = mimeType;
+                        image.data = data;
+                        images.append(image);
+                        imageNotes.append(QStringLiteral("[image: %1, %2 KB]").arg(mimeType).arg((data.size() + 1023) / 1024));
+                    }
+                    continue;
+                }
                 QString text = content[QStringLiteral("text")].toString();
                 if (!text.isEmpty()) {
                     result = text;
@@ -2620,9 +2637,20 @@ void ACPSession::handleSessionUpdate(const QJsonObject &params)
 
             // Only emit update if we have a result OR status changed
             // (Don't overwrite good results with empty ones from status-only updates)
+            if (!images.isEmpty()) {
+                Q_EMIT toolCallImages(messageId, toolCallId, images);
+            }
             if (!result.isEmpty() || !status.isEmpty()) {
                 Q_EMIT toolCallUpdated(messageId, toolCallId, status, result, updateFilePath, toolName);
-                m_transcript->recordToolUpdate(toolCallId, status, result);
+                // The transcript names the images (it is text, read back as
+                // context).
+                QString recorded = result;
+                if (!imageNotes.isEmpty()) {
+                    imageNotes.prepend(result);
+                    imageNotes.removeAll(QString());
+                    recorded = imageNotes.join(QLatin1Char('\n'));
+                }
+                m_transcript->recordToolUpdate(toolCallId, status, recorded);
             }
         }
 

@@ -167,6 +167,9 @@ Q_SIGNALS:
     void messageFinished(const QString &messageId);
     void toolCallAdded(const QString &messageId, const ToolCall &toolCall);
     void toolCallUpdated(const QString &messageId, const QString &toolCallId, const QString &status, const QString &result, const QString &filePath = QString(), const QString &toolName = QString());
+    // Images in a tool call's result (e.g. Claude Code's Read of an image
+    // file), replacing those shown before.
+    void toolCallImages(const QString &messageId, const QString &toolCallId, const QList<ImageAttachment> &images);
     void todosUpdated(const QList<TodoItem> &todos);
     void permissionRequested(const PermissionRequest &request);
     void modesAvailable(const QJsonArray &modes);

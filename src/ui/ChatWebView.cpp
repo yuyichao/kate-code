@@ -398,6 +398,18 @@ void ChatWebView::updateToolCall(const QString &messageId, const QString &toolCa
     runJavaScript(script);
 }
 
+void ChatWebView::setToolCallImages(const QString &messageId, const QString &toolCallId, const QList<ImageAttachment> &images)
+{
+    // Base64 and the (known) MIME types need no escaping in a JS string.
+    QStringList list;
+    for (const ImageAttachment &image : images) {
+        list.append(QStringLiteral("{mimeType: '%1', data: '%2'}")
+                        .arg(escapeJsString(image.mimeType), QString::fromLatin1(image.data.toBase64())));
+    }
+    runJavaScript(QStringLiteral("setToolCallImages('%1', '%2', [%3]);")
+                      .arg(escapeJsString(messageId), escapeJsString(toolCallId), list.join(QLatin1Char(','))));
+}
+
 void ChatWebView::setToolCallDiff(const QString &messageId, const QString &toolCallId,
                                    const QString &filePath, const QString &oldText, const QString &newText)
 {

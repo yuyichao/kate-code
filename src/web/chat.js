@@ -729,6 +729,56 @@ function updateToolCall(messageId, toolCallId, status, base64Result, filePath, t
     updateMessageDOM(messageId);
 }
 
+// Images of a tool call's result ({mimeType, data: base64}), replacing
+// earlier ones. Kept as blob: URLs: a message's HTML is rebuilt on every
+// update, and data: URLs would put megabytes into it each time.
+function setToolCallImages(messageId, toolCallId, images) {
+    if (!messages[messageId]) return;
+    const toolCall = messages[messageId].toolCalls.find(tc => tc.id === toolCallId);
+    if (!toolCall) return;
+    revokeToolCallImages(toolCall);
+    toolCall.images = [];
+    for (const image of images) {
+        try {
+            const binary = atob(image.data);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            const url = URL.createObjectURL(new Blob([bytes], { type: image.mimeType }));
+            toolCall.images.push({ url: url, mimeType: image.mimeType, full: false });
+        } catch (e) {
+            console.error('setToolCallImages decode error:', e);
+        }
+    }
+    updateMessageDOM(messageId);
+}
+
+function revokeToolCallImages(toolCall) {
+    for (const image of toolCall.images || []) {
+        URL.revokeObjectURL(image.url);
+    }
+}
+
+// Clicking a result image switches it between fitted and full size.
+function toggleToolCallImage(toolCallId, index) {
+    for (const messageId in messages) {
+        const toolCall = messages[messageId].toolCalls.find(tc => tc.id === toolCallId);
+        if (toolCall && toolCall.images && toolCall.images[index]) {
+            toolCall.images[index].full = !toolCall.images[index].full;
+            updateMessageDOM(messageId);
+            return;
+        }
+    }
+}
+
+// Whether a tool call shows its details: as toggled, else Edit diffs and
+// results with images are open.
+function isToolCallExpanded(toolCall) {
+    if (toolCall.expanded !== undefined) return toolCall.expanded;
+    return isEditTool(toolCall.name) || !!(toolCall.images && toolCall.images.length);
+}
+
 // Update tool call diff data after D-Bus edit parameters become available
 // oldText and newText are base64-encoded to safely pass multiline content
 function setToolCallDiff(messageId, toolCallId, filePath, b64OldText, b64NewText) {
@@ -863,8 +913,7 @@ function createMessageHTML(message) {
 // Render a single tool call as inline element
 function renderToolCall(toolCall) {
     const fileName = toolCall.filePath ? toolCall.filePath.split('/').pop() : '';
-    // Edit tools are expanded by default to show the diff inline
-    const isExpanded = toolCall.expanded !== undefined ? toolCall.expanded : isEditTool(toolCall.name);
+    const isExpanded = isToolCallExpanded(toolCall);
 
     // Extract command for Bash tools (including MCP variants like mcp__acp__Bash)
     let commandDisplay = '';
@@ -1098,6 +1147,15 @@ function renderToolCall(toolCall) {
             }
         }
 
+        // Images of the result (e.g. Read of an image file)
+        if (toolCall.images && toolCall.images.length) {
+            html += '<div class="tool-call-result-section tool-call-images">';
+            toolCall.images.forEach((image, i) => {
+                html += `<img src="${image.url}" class="tool-call-image${image.full ? ' full' : ''}" alt="${escapeHtml(image.mimeType)}" title="${image.full ? 'Click to fit' : 'Click for full size'}" onclick="toggleToolCallImage('${escapeHtml(toolCall.id)}', ${i})">`;
+            });
+            html += '</div>';
+        }
+
         // Show terminal output if this tool call has embedded terminal
         if (toolCall.terminalId) {
             html += `<div class="tool-call-terminal-section">
@@ -1249,7 +1307,7 @@ function toggleToolCall(toolCallId) {
     for (const messageId in messages) {
         const toolCall = messages[messageId].toolCalls.find(tc => tc.id === toolCallId);
         if (toolCall) {
-            toolCall.expanded = !toolCall.expanded;
+            toolCall.expanded = !isToolCallExpanded(toolCall);
             updateMessageDOM(messageId);
             break;
         }
@@ -1258,6 +1316,11 @@ function toggleToolCall(toolCallId) {
 
 // Clear all messages and reset all state for new session
 function clearMessages() {
+    for (const messageId in messages) {
+        for (const toolCall of messages[messageId].toolCalls || []) {
+            revokeToolCallImages(toolCall);
+        }
+    }
     messages = {};
     dirtyMessages.clear();
     olderMessages = [];
@@ -2252,6 +2315,7 @@ window.updateMessage = updateMessage;
 window.finishMessage = finishMessage;
 window.addToolCall = addToolCall;
 window.updateToolCall = updateToolCall;
+window.setToolCallImages = setToolCallImages;
 window.clearMessages = clearMessages;
 window.updateTodos = updateTodos;
 window.applyColorScheme = applyColorScheme;

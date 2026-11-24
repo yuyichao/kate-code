@@ -31,6 +31,7 @@ public:
     void addToolCall(const QString &messageId, const ToolCall &toolCall);
     void updateToolCall(const QString &messageId, const QString &toolCallId, const QString &status, const QString &result, const QString &filePath = QString(), const QString &toolName = QString());
     void setToolCallDiff(const QString &messageId, const QString &toolCallId, const QString &filePath, const QString &oldText, const QString &newText);
+    void setToolCallImages(const QString &messageId, const QString &toolCallId, const QList<ImageAttachment> &images);
     void showPermissionRequest(const PermissionRequest &request);
     void updateTodos(const QList<TodoItem> &todos);
     void clearMessages();
